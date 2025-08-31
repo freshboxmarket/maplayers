@@ -19,7 +19,7 @@
   "style": {
     "unselectedMode": "dim",
     "selected": { "strokeOpacity": 1.0, "weightPx": 2 },
-    "dimmed":   { "strokeOpacity": 0.30, "weightPx": 1, "fillOpacity": 0.12 },
+    "dimmed":   { "strokeOpacity": 0.35, "weightPx": 1, "fillFactor": 0.30 },
     "perDay": {
       "Wednesday": { "fill": "#00cc66", "fillOpacity": 0.39, "stroke": "#00994c" },
       "Thursday":  { "fill": "#ff6666", "fillOpacity": 0.39, "stroke": "#cc0000" },
