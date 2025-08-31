@@ -5,6 +5,15 @@
     "schema": { "day": "day", "keys": "zone keys", "delimiter": "," },
     "mergeDays": true
   },
+  "customers": {
+    "type": "csv",
+    "enabled": true,
+    "url": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRMkbzNUzuGSEToTgDsF2ZSgSxmeiwwn4i3IJNgT64EJecwNytydMZWGdTQ9X2azaicITiFOGCevodA/pub?output=csv",
+    "schema": {
+      "coords": "Verified Coordinates",
+      "note":   "Order Note"
+    }
+  },
   "layers": [
     { "day": "Wednesday", "name": "_Wednesday_group", "url": "./_Wednesday_group.geojson" },
     { "day": "Thursday",  "name": "_Thursday_group",  "url": "./_Thursday_group.geojson" },
@@ -25,6 +34,14 @@
       "Thursday":  { "fill": "#ff6666", "fillOpacity": 0.39, "stroke": "#cc0000" },
       "Friday":    { "fill": "#a6cee3", "fillOpacity": 1.00, "stroke": "#1f78b4" },
       "Saturday":  { "fill": "#ffff66", "fillOpacity": 0.39, "stroke": "#cccc00" }
+    },
+    "customers": {
+      "radius": 6,
+      "stroke": "#111",
+      "fill":   "#ffffff",
+      "weightPx": 2,
+      "opacity": 0.9,
+      "fillOpacity": 0.85
     }
   },
   "behavior": {
