@@ -1,145 +1,199 @@
 (async function () {
-  const params = new URLSearchParams(location.search);
-  const cfgUrl = params.get('cfg') || './config/app.config.json';
-  const cfg = await (await fetch(cfgUrl + cb())).json();
+  const qs = new URLSearchParams(location.search);
+  const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
-  const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap' }).addTo(map);
+  try {
+    // Load config
+    const cfg = await fetchJson(cfgUrl);
 
-  // Legend
-  renderLegend(cfg);
-
-  // Load selection (CSV → Set of route keys, uppercase/trim)
-  async function loadSelection() {
-    const selUrl = params.get('sel') || cfg.selection.url;
-    const txt = await (await fetch(selUrl + cb())).text();
-    const rows = parseCsv(txt);  // array of objects keyed by header
-    const keyCol = cfg.selection.schema.keys;
-    const dayCol = cfg.selection.schema.day;
-    const delim  = cfg.selection.schema.delimiter || ',';
-
-    const keys = new Set();
-    for (const r of rows) {
-      const rawKeys = (r[keyCol] || '').split(delim).map(s => s.trim()).filter(Boolean);
-      if (!cfg.selection.mergeDays) {
-        const day = (r[dayCol] || '').toString().trim();
-        rawKeys.forEach(k => keys.add(`${day}||${k.toUpperCase()}`));
-      } else {
-        rawKeys.forEach(k => keys.add(k.toUpperCase()));
-      }
-    }
-    return keys;
-  }
-
-  // Load day layers
-  const layers = [];
-  for (const Lcfg of cfg.layers) {
-    const gj = await (await fetch(Lcfg.url + cb())).json();
-    const color = (cfg.style.perDay[Lcfg.day] && cfg.style.perDay[Lcfg.day].color) || '#666';
-
-    const layer = L.geoJSON(gj, {
-      style: () => ({
-        color,
-        weight: cfg.style.dimmed.weight,
-        opacity: cfg.style.dimmed.opacity,
-        fillOpacity: cfg.style.dimmed.opacity
-      }),
-      onEachFeature: (feat, lyr) => {
-        const props = feat.properties || {};
-        const key = props[cfg.fields.key];
-        const muni = props[cfg.fields.muni];
-        lyr.bindTooltip(`${Lcfg.day}: ${muni || 'area'} (${key || '-'})`, { sticky: true });
-        // stash for later re-styling
-        lyr._routeKey = key ? key.toString().toUpperCase() : '';
-        lyr._day = props[cfg.fields.day] || Lcfg.day;
-        lyr._baseColor = color;
-      }
+    // Map
+    const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution:'&copy; OpenStreetMap'
     }).addTo(map);
-    layers.push(layer);
-  }
 
-  // Apply selection styling
-  async function applySelection() {
-    const selected = await loadSelection();
-    const bounds = [];
-    layers.forEach(layer => {
-      layer.eachLayer(lyr => {
-        const keyHit = cfg.selection.mergeDays
-          ? selected.has(lyr._routeKey)
-          : selected.has(`${lyr._day}||${lyr._routeKey}`);
+    renderLegend(cfg);
 
-        if (keyHit) {
-          lyr.setStyle({
-            color: lyr._baseColor,
-            weight: cfg.style.selected.weight,
-            opacity: cfg.style.selected.opacity,
-            fillOpacity: cfg.style.selected.opacity
-          });
-          if (lyr.getBounds) bounds.push(lyr.getBounds());
-          lyr.addTo(layer);
+    // Load all day layers
+    const dayLayers = [];
+    for (const Lcfg of cfg.layers) {
+      const gj = await fetchJson(Lcfg.url);
+      const color = (cfg.style.perDay[Lcfg.day] && cfg.style.perDay[Lcfg.day].color) || '#666';
+
+      const layer = L.geoJSON(gj, {
+        style: () => ({
+          color,
+          weight: cfg.style.dimmed.weight,
+          opacity: cfg.style.dimmed.opacity,
+          fillOpacity: cfg.style.dimmed.opacity
+        }),
+        onEachFeature: (feat, lyr) => {
+          const p = feat.properties || {};
+          const key = (p[cfg.fields.key] ?? '').toString().toUpperCase().trim();
+          const muni = p[cfg.fields.muni] ?? '';
+          const day  = (p[cfg.fields.day] ?? Lcfg.day).toString().trim();
+          lyr._routeKey  = key;      // used for selection matching
+          lyr._day       = day;      // used if mergeDays=false
+          lyr._baseColor = color;    // per-day color
+          lyr.bindTooltip(`${day}: ${muni || 'area'}${key ? ` (${key})` : ''}`, { sticky: true });
+        }
+      }).addTo(map);
+
+      dayLayers.push(layer);
+    }
+
+    // Selection logic
+    async function applySelection() {
+      const selUrl = qs.get('sel') || cfg.selection.url;
+      const csvText = await fetchText(selUrl);
+      const rows = parseCsv(csvText);
+
+      const keyCol = cfg.selection.schema.keys;
+      const dayCol = cfg.selection.schema.day;
+      const delim  = cfg.selection.schema.delimiter || ',';
+
+      // Build selected key set
+      const selected = new Set();
+      for (const r of rows) {
+        const rawKeys = (r[keyCol] || '').split(delim).map(s => s.trim()).filter(Boolean);
+        if (cfg.selection.mergeDays) {
+          rawKeys.forEach(k => selected.add(k.toUpperCase()));
         } else {
-          if (cfg.style.unselectedMode === 'hide') {
-            layer.removeLayer(lyr);
-          } else {
+          const day = (r[dayCol] || '').toString().trim();
+          rawKeys.forEach(k => selected.add(`${day}||${k.toUpperCase()}`));
+        }
+      }
+
+      // Style features
+      const bounds = [];
+      let selectedCount = 0;
+      dayLayers.forEach(layer => {
+        layer.eachLayer(lyr => {
+          const hit = cfg.selection.mergeDays
+            ? selected.has(lyr._routeKey)
+            : selected.has(`${lyr._day}||${lyr._routeKey}`);
+
+          if (hit) {
             lyr.setStyle({
               color: lyr._baseColor,
-              weight: cfg.style.dimmed.weight,
-              opacity: cfg.style.dimmed.opacity,
-              fillOpacity: cfg.style.dimmed.opacity
+              weight: cfg.style.selected.weight,
+              opacity: cfg.style.selected.opacity,
+              fillOpacity: cfg.style.selected.opacity
             });
-            lyr.addTo(layer);
+            if (lyr.getBounds) bounds.push(lyr.getBounds());
+            selectedCount++;
+            layer.addLayer(lyr);
+          } else {
+            if (cfg.style.unselectedMode === 'hide') {
+              layer.removeLayer(lyr);
+            } else {
+              lyr.setStyle({
+                color: lyr._baseColor,
+                weight: cfg.style.dimmed.weight,
+                opacity: cfg.style.dimmed.opacity,
+                fillOpacity: cfg.style.dimmed.opacity
+              });
+              layer.addLayer(lyr);
+            }
           }
-        }
+        });
       });
-    });
 
-    if (cfg.behavior.autoZoom && bounds.length) {
-      const all = bounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(bounds[0]));
-      map.fitBounds(all.pad(0.1));
+      // Auto-zoom
+      if (cfg.behavior.autoZoom && bounds.length) {
+        const all = bounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(bounds[0]));
+        map.fitBounds(all.pad(0.1));
+      }
+
+      setStatus(`Selected features: ${selectedCount} • Keys: ${Array.from(selected).join(', ') || '—'}`);
     }
+
+    await applySelection();
+
+    // Optional auto-refresh of selection CSV
+    const refresh = Number(cfg.behavior.refreshSeconds || 0);
+    if (refresh > 0) {
+      setInterval(applySelection, refresh * 1000);
+    }
+
+  } catch (e) {
+    showError(e);
+    console.error(e);
   }
 
-  await applySelection();
-
-  // Optional auto-refresh of selection CSV
-  if (cfg.behavior.refreshSeconds > 0) {
-    setInterval(applySelection, cfg.behavior.refreshSeconds * 1000);
+  // ---------- Helpers ----------
+  function cb(u) {
+    const sep = u.includes('?') ? '&' : '?';
+    return `${sep}cb=${Date.now()}`;
   }
 
-  // Helpers
+  async function fetchJson(url) {
+    const res = await fetch(url + cb(url));
+    if (!res.ok) throw new Error(`Fetch failed (${res.status}) for ${url}`);
+    return await res.json();
+  }
+
+  async function fetchText(url) {
+    const res = await fetch(url + cb(url));
+    if (!res.ok) throw new Error(`Fetch failed (${res.status}) for ${url}`);
+    return await res.text();
+  }
+
   function parseCsv(text) {
-    const rows = text.trim().split(/\r?\n/);
-    const headers = rows.shift().split(',').map(h => h.trim().replace(/^\ufeff/, '')); // strip BOM
-    return rows.map(line => {
-      const cols = splitCsvLine(line);
-      const obj = {};
-      headers.forEach((h, i) => obj[h] = (cols[i] || '').trim());
-      return obj;
-    });
-  }
+    // RFC4180-ish parser (handles quoted commas and double-quotes)
+    const rows = [];
+    let i = 0, field = '', row = [], inQ = false;
+    const pushField = () => { row.push(field); field=''; };
+    const pushRow = () => { rows.push(row); row=[]; };
 
-  function splitCsvLine(line) {
-    // simple CSV splitter (no nested quotes needed for your sheet)
-    const out = []; let cur = ''; let inQ = false;
-    for (let i=0; i<line.length; i++) {
-      const ch = line[i];
-      if (ch === '"' ) { inQ = !inQ; continue; }
-      if (ch === ',' && !inQ) { out.push(cur); cur=''; continue; }
-      cur += ch;
+    // Normalize newlines
+    text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const N = text.length;
+
+    while (i < N) {
+      const ch = text[i];
+      if (inQ) {
+        if (ch === '"') {
+          if (i + 1 < N && text[i+1] === '"') { field += '"'; i += 2; continue; }
+          inQ = false; i++; continue;
+        }
+        field += ch; i++; continue;
+      } else {
+        if (ch === '"') { inQ = true; i++; continue; }
+        if (ch === ',') { pushField(); i++; continue; }
+        if (ch === '\n') { pushField(); pushRow(); i++; continue; }
+        field += ch; i++; continue;
+      }
     }
-    out.push(cur);
-    return out;
-  }
+    pushField(); pushRow();
 
-  function cb() {
-    const n = Date.now();
-    return (typeof URL === 'function') ? `?cb=${n}` : '';
+    if (rows.length === 0) return [];
+    const headers = rows.shift().map(h => h.replace(/^\uFEFF/, '').trim()); // strip BOM
+    const out = rows
+      .filter(r => r.some(v => (v || '').trim() !== ''))
+      .map(r => {
+        const o = {};
+        headers.forEach((h, idx) => { o[h] = (r[idx] || '').trim(); });
+        return o;
+      });
+    return out;
   }
 
   function renderLegend(cfg) {
     const el = document.getElementById('legend');
     const rows = Object.entries(cfg.style.perDay).map(([day, st]) =>
       `<div class="row"><span class="swatch" style="background:${st.color}"></span>${day}</div>`).join('');
-    el.innerHTML = `<h4>Zones</h4>${rows}<small>Selected = bright • Others = ${cfg.style.unselectedMode}</small>`;
+    el.innerHTML = `<h4>Layers</h4>${rows}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
+  }
+
+  function setStatus(msg) {
+    const el = document.getElementById('status');
+    el.textContent = msg;
+  }
+
+  function showError(e) {
+    const el = document.getElementById('error');
+    el.style.display = 'block';
+    el.innerHTML = `<strong>Load error</strong><br>${e && e.message ? e.message : e}`;
   }
 })();
