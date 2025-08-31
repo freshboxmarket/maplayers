@@ -7,8 +7,6 @@
 
     // --- map & tiles ---
     const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
-
-    // grayscale base
     const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution:'&copy; OpenStreetMap contributors'
     }).addTo(map);
@@ -17,8 +15,8 @@
 
     const dayLayers = [];        // [{day, layer, perDay}]
     const boundaryFeatures = []; // for clipping color tiles
-    let allBounds = null;        // union of all features
-    let selectionBounds = null;  // union of selected features (last apply)
+    let allBounds = null;        // union of all polygon bounds
+    let selectionBounds = null;  // union of selected polygon bounds
     let hasSelection = false;
     let totalFeatures = 0;
 
@@ -26,15 +24,15 @@
     const customerLayer = L.layerGroup().addTo(map);
     let customerCount = 0;
 
-    // at most one focused feature at a time
+    // one focused polygon at a time
     let currentFocus = null;
 
     renderLegend(cfg, {}, customerCount);
 
-    // --- load layers ---
-    for (const Lcfg of cfg.layers) {
+    // --- polygons ---
+    for (const Lcfg of (cfg.layers || [])) {
       const gj = await fetchJson(Lcfg.url);
-      const perDay = cfg.style.perDay[Lcfg.day] || {};
+      const perDay = (cfg.style && cfg.style.perDay && cfg.style.perDay[Lcfg.day]) || {};
       const color = perDay.stroke || '#666';
       const fillColor = perDay.fill || '#ccc';
 
@@ -60,12 +58,12 @@
           lyr._perDay   = perDay;
           lyr._labelTxt = muni;
           lyr._isSelected = false; // set during applySelection
+          lyr._turfFeat = { type: 'Feature', properties: {}, geometry: feat.geometry };
 
-          // click-to-focus (toggle)
           lyr.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
-            if (currentFocus === lyr) { clearFocus(true); }
-            else { focusFeature(lyr); }
+            if (currentFocus === lyr) clearFocus(true);
+            else focusFeature(lyr);
           });
 
           if (lyr.getBounds) {
@@ -83,23 +81,20 @@
       if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
         const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
         const colorTiles = L.TileLayer.boundaryCanvas('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          boundary: boundaryFC,
-          attribution: ''
+          boundary: boundaryFC, attribution: ''
         });
         colorTiles.addTo(map).setZIndex(2);
         base.setZIndex(1);
       }
     } catch(e) { /* ok */ }
 
-    // click background → clear focus and recenter to selection
-    map.on('click', () => clearFocus(true));
-    // move the map (pan/zoom) → clear focus (do NOT recenter)
-    map.on('movestart', () => clearFocus(false));
+    // clear focus interactions
+    map.on('click', () => { clearFocus(true); });
+    map.on('movestart', () => { clearFocus(false); map.closePopup(); });
+    map.on('zoomstart', () => { map.closePopup(); });
 
-    // initial selection
+    // initial selection + customers
     await applySelection();
-
-    // customers overlay (optional)
     await loadCustomersIfAny();
 
     const refresh = Number(cfg.behavior.refreshSeconds || 0);
@@ -108,8 +103,8 @@
       await loadCustomersIfAny();
     }, refresh * 1000);
 
+    // ---------- selection over polygons ----------
     async function applySelection() {
-      // selection change cancels a manual focus
       clearFocus(false);
 
       const selUrl = qs.get('sel') || cfg.selection.url;
@@ -120,18 +115,14 @@
       const selectedSet = new Set();
       if (hdr) {
         const { headerIndex, colMap } = hdr;
-        const keysIdx = colMap.keys;
-        const dayIdx  = colMap.day;
+        const keysIdx = colMap.keys, dayIdx  = colMap.day;
         for (let i = headerIndex + 1; i < rowsAA.length; i++) {
-          const r = rowsAA[i];
-          if (!r || r.length === 0) continue;
+          const r = rowsAA[i]; if (!r || r.length === 0) continue;
           const rawKeys = ((r[keysIdx] || '') + '')
             .split(cfg.selection.schema.delimiter || ',')
-            .map(s => s.trim())
-            .filter(Boolean);
-          if (cfg.selection.mergeDays) {
-            rawKeys.forEach(k => selectedSet.add(k.toUpperCase()));
-          } else {
+            .map(s => s.trim()).filter(Boolean);
+          if (cfg.selection.mergeDays) rawKeys.forEach(k => selectedSet.add(k.toUpperCase()));
+          else {
             const dayVal = ((r[dayIdx] || '') + '').trim();
             rawKeys.forEach(k => selectedSet.add(`${dayVal}||${k.toUpperCase()}`));
           }
@@ -141,45 +132,38 @@
       hasSelection = selectedSet.size > 0;
       selectionBounds = null;
 
-      // counts & styling
       const counts = {};
       let selectedCount = 0;
       const selBounds = [];
 
       dayLayers.forEach(({ day, layer, perDay }) => {
         let dayTotal = 0, daySel = 0;
-
         layer.eachLayer(lyr => {
           dayTotal++;
           const hit = cfg.selection.mergeDays
             ? selectedSet.has(lyr._routeKey)
             : selectedSet.has(`${lyr._day}||${lyr._routeKey}`);
-
           lyr._isSelected = !!hit;
 
           if (hit) {
             daySel++;
             applyStyleSelected(lyr, perDay, cfg);
-            showLabel(lyr, lyr._labelTxt);      // labels ON for selected
+            showLabel(lyr, lyr._labelTxt);
             if (lyr.getBounds) selBounds.push(lyr.getBounds());
             selectedCount++;
             layer.addLayer(lyr);
           } else {
             if (cfg.style.unselectedMode === 'hide' && hasSelection) {
-              hideLabel(lyr);
-              layer.removeLayer(lyr);
+              hideLabel(lyr); layer.removeLayer(lyr);
             } else {
               applyStyleDim(lyr, perDay, cfg);
-              hideLabel(lyr);                    // labels OFF for unselected
-              layer.addLayer(lyr);
+              hideLabel(lyr); layer.addLayer(lyr);
             }
           }
         });
-
         counts[day] = { selected: daySel, total: dayTotal };
       });
 
-      // center primarily on selected
       if (cfg.behavior.autoZoom) {
         if (hasSelection && selBounds.length) {
           selectionBounds = selBounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(selBounds[0]));
@@ -190,7 +174,7 @@
       }
 
       renderLegend(cfg, counts, customerCount);
-      setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount} • Customers: ${customerCount}${hasSelection ? '' : ' • (no keys parsed; showing all dimmed)'}`);
+      setStatus(`Features: ${totalFeatures} • Selected: ${selectedCount} • Customers: ${customerCount}`);
     }
 
     // ---------- customers overlay ----------
@@ -198,63 +182,137 @@
       customerLayer.clearLayers();
       customerCount = 0;
 
-      // allow ?cust=off to suppress customers
+      // allow ?cust=off to suppress
       const custToggle = qs.get('cust');
       if (custToggle && custToggle.toLowerCase() === 'off') {
         renderLegend(cfg, null, customerCount);
-        setStatus(`Customers: ${customerCount}`);
         return;
       }
-
-      if (!cfg.customers || cfg.customers.enabled === false) {
+      if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
         renderLegend(cfg, null, customerCount);
-        setStatus(`Customers: ${customerCount}`);
         return;
       }
 
-      const custUrl = cfg.customers.url;
-      if (!custUrl) { renderLegend(cfg, null, customerCount); return; }
-
-      const text = await fetchText(custUrl);
+      const text = await fetchText(cfg.customers.url);
       const rows = parseCsvRows(text);
       if (!rows.length) { renderLegend(cfg, null, customerCount); return; }
 
-      // find header row
       const hdrIdx = findCustomerHeaderIndex(rows, cfg.customers.schema);
       if (hdrIdx === -1) { renderLegend(cfg, null, customerCount); return; }
-
       const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema);
 
-      // build markers
+      // Build coverage polygons list for Turf
+      const coveragePolys = [];
+      dayLayers.forEach(({ layer }) => {
+        layer.eachLayer(lyr => { if (lyr._turfFeat) coveragePolys.push({ feat: lyr._turfFeat, perDay: lyr._perDay }); });
+      });
+
+      // Create markers
       for (let i = hdrIdx + 1; i < rows.length; i++) {
         const r = rows[i]; if (!r || r.length === 0) continue;
-
         const coord = (mapIdx.coords !== -1) ? r[mapIdx.coords] : '';
         const note  = (mapIdx.note   !== -1) ? r[mapIdx.note]   : '';
-
         const ll = parseLatLng(coord);
         if (!ll) continue;
 
-        const s = cfg.style.customers || {};
-        const m = L.circleMarker([ll.lat, ll.lng], {
-          radius: s.radius || 6,
-          color:  s.stroke || '#111',
-          weight: s.weightPx || 2,
-          opacity: s.opacity != null ? s.opacity : 0.9,
-          fillColor: s.fill || '#fff',
-          fillOpacity: s.fillOpacity != null ? s.fillOpacity : 0.85
-        }).addTo(customerLayer);
+        // default (outside): big white dot
+        let style = {
+          radius: cfg.style.customers.radius || 9,
+          color:  cfg.style.customers.stroke || '#111',
+          weight: cfg.style.customers.weightPx || 2,
+          opacity: cfg.style.customers.opacity != null ? cfg.style.customers.opacity : 0.95,
+          fillColor: cfg.style.customers.fill || '#ffffff',
+          fillOpacity: cfg.style.customers.fillOpacity != null ? cfg.style.customers.fillOpacity : 0.95
+        };
 
-        const popup = note ? `<div style="max-width:240px">${escapeHtml(note)}</div>`
-                           : `<div>${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}</div>`;
-        m.bindPopup(popup);
+        // If inside any polygon, colorize with that day palette (first match)
+        const pt = turf.point([ll.lng, ll.lat]);
+        for (let j = 0; j < coveragePolys.length; j++) {
+          if (turf.booleanPointInPolygon(pt, coveragePolys[j].feat)) {
+            const pd = coveragePolys[j].perDay || {};
+            style.color = pd.stroke || style.color;
+            style.fillColor = pd.fill || style.fillColor;
+            break;
+          }
+        }
+
+        const m = L.circleMarker([ll.lat, ll.lng], style).addTo(customerLayer);
+        const popup = note
+          ? `<div style="max-width:260px">${escapeHtml(note)}</div>`
+          : `<div>${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}</div>`;
+        m.bindPopup(popup, { autoClose: true, closeOnClick: true });
 
         customerCount++;
       }
 
       renderLegend(cfg, null, customerCount);
-      // leave map extent unchanged; this overlay is passive
-      setStatus(`Customers plotted: ${customerCount}`);
+      // leave map extent unchanged
+    }
+
+    // ---------- focus/highlight polygons ----------
+    function focusFeature(lyr) {
+      if (currentFocus && currentFocus !== lyr) restoreFeature(currentFocus);
+      currentFocus = lyr;
+
+      const perDay = lyr._perDay || {};
+      const baseWeight = lyr._isSelected ? cfg.style.selected.weightPx : cfg.style.dimmed.weightPx;
+      const hiWeight = Math.max(3, Math.round(baseWeight * 3));
+
+      lyr.setStyle({
+        color: perDay.stroke || '#666',
+        weight: hiWeight,
+        opacity: 1.0,
+        fillColor: perDay.fill || '#ccc',
+        fillOpacity: lyr._isSelected
+          ? (perDay.fillOpacity != null ? perDay.fillOpacity : 0.8)
+          : dimFill(perDay, cfg)
+      });
+
+      showLabel(lyr, lyr._labelTxt);
+      lyr.bringToFront?.();
+
+      const b = lyr.getBounds?.();
+      if (b) map.fitBounds(b.pad(0.2));
+    }
+    function restoreFeature(lyr) {
+      const perDay = lyr._perDay || {};
+      if (lyr._isSelected) {
+        applyStyleSelected(lyr, perDay, cfg); showLabel(lyr, lyr._labelTxt);
+      } else {
+        applyStyleDim(lyr, perDay, cfg); hideLabel(lyr);
+      }
+    }
+    function clearFocus(recenter) {
+      if (!currentFocus) {
+        if (recenter && hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+        return;
+      }
+      restoreFeature(currentFocus);
+      currentFocus = null;
+      if (recenter) {
+        if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+        else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+      }
+    }
+
+    // ---------- polygon style helpers ----------
+    function applyStyleSelected(lyr, perDay, cfg) {
+      lyr.setStyle({
+        color: perDay.stroke || '#666',
+        weight: cfg.style.selected.weightPx,
+        opacity: cfg.style.selected.strokeOpacity,
+        fillColor: perDay.fill || '#ccc',
+        fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
+      });
+    }
+    function applyStyleDim(lyr, perDay, cfg) {
+      lyr.setStyle({
+        color: perDay.stroke || '#666',
+        weight: cfg.style.dimmed.weightPx,
+        opacity: cfg.style.dimmed.strokeOpacity,
+        fillColor: perDay.fill || '#ccc',
+        fillOpacity: dimFill(perDay, cfg)
+      });
     }
 
   } catch (e) {
@@ -264,16 +322,8 @@
 
   // ---------- shared helpers ----------
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
-  async function fetchJson(url) {
-    const res = await fetch(url + cb(url));
-    if (!res.ok) throw new Error(`Fetch failed (${res.status}) for ${url}`);
-    return await res.json();
-  }
-  async function fetchText(url) {
-    const res = await fetch(url + cb(url));
-    if (!res.ok) throw new Error(`Fetch failed (${res.status}) for ${url}`);
-    return await res.text();
-  }
+  async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
+  async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
 
   // CSV → array of arrays
   function parseCsvRows(text) {
@@ -328,10 +378,7 @@
     const wantCoords = (schema.coords || 'Verified Coordinates').toLowerCase();
     const wantNote   = (schema.note   || 'Order Note').toLowerCase();
     const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
-    return {
-      coords: idx(wantCoords),
-      note:   idx(wantNote)
-    };
+    return { coords: idx(wantCoords), note: idx(wantNote) };
   }
   function parseLatLng(s) {
     const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
@@ -348,17 +395,10 @@
     return Math.max(0.08, base * factor);
   }
 
-  // label helpers: permanent tooltip on/off
-  function showLabel(lyr, text) {
-    if (lyr.getTooltip()) lyr.unbindTooltip();
-    lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' });
-  }
-  function hideLabel(lyr) {
-    const t = lyr.getTooltip();
-    if (t) lyr.unbindTooltip();
-  }
+  // labels
+  function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
+  function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
 
-  // Municipality title case (handles slashes/hyphens and common particles)
   function smartTitleCase(s) {
     if (!s) return '';
     s = s.toLowerCase();
@@ -401,7 +441,7 @@
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}${cust}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
   }
 
-  function setStatus(msg) { document.getElementById('status').textContent = msg; }
+  function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
   function showError(e) {
     const el = document.getElementById('error');
     el.style.display = 'block';
