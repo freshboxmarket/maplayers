@@ -10,34 +10,18 @@
     "mergeDays": true
   },
   "layers": [
-    {
-      "day": "Wednesday",
-      "name": "_Wednesday_group",
-      "url": "./data/_Wednesday_group.geojson"
-    },
-    {
-      "day": "Thursday",
-      "name": "_Thursday_group",
-      "url": "./data/_Thursday_group.geojson"
-    },
-    {
-      "day": "Friday",
-      "name": "_Friday_group",
-      "url": "./data/_Friday_group.geojson"
-    },
-    {
-      "day": "Saturday",
-      "name": "_Saturday_group",
-      "url": "./data/_Saturday_group.geojson"
-    }
+    { "day": "Wednesday", "name": "_Wednesday_group", "url": "./data/_Wednesday_group.geojson" },
+    { "day": "Thursday",  "name": "_Thursday_group",  "url": "./data/_Thursday_group.geojson" },
+    { "day": "Friday",    "name": "_Friday_group",    "url": "./data/_Friday_group.geojson" },
+    { "day": "Saturday",  "name": "_Saturday_group",  "url": "./data/_Saturday_group.geojson" }
   ],
   "fields": {
-    "key": "zone key",      // your GeoJSON uses "zone key" (space)
-    "day": "Zone",          // your GeoJSON uses "Zone"
-    "muni": "Municipality"  // optional, for popups
+    "key": "zone key",
+    "day": "Zone",
+    "muni": "Municipality"
   },
   "style": {
-    "unselectedMode": "dim",   // "dim" or "hide"
+    "unselectedMode": "dim",
     "selected": { "opacity": 0.8, "weight": 2 },
     "dimmed":   { "opacity": 0.15, "weight": 1 },
     "perDay": {
@@ -49,6 +33,6 @@
   },
   "behavior": {
     "autoZoom": true,
-    "refreshSeconds": 0  // 0 = no auto-refresh; set e.g. 60 to re-pull selection CSV every minute
+    "refreshSeconds": 0
   }
 }
