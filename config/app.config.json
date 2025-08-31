@@ -2,11 +2,7 @@
   "selection": {
     "type": "csv",
     "url": "https://docs.google.com/spreadsheets/d/e/2PACX-1vSlFU0sHIDee6KXzmFf5MfzJeOg0Jm2Gx0U4DW82Pb-Pwkb6i7Q5nR30_TitJ5bt6dLQXezTuUBU0dP/pub?output=csv",
-    "schema": {
-      "day": "day",
-      "keys": "zone keys",
-      "delimiter": ","
-    },
+    "schema": { "day": "day", "keys": "zone keys", "delimiter": "," },
     "mergeDays": true
   },
   "layers": [
@@ -22,13 +18,13 @@
   },
   "style": {
     "unselectedMode": "dim",
-    "selected": { "opacity": 0.8, "weight": 2 },
-    "dimmed":   { "opacity": 0.15, "weight": 1 },
+    "selected": { "strokeOpacity": 1.0, "weightPx": 2 },
+    "dimmed":   { "strokeOpacity": 0.30, "weightPx": 1, "fillOpacity": 0.12 },
     "perDay": {
-      "Wednesday": { "color": "#2E7D32" },
-      "Thursday":  { "color": "#D32F2F" },
-      "Friday":    { "color": "#1976D2" },
-      "Saturday":  { "color": "#FBC02D" }
+      "Wednesday": { "fill": "#00cc66", "fillOpacity": 0.39, "stroke": "#00994c" },
+      "Thursday":  { "fill": "#ff6666", "fillOpacity": 0.39, "stroke": "#cc0000" },
+      "Friday":    { "fill": "#a6cee3", "fillOpacity": 1.00, "stroke": "#1f78b4" },
+      "Saturday":  { "fill": "#ffff66", "fillOpacity": 0.39, "stroke": "#cccc00" }
     }
   },
   "behavior": {
