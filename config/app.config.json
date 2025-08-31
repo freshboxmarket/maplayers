@@ -10,10 +10,10 @@
     "mergeDays": true
   },
   "layers": [
-    { "day": "Wednesday", "name": "_Wednesday_group", "url": "./data/_Wednesday_group.geojson" },
-    { "day": "Thursday",  "name": "_Thursday_group",  "url": "./data/_Thursday_group.geojson" },
-    { "day": "Friday",    "name": "_Friday_group",    "url": "./data/_Friday_group.geojson" },
-    { "day": "Saturday",  "name": "_Saturday_group",  "url": "./data/_Saturday_group.geojson" }
+    { "day": "Wednesday", "name": "_Wednesday_group", "url": "./_Wednesday_group.geojson" },
+    { "day": "Thursday",  "name": "_Thursday_group",  "url": "./_Thursday_group.geojson" },
+    { "day": "Friday",    "name": "_Friday_group",    "url": "./_Friday_group.geojson" },
+    { "day": "Saturday",  "name": "_Saturday_group",  "url": "./_Saturday_group.geojson" }
   ],
   "fields": {
     "key": "zone key",
