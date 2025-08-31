@@ -12,20 +12,20 @@
     const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution:'&copy; OpenStreetMap contributors'
     }).addTo(map);
-    // make base grayscale
     const baseEl = base.getContainer?.();
     if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
-    // containers for layers & later boundary
-    const dayLayers = [];
-    const boundaryFeatures = []; // to clip the color tiles
-    let allBounds = null;
+    const dayLayers = [];            // [{day, layer, perDay}]
+    const boundaryFeatures = [];     // for clipping color tiles
+    let allBounds = null;            // union of all features
+    let selectionBounds = null;      // union of selected features (last apply)
+    let hasSelection = false;
     let totalFeatures = 0;
+    let currentFocus = null;         // lyr we zoomed into via click (if any)
 
-    // legend scaffold (we'll fill counts later)
     renderLegend(cfg, {});
 
-    // --- load 4 day layers ---
+    // --- load layers ---
     for (const Lcfg of cfg.layers) {
       const gj = await fetchJson(Lcfg.url);
       const perDay = cfg.style.perDay[Lcfg.day] || {};
@@ -42,21 +42,26 @@
         }),
         onEachFeature: (feat, lyr) => {
           totalFeatures++;
-          // collect boundary features for later tile clipping
           boundaryFeatures.push({ type: 'Feature', geometry: feat.geometry });
 
-          const p = feat.properties || {};
-          const key  = (p[cfg.fields.key]  ?? '').toString().toUpperCase().trim();
-          const muni = (p[cfg.fields.muni] ?? '').toString().trim();
+          const p   = feat.properties || {};
+          const key = (p[cfg.fields.key]  ?? '').toString().toUpperCase().trim();
+          const muniRaw = (p[cfg.fields.muni] ?? '').toString().trim();
+          const muni = smartTitleCase(muniRaw);            // << label text you asked for
           const day  = (p[cfg.fields.day]  ?? Lcfg.day).toString().trim();
 
           lyr._routeKey = key;
           lyr._day      = day;
           lyr._perDay   = perDay;
+          lyr._labelTxt = muni;                            // store the pretty label
 
-          // pretty, permanent label: "s13 • PERTH EAST"
-          const label = [key, muni].filter(Boolean).join(' • ');
-          lyr.bindTooltip(label, { permanent: true, direction: 'center', className: 'lbl' });
+          // start with NO label bound; we attach/detach when (de)selected or focused
+
+          // click-to-focus
+          lyr.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            focusFeature(lyr);
+          });
 
           if (lyr.getBounds) {
             const b = lyr.getBounds();
@@ -68,7 +73,7 @@
       dayLayers.push({ day: Lcfg.day, layer, perDay });
     }
 
-    // --- color tiles clipped to union of delivery polygons ---
+    // color tiles clipped to union of delivery polygons
     try {
       if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
         const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -79,17 +84,23 @@
         colorTiles.addTo(map).setZIndex(2);
         base.setZIndex(1);
       }
-    } catch(e) { /* fallback to grayscale-only base if plugin not present */ }
+    } catch(e) { /* ok to ignore */ }
 
-    // initial fit (in case selection is empty)
-    if (cfg.behavior.autoZoom && allBounds) map.fitBounds(allBounds.pad(0.1));
+    // click outside to clear focus and refit to selection
+    map.on('click', () => {
+      if (currentFocus) clearFocus();
+      else if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+    });
 
-    // --- selection & styling ---
-    await applySelection();
+    await applySelection(); // center on selected at launch
+
     const refresh = Number(cfg.behavior.refreshSeconds || 0);
     if (refresh > 0) setInterval(applySelection, refresh * 1000);
 
     async function applySelection() {
+      // any change to selection cancels a manual focus
+      if (currentFocus) clearFocus();
+
       const selUrl = qs.get('sel') || cfg.selection.url;
       const csvText = await fetchText(selUrl);
       const rowsAA = parseCsvRows(csvText);
@@ -117,14 +128,17 @@
         }
       }
 
-      // counts per day
-      const counts = {}; // { day: { selected, total } }
+      hasSelection = selected.size > 0;
+      selectionBounds = null;
+
+      // counts & styling
+      const counts = {};
       let selectedCount = 0;
       const selBounds = [];
-      const hasSelection = selected.size > 0;
 
       dayLayers.forEach(({ day, layer, perDay }) => {
         let dayTotal = 0, daySel = 0;
+
         layer.eachLayer(lyr => {
           dayTotal++;
           const hit = cfg.selection.mergeDays
@@ -140,15 +154,13 @@
               fillColor: perDay.fill || '#ccc',
               fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
             });
-            // brighten label
-            const tip = lyr.getTooltip();
-            if (tip?.getElement()) tip.getElement().classList.remove('dim');
-
+            showLabel(lyr, lyr._labelTxt);
             if (lyr.getBounds) selBounds.push(lyr.getBounds());
             selectedCount++;
             layer.addLayer(lyr);
           } else {
             if (cfg.style.unselectedMode === 'hide' && hasSelection) {
+              hideLabel(lyr);
               layer.removeLayer(lyr);
             } else {
               lyr.setStyle({
@@ -158,28 +170,52 @@
                 fillColor: perDay.fill || '#ccc',
                 fillOpacity: dimFill(perDay, cfg)
               });
-              // dim label
-              const tip = lyr.getTooltip();
-              if (tip?.getElement()) tip.getElement().classList.add('dim');
-
+              if (currentFocus === lyr) showLabel(lyr, lyr._labelTxt); // focused unselected stays labeled
+              else hideLabel(lyr);                                     // otherwise no labels for unselected
               layer.addLayer(lyr);
             }
           }
         });
+
         counts[day] = { selected: daySel, total: dayTotal };
       });
 
+      // center on selected primarily
       if (cfg.behavior.autoZoom) {
         if (hasSelection && selBounds.length) {
-          const allSel = selBounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(selBounds[0]));
-          map.fitBounds(allSel.pad(0.1));
+          selectionBounds = selBounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(selBounds[0]));
+          map.fitBounds(selectionBounds.pad(0.1));
         } else if (allBounds) {
           map.fitBounds(allBounds.pad(0.1));
         }
       }
 
       renderLegend(cfg, counts);
-      setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount} • Keys: ${hasSelection ? Array.from(selected).join(', ') : '—'}`);
+      setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount}${hasSelection ? '' : ' • (no keys parsed; showing all dimmed)'}`);
+    }
+
+    // ---- focus helpers ----
+    function focusFeature(lyr) {
+      currentFocus = lyr;
+      showLabel(lyr, lyr._labelTxt);
+      lyr.bringToFront?.();
+      const b = lyr.getBounds?.();
+      if (b) map.fitBounds(b.pad(0.2));
+    }
+    function clearFocus() {
+      if (!currentFocus) return;
+      // if that feature is not selected, hide its label again
+      if (!hasSelection ||
+          (hasSelection && !featureIsSelected(currentFocus))) {
+        hideLabel(currentFocus);
+      }
+      currentFocus = null;
+      if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+      else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+    }
+    function featureIsSelected(lyr) {
+      // we infer from current style: selected has higher weight
+      return lyr.options && lyr.options.weight === cfg.style.selected.weightPx;
     }
 
   } catch (e) {
@@ -208,22 +244,17 @@
     const pushF=()=>{ r.push(f); f=''; }, pushR=()=>{ out.push(r); r=[]; };
     while (i<N) {
       const c = text[i];
-      if (q) {
-        if (c === '"') {
-          if (i+1<N && text[i+1] === '"') { f+='"'; i+=2; } else { q=false; i++; }
-        } else { f+=c; i++; }
-      } else {
-        if (c === '"') { q=true; i++; }
-        else if (c === ',') { pushF(); i++; }
-        else if (c === '\n') { pushF(); pushR(); i++; }
-        else { f+=c; i++; }
-      }
+      if (q) { if (c === '"') { if (i+1<N && text[i+1] === '"') { f+='"'; i+=2; } else { q=false; i++; } }
+               else { f+=c; i++; } }
+      else { if (c === '"') { q=true; i++; }
+             else if (c === ',') { pushF(); i++; }
+             else if (c === '\n') { pushF(); pushR(); i++; }
+             else { f+=c; i++; } }
     }
     pushF(); pushR();
-    return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/,'').trim()));
+    return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
   }
-
-  // find header row that includes a keys column (and day if present)
+  // find header row including keys (and day if present)
   function findHeader(rows, schema) {
     const wantDay  = (schema.day  || 'day').toLowerCase();
     const wantKeys = (schema.keys || 'zone keys').toLowerCase();
@@ -240,11 +271,47 @@
     }
     return null;
   }
-
   function dimFill(perDay, cfg) {
     const base = perDay.fillOpacity != null ? perDay.fillOpacity : 0.8;
     const factor = cfg.style.dimmed.fillFactor != null ? cfg.style.dimmed.fillFactor : 0.3;
     return Math.max(0.08, base * factor);
+  }
+
+  // label helpers: permanent tooltip on/off
+  function showLabel(lyr, text) {
+    // rebind to ensure 'permanent' is applied
+    if (lyr.getTooltip()) lyr.unbindTooltip();
+    lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' });
+  }
+  function hideLabel(lyr) {
+    const t = lyr.getTooltip();
+    if (t) lyr.unbindTooltip();
+  }
+
+  // smart title case for MUNICIPALITY NAMES
+  function smartTitleCase(s) {
+    if (!s) return '';
+    s = s.toLowerCase();
+    // split by slashes or hyphens but keep the separators
+    const parts = s.split(/([\/-])/g);
+    const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']);
+    const fixWord = (w, isFirst) => {
+      if (!w) return w;
+      if (!isFirst && small.has(w)) return w;
+      // St. / Mt. abbreviations
+      if (w === 'st' || w === 'st.' ) return 'St.';
+      if (w === 'mt' || w === 'mt.' ) return 'Mt.';
+      // normal cap
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    };
+    // rebuild with title-casing around separators
+    let tokenIdx = 0;
+    for (let i=0;i<parts.length;i++){
+      if (parts[i] === '/' || parts[i] === '-') continue;
+      const tokens = parts[i].split(/\s+/).map((tok, j) => fixWord(tok, tokenIdx++ === 0));
+      parts[i] = tokens.join(' ');
+    }
+    return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
   function renderLegend(cfg, counts) {
@@ -260,7 +327,6 @@
     }).join('');
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
   }
-
   function setStatus(msg) { document.getElementById('status').textContent = msg; }
   function showError(e) {
     const el = document.getElementById('error');
