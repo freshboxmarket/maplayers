@@ -13,21 +13,28 @@
     const baseEl = base.getContainer?.();
     if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
-    const dayLayers = [];        // [{day, layer, perDay}]
-    const boundaryFeatures = []; // for clipping color tiles
-    let allBounds = null;        // union of all polygon bounds
-    let selectionBounds = null;  // union of selected polygon bounds
+    const dayLayers = [];              // [{day, layer, perDay}]
+    const boundaryFeatures = [];       // for clipping color tiles
+    let allBounds = null;
+    let selectionBounds = null;
     let hasSelection = false;
     let totalFeatures = 0;
 
-    // customers
+    // Customers
     const customerLayer = L.layerGroup().addTo(map);
+    const customerMarkers = [];        // [{ marker, lat, lng }]
     let customerCount = 0;
+    let custWithinSel = 0;
+    let custOutsideSel = 0;
 
     // one focused polygon at a time
     let currentFocus = null;
 
-    renderLegend(cfg, {}, customerCount);
+    // coverage sets for Turf
+    const coveragePolysAll = [];       // all polygons (for recolor)
+    let coveragePolysSelected = [];    // selected-only (for counts)
+
+    renderLegend(cfg, {}, custWithinSel, custOutsideSel);
 
     // --- polygons ---
     for (const Lcfg of (cfg.layers || [])) {
@@ -58,7 +65,10 @@
           lyr._perDay   = perDay;
           lyr._labelTxt = muni;
           lyr._isSelected = false; // set during applySelection
-          lyr._turfFeat = { type: 'Feature', properties: {}, geometry: feat.geometry };
+          lyr._turfFeat = { type: 'Feature', properties: { day }, geometry: feat.geometry };
+
+          // keep a record for "color-by-any-polygon"
+          coveragePolysAll.push({ feat: lyr._turfFeat, perDay });
 
           lyr.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
@@ -131,6 +141,7 @@
 
       hasSelection = selectedSet.size > 0;
       selectionBounds = null;
+      coveragePolysSelected = [];
 
       const counts = {};
       let selectedCount = 0;
@@ -149,6 +160,7 @@
             daySel++;
             applyStyleSelected(lyr, perDay, cfg);
             showLabel(lyr, lyr._labelTxt);
+            coveragePolysSelected.push({ feat: lyr._turfFeat, perDay });
             if (lyr.getBounds) selBounds.push(lyr.getBounds());
             selectedCount++;
             layer.addLayer(lyr);
@@ -173,41 +185,59 @@
         }
       }
 
-      renderLegend(cfg, counts, customerCount);
-      setStatus(`Features: ${totalFeatures} • Selected: ${selectedCount} • Customers: ${customerCount}`);
+      // recolor + recount customers relative to the NEW selection
+      recolorAndRecountCustomers();
+
+      renderLegend(cfg, counts, custWithinSel, custOutsideSel);
+      setStatus(`Features: ${totalFeatures} • Selected: ${selectedCount} • Customers (in/out): ${custWithinSel}/${custOutsideSel}`);
     }
 
     // ---------- customers overlay ----------
     async function loadCustomersIfAny() {
       customerLayer.clearLayers();
+      customerMarkers.length = 0;
       customerCount = 0;
 
-      // allow ?cust=off to suppress
       const custToggle = qs.get('cust');
       if (custToggle && custToggle.toLowerCase() === 'off') {
-        renderLegend(cfg, null, customerCount);
+        custWithinSel = 0; custOutsideSel = 0;
+        renderLegend(cfg, null, custWithinSel, custOutsideSel);
         return;
       }
       if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
-        renderLegend(cfg, null, customerCount);
+        custWithinSel = 0; custOutsideSel = 0;
+        renderLegend(cfg, null, custWithinSel, custOutsideSel);
         return;
       }
 
       const text = await fetchText(cfg.customers.url);
       const rows = parseCsvRows(text);
-      if (!rows.length) { renderLegend(cfg, null, customerCount); return; }
+      if (!rows.length) {
+        custWithinSel = 0; custOutsideSel = 0;
+        renderLegend(cfg, null, custWithinSel, custOutsideSel);
+        return;
+      }
 
       const hdrIdx = findCustomerHeaderIndex(rows, cfg.customers.schema);
-      if (hdrIdx === -1) { renderLegend(cfg, null, customerCount); return; }
+      if (hdrIdx === -1) {
+        custWithinSel = 0; custOutsideSel = 0;
+        renderLegend(cfg, null, custWithinSel, custOutsideSel);
+        return;
+      }
       const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema);
 
-      // Build coverage polygons list for Turf
-      const coveragePolys = [];
-      dayLayers.forEach(({ layer }) => {
-        layer.eachLayer(lyr => { if (lyr._turfFeat) coveragePolys.push({ feat: lyr._turfFeat, perDay: lyr._perDay }); });
-      });
+      // default style
+      const s = cfg.style.customers || {};
+      const baseStyle = {
+        radius: s.radius || 9,
+        color:  s.stroke || '#111',
+        weight: s.weightPx || 2,
+        opacity: s.opacity != null ? s.opacity : 0.95,
+        fillColor: s.fill || '#ffffff',
+        fillOpacity: s.fillOpacity != null ? s.fillOpacity : 0.95
+      };
 
-      // Create markers
+      // markers
       for (let i = hdrIdx + 1; i < rows.length; i++) {
         const r = rows[i]; if (!r || r.length === 0) continue;
         const coord = (mapIdx.coords !== -1) ? r[mapIdx.coords] : '';
@@ -215,41 +245,75 @@
         const ll = parseLatLng(coord);
         if (!ll) continue;
 
-        // default (outside): big white dot
-        let style = {
-          radius: cfg.style.customers.radius || 9,
-          color:  cfg.style.customers.stroke || '#111',
-          weight: cfg.style.customers.weightPx || 2,
-          opacity: cfg.style.customers.opacity != null ? cfg.style.customers.opacity : 0.95,
-          fillColor: cfg.style.customers.fill || '#ffffff',
-          fillOpacity: cfg.style.customers.fillOpacity != null ? cfg.style.customers.fillOpacity : 0.95
-        };
-
-        // If inside any polygon, colorize with that day palette (first match)
-        const pt = turf.point([ll.lng, ll.lat]);
-        for (let j = 0; j < coveragePolys.length; j++) {
-          if (turf.booleanPointInPolygon(pt, coveragePolys[j].feat)) {
-            const pd = coveragePolys[j].perDay || {};
-            style.color = pd.stroke || style.color;
-            style.fillColor = pd.fill || style.fillColor;
-            break;
-          }
-        }
-
-        const m = L.circleMarker([ll.lat, ll.lng], style).addTo(customerLayer);
-        const popup = note
+        const m = L.circleMarker([ll.lat, ll.lng], baseStyle).addTo(customerLayer);
+        const popupHtml = note
           ? `<div style="max-width:260px">${escapeHtml(note)}</div>`
           : `<div>${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}</div>`;
-        m.bindPopup(popup, { autoClose: true, closeOnClick: true });
+        m.bindPopup(popupHtml, { autoClose: true, closeOnClick: true });
 
+        customerMarkers.push({ marker: m, lat: ll.lat, lng: ll.lng });
         customerCount++;
       }
 
-      renderLegend(cfg, null, customerCount);
-      // leave map extent unchanged
+      // color + count
+      recolorAndRecountCustomers();
+
+      // keep extent unchanged
+      renderLegend(cfg, null, custWithinSel, custOutsideSel);
+      setStatus(`Customers (in/out): ${custWithinSel}/${custOutsideSel}`);
     }
 
-    // ---------- focus/highlight polygons ----------
+    // recolor (by ANY polygon) + recount (by SELECTED polygons)
+    function recolorAndRecountCustomers() {
+      let inSel = 0, outSel = 0;
+      const turfOn = (typeof turf !== 'undefined');
+
+      for (const rec of customerMarkers) {
+        // base style (white)
+        const s = cfg.style.customers || {};
+        const style = {
+          radius: s.radius || 9,
+          color:  s.stroke || '#111',
+          weight: s.weightPx || 2,
+          opacity: s.opacity != null ? s.opacity : 0.95,
+          fillColor: s.fill || '#ffffff',
+          fillOpacity: s.fillOpacity != null ? s.fillOpacity : 0.95
+        };
+
+        if (turfOn) {
+          const pt = turf.point([rec.lng, rec.lat]);
+
+          // color by any polygon hit (first match wins)
+          for (let j = 0; j < coveragePolysAll.length; j++) {
+            if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
+              const pd = coveragePolysAll[j].perDay || {};
+              style.color = pd.stroke || style.color;
+              style.fillColor = pd.fill || style.fillColor;
+              break;
+            }
+          }
+
+          // count by selected polygons
+          let insideSel = false;
+          if (hasSelection && coveragePolysSelected.length) {
+            for (let k = 0; k < coveragePolysSelected.length; k++) {
+              if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) { insideSel = true; break; }
+            }
+          }
+          if (insideSel) inSel++; else outSel++;
+        } else {
+          // no Turf → can't classify; count all as "outside"
+          outSel++;
+        }
+
+        rec.marker.setStyle(style);
+      }
+
+      custWithinSel = inSel;
+      custOutsideSel = outSel;
+    }
+
+    // ---------- polygon focus/highlight ----------
     function focusFeature(lyr) {
       if (currentFocus && currentFocus !== lyr) restoreFeature(currentFocus);
       currentFocus = lyr;
@@ -399,6 +463,15 @@
   function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
   function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
 
+  // escapes for popup HTML
+  function escapeHtml(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  // Municipality title case
   function smartTitleCase(s) {
     if (!s) return '';
     s = s.toLowerCase();
@@ -420,7 +493,8 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
-  function renderLegend(cfg, counts, customers) {
+  // legend
+  function renderLegend(cfg, counts, custIn, custOut) {
     const el = document.getElementById('legend');
     const rowsHtml = (cfg.layers || []).map(Lcfg => {
       const st = (cfg.style && cfg.style.perDay && cfg.style.perDay[Lcfg.day]) || {};
@@ -431,14 +505,13 @@
         <div class="counts">${c.selected}/${c.total}</div>
       </div>`;
     }).join('');
-    const cust = (typeof customers === 'number')
-      ? `<div class="row" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px">
-           <span class="swatch" style="background:#fff;border-color:#111"></span>
-           <div>Customers</div>
-           <div class="counts">${customers}</div>
-         </div>`
-      : '';
-    el.innerHTML = `<h4>Layers</h4>${rowsHtml}${cust}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
+    const custBlock = `<div class="row" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px">
+        <div>Customers within selection:</div><div class="counts">${custIn ?? 0}</div>
+      </div>
+      <div class="row">
+        <div>Customers outside selection:</div><div class="counts">${custOut ?? 0}</div>
+      </div>`;
+    el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}`;
   }
 
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
