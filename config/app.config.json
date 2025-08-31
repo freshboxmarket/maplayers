@@ -36,12 +36,12 @@
       "Saturday":  { "fill": "#ffff66", "fillOpacity": 0.39, "stroke": "#cccc00" }
     },
     "customers": {
-      "radius": 6,
+      "radius": 9,
       "stroke": "#111",
       "fill":   "#ffffff",
       "weightPx": 2,
-      "opacity": 0.9,
-      "fillOpacity": 0.85
+      "opacity": 0.95,
+      "fillOpacity": 0.95
     }
   },
   "behavior": {
