@@ -22,10 +22,14 @@
     let hasSelection = false;
     let totalFeatures = 0;
 
+    // customers
+    const customerLayer = L.layerGroup().addTo(map);
+    let customerCount = 0;
+
     // at most one focused feature at a time
     let currentFocus = null;
 
-    renderLegend(cfg, {});
+    renderLegend(cfg, {}, customerCount);
 
     // --- load layers ---
     for (const Lcfg of cfg.layers) {
@@ -94,8 +98,15 @@
 
     // initial selection
     await applySelection();
+
+    // customers overlay (optional)
+    await loadCustomersIfAny();
+
     const refresh = Number(cfg.behavior.refreshSeconds || 0);
-    if (refresh > 0) setInterval(applySelection, refresh * 1000);
+    if (refresh > 0) setInterval(async () => {
+      await applySelection();
+      await loadCustomersIfAny();
+    }, refresh * 1000);
 
     async function applySelection() {
       // selection change cancels a manual focus
@@ -178,80 +189,72 @@
         }
       }
 
-      renderLegend(cfg, counts);
-      setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount}${hasSelection ? '' : ' • (no keys parsed; showing all dimmed)'}`);
+      renderLegend(cfg, counts, customerCount);
+      setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount} • Customers: ${customerCount}${hasSelection ? '' : ' • (no keys parsed; showing all dimmed)'}`);
     }
 
-    // ---------- focus/highlight ----------
-    function focusFeature(lyr) {
-      if (currentFocus && currentFocus !== lyr) restoreFeature(currentFocus);
-      currentFocus = lyr;
+    // ---------- customers overlay ----------
+    async function loadCustomersIfAny() {
+      customerLayer.clearLayers();
+      customerCount = 0;
 
-      // highlight: 3× current base weight, full stroke opacity, keep fill as-is
-      const perDay = lyr._perDay || {};
-      const baseWeight = lyr._isSelected ? cfg.style.selected.weightPx : cfg.style.dimmed.weightPx;
-      const hiWeight = Math.max(3, Math.round(baseWeight * 3)); // 3×, at least 3px
-
-      lyr.setStyle({
-        color: perDay.stroke || '#666',
-        weight: hiWeight,
-        opacity: 1.0,
-        fillColor: perDay.fill || '#ccc',
-        fillOpacity: lyr._isSelected
-          ? (perDay.fillOpacity != null ? perDay.fillOpacity : 0.8)
-          : dimFill(perDay, cfg)
-      });
-
-      showLabel(lyr, lyr._labelTxt);       // show its name while focused
-      lyr.bringToFront?.();
-
-      const b = lyr.getBounds?.();
-      if (b) map.fitBounds(b.pad(0.2));
-    }
-
-    function restoreFeature(lyr) {
-      const perDay = lyr._perDay || {};
-      if (lyr._isSelected) {
-        applyStyleSelected(lyr, perDay, cfg);
-        showLabel(lyr, lyr._labelTxt);     // keep label for selected
-      } else {
-        applyStyleDim(lyr, perDay, cfg);
-        hideLabel(lyr);                     // hide label for unselected
-      }
-    }
-
-    function clearFocus(recenter) {
-      if (!currentFocus) {
-        if (recenter && hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+      // allow ?cust=off to suppress customers
+      const custToggle = qs.get('cust');
+      if (custToggle && custToggle.toLowerCase() === 'off') {
+        renderLegend(cfg, null, customerCount);
+        setStatus(`Customers: ${customerCount}`);
         return;
       }
-      restoreFeature(currentFocus);
-      currentFocus = null;
-      if (recenter) {
-        if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
-        else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+
+      if (!cfg.customers || cfg.customers.enabled === false) {
+        renderLegend(cfg, null, customerCount);
+        setStatus(`Customers: ${customerCount}`);
+        return;
       }
-    }
 
-    // ---------- style helpers ----------
-    function applyStyleSelected(lyr, perDay, cfg) {
-      lyr.setStyle({
-        color: perDay.stroke || '#666',
-        weight: cfg.style.selected.weightPx,
-        opacity: cfg.style.selected.strokeOpacity,
-        fillColor: perDay.fill || '#ccc',
-        fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
-      });
-    }
+      const custUrl = cfg.customers.url;
+      if (!custUrl) { renderLegend(cfg, null, customerCount); return; }
 
-    function applyStyleDim(lyr, perDay, cfg) {
-      lyr.setStyle({
-        color: perDay.stroke || '#666',
-        weight: cfg.style.dimmed.weightPx,
-        opacity: cfg.style.dimmed.strokeOpacity,
-        fillColor: perDay.fill || '#ccc',
-        fillOpacity: dimFill(perDay, cfg)
-      });
+      const text = await fetchText(custUrl);
+      const rows = parseCsvRows(text);
+      if (!rows.length) { renderLegend(cfg, null, customerCount); return; }
+
+      // find header row
+      const hdrIdx = findCustomerHeaderIndex(rows, cfg.customers.schema);
+      if (hdrIdx === -1) { renderLegend(cfg, null, customerCount); return; }
+
+      const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema);
+
+      // build markers
+      for (let i = hdrIdx + 1; i < rows.length; i++) {
+        const r = rows[i]; if (!r || r.length === 0) continue;
+
+        const coord = (mapIdx.coords !== -1) ? r[mapIdx.coords] : '';
+        const note  = (mapIdx.note   !== -1) ? r[mapIdx.note]   : '';
+
+        const ll = parseLatLng(coord);
+        if (!ll) continue;
+
+        const s = cfg.style.customers || {};
+        const m = L.circleMarker([ll.lat, ll.lng], {
+          radius: s.radius || 6,
+          color:  s.stroke || '#111',
+          weight: s.weightPx || 2,
+          opacity: s.opacity != null ? s.opacity : 0.9,
+          fillColor: s.fill || '#fff',
+          fillOpacity: s.fillOpacity != null ? s.fillOpacity : 0.85
+        }).addTo(customerLayer);
+
+        const popup = note ? `<div style="max-width:240px">${escapeHtml(note)}</div>`
+                           : `<div>${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}</div>`;
+        m.bindPopup(popup);
+
+        customerCount++;
+      }
+
+      renderLegend(cfg, null, customerCount);
+      // leave map extent unchanged; this overlay is passive
+      setStatus(`Customers plotted: ${customerCount}`);
     }
 
   } catch (e) {
@@ -291,7 +294,7 @@
     return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
   }
 
-  // find header row including keys (and day if present)
+  // selection header finder
   function findHeader(rows, schema) {
     const wantDay  = (schema.day  || 'day').toLowerCase();
     const wantKeys = (schema.keys || 'zone keys').toLowerCase();
@@ -307,6 +310,36 @@
       if (keysIdx !== -1) return { headerIndex: i, colMap: { day: dayIdx, keys: keysIdx } };
     }
     return null;
+  }
+
+  // customers header helpers
+  function findCustomerHeaderIndex(rows, schema) {
+    const wantCoords = (schema.coords || 'Verified Coordinates').toLowerCase();
+    const wantNote   = (schema.note   || 'Order Note').toLowerCase();
+    for (let i=0;i<rows.length;i++) {
+      const hdr = rows[i] || [];
+      const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
+      const hasNote   = hdr.some(h => (h||'').toLowerCase() === wantNote);
+      if (hasCoords || hasNote) return i;
+    }
+    return -1;
+  }
+  function headerIndexMap(hdrRow, schema) {
+    const wantCoords = (schema.coords || 'Verified Coordinates').toLowerCase();
+    const wantNote   = (schema.note   || 'Order Note').toLowerCase();
+    const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
+    return {
+      coords: idx(wantCoords),
+      note:   idx(wantNote)
+    };
+  }
+  function parseLatLng(s) {
+    const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
+    if (!m) return null;
+    const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+    return { lat, lng };
   }
 
   function dimFill(perDay, cfg) {
@@ -347,10 +380,10 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
-  function renderLegend(cfg, counts) {
+  function renderLegend(cfg, counts, customers) {
     const el = document.getElementById('legend');
-    const rowsHtml = cfg.layers.map(Lcfg => {
-      const st = cfg.style.perDay[Lcfg.day] || {};
+    const rowsHtml = (cfg.layers || []).map(Lcfg => {
+      const st = (cfg.style && cfg.style.perDay && cfg.style.perDay[Lcfg.day]) || {};
       const c  = (counts && counts[Lcfg.day]) ? counts[Lcfg.day] : { selected: 0, total: 0 };
       return `<div class="row">
         <span class="swatch" style="background:${st.fill}; border-color:${st.stroke}"></span>
@@ -358,7 +391,14 @@
         <div class="counts">${c.selected}/${c.total}</div>
       </div>`;
     }).join('');
-    el.innerHTML = `<h4>Layers</h4>${rowsHtml}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
+    const cust = (typeof customers === 'number')
+      ? `<div class="row" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px">
+           <span class="swatch" style="background:#fff;border-color:#111"></span>
+           <div>Customers</div>
+           <div class="counts">${customers}</div>
+         </div>`
+      : '';
+    el.innerHTML = `<h4>Layers</h4>${rowsHtml}${cust}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
   }
 
   function setStatus(msg) { document.getElementById('status').textContent = msg; }
