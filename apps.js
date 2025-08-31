@@ -15,13 +15,17 @@
     const baseEl = base.getContainer?.();
     if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
+    // state
     const dayLayers = [];            // [{day, layer, perDay}]
     const boundaryFeatures = [];     // for clipping color tiles
     let allBounds = null;            // union of all features
     let selectionBounds = null;      // union of selected features (last apply)
-    let hasSelection = false;
     let totalFeatures = 0;
-    let currentFocus = null;         // lyr we zoomed into via click (if any)
+    let hasSelection = false;
+
+    // focus state (one feature at a time) + its heavy outline overlay
+    let currentFocus = null;
+    let focusOutline = null;
 
     renderLegend(cfg, {});
 
@@ -47,17 +51,16 @@
           const p   = feat.properties || {};
           const key = (p[cfg.fields.key]  ?? '').toString().toUpperCase().trim();
           const muniRaw = (p[cfg.fields.muni] ?? '').toString().trim();
-          const muni = smartTitleCase(muniRaw);            // << label text you asked for
+          const muni = smartTitleCase(muniRaw);
           const day  = (p[cfg.fields.day]  ?? Lcfg.day).toString().trim();
 
           lyr._routeKey = key;
           lyr._day      = day;
           lyr._perDay   = perDay;
-          lyr._labelTxt = muni;                            // store the pretty label
+          lyr._labelTxt = muni;
+          lyr._isSelected = false; // set in applySelection
 
-          // start with NO label bound; we attach/detach when (de)selected or focused
-
-          // click-to-focus
+          // click-to-focus: highlight border + show label; only one focused at a time
           lyr.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
             focusFeature(lyr);
@@ -84,22 +87,26 @@
         colorTiles.addTo(map).setZIndex(2);
         base.setZIndex(1);
       }
-    } catch(e) { /* ok to ignore */ }
+    } catch(e) { /* ok */ }
 
-    // click outside to clear focus and refit to selection
+    // background click: clear focus + refit to selected extent
     map.on('click', () => {
-      if (currentFocus) clearFocus();
-      else if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+      clearFocus();
+      if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
     });
 
-    await applySelection(); // center on selected at launch
+    // any map movement: clear transient focus (so only selected labels remain)
+    map.on('movestart', () => { clearFocus(); });
+
+    await applySelection(); // centers on selection at launch
 
     const refresh = Number(cfg.behavior.refreshSeconds || 0);
     if (refresh > 0) setInterval(applySelection, refresh * 1000);
 
+    // ---------- selection & styling ----------
     async function applySelection() {
-      // any change to selection cancels a manual focus
-      if (currentFocus) clearFocus();
+      // changing selection cancels transient focus
+      clearFocus();
 
       const selUrl = qs.get('sel') || cfg.selection.url;
       const csvText = await fetchText(selUrl);
@@ -111,7 +118,6 @@
         const { headerIndex, colMap } = hdr;
         const keysIdx = colMap.keys;
         const dayIdx  = colMap.day;
-
         for (let i = headerIndex + 1; i < rowsAA.length; i++) {
           const r = rowsAA[i];
           if (!r || r.length === 0) continue;
@@ -131,7 +137,7 @@
       hasSelection = selected.size > 0;
       selectionBounds = null;
 
-      // counts & styling
+      // counts + apply styles/labels
       const counts = {};
       let selectedCount = 0;
       const selBounds = [];
@@ -141,40 +147,28 @@
 
         layer.eachLayer(lyr => {
           dayTotal++;
-          const hit = cfg.selection.mergeDays
-            ? selected.has(lyr._routeKey)
-            : selected.has(`${lyr._day}||${lyr._routeKey}`);
 
-          if (hasSelection && hit) {
-            daySel++;
-            lyr.setStyle({
-              color: perDay.stroke || '#666',
-              weight: cfg.style.selected.weightPx,
-              opacity: cfg.style.selected.strokeOpacity,
-              fillColor: perDay.fill || '#ccc',
-              fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
-            });
+          const hit = hasSelection && (
+            cfg.selection.mergeDays
+              ? selected.has(lyr._routeKey)
+              : selected.has(`${lyr._day}||${lyr._routeKey}`)
+          );
+
+          lyr._isSelected = !!hit;
+
+          if (hit) {
+            applySelectedStyle(lyr, perDay, cfg);
             showLabel(lyr, lyr._labelTxt);
             if (lyr.getBounds) selBounds.push(lyr.getBounds());
-            selectedCount++;
-            layer.addLayer(lyr);
+            selectedCount++; daySel++;
           } else {
-            if (cfg.style.unselectedMode === 'hide' && hasSelection) {
-              hideLabel(lyr);
-              layer.removeLayer(lyr);
-            } else {
-              lyr.setStyle({
-                color: perDay.stroke || '#666',
-                weight: cfg.style.dimmed.weightPx,
-                opacity: cfg.style.dimmed.strokeOpacity,
-                fillColor: perDay.fill || '#ccc',
-                fillOpacity: dimFill(perDay, cfg)
-              });
-              if (currentFocus === lyr) showLabel(lyr, lyr._labelTxt); // focused unselected stays labeled
-              else hideLabel(lyr);                                     // otherwise no labels for unselected
-              layer.addLayer(lyr);
-            }
+            applyDimmedStyle(lyr, perDay, cfg);
+            // only keep label if this (now) unselected feature is the current focus
+            if (currentFocus === lyr) showLabel(lyr, lyr._labelTxt);
+            else hideLabel(lyr);
           }
+
+          layer.addLayer(lyr);
         });
 
         counts[day] = { selected: daySel, total: dayTotal };
@@ -194,28 +188,47 @@
       setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount}${hasSelection ? '' : ' • (no keys parsed; showing all dimmed)'}`);
     }
 
-    // ---- focus helpers ----
+    // ---------- focus/highlight helpers ----------
     function focusFeature(lyr) {
+      // clear previous focus (removes outline & hides its label if not selected)
+      clearFocus();
+
       currentFocus = lyr;
+
+      // heavy dashed outline behind the feature
+      try {
+        const geom = lyr.toGeoJSON();
+        focusOutline = L.geoJSON(geom, {
+          style: { color: '#000', weight: 6, opacity: 0.9, fillOpacity: 0, dashArray: '6 3' }
+        }).addTo(map);
+      } catch (e) { /* if toGeoJSON not available, skip outline */ }
+
+      // bump main stroke a bit
+      lyr.setStyle({ weight: (cfg.style.selected.weightPx || 2) + 2, opacity: 1 });
       showLabel(lyr, lyr._labelTxt);
       lyr.bringToFront?.();
+
       const b = lyr.getBounds?.();
       if (b) map.fitBounds(b.pad(0.2));
     }
+
     function clearFocus() {
-      if (!currentFocus) return;
-      // if that feature is not selected, hide its label again
-      if (!hasSelection ||
-          (hasSelection && !featureIsSelected(currentFocus))) {
-        hideLabel(currentFocus);
+      // remove outline if present
+      if (focusOutline) { map.removeLayer(focusOutline); focusOutline = null; }
+
+      if (currentFocus) {
+        // restore style/label of previously focused feature
+        const lyr = currentFocus;
+        const perDay = lyr._perDay || {};
+        if (lyr._isSelected) {
+          applySelectedStyle(lyr, perDay, cfg);
+          showLabel(lyr, lyr._labelTxt);  // selected labels stay
+        } else {
+          applyDimmedStyle(lyr, perDay, cfg);
+          hideLabel(lyr);                  // unselected labels vanish
+        }
+        currentFocus = null;
       }
-      currentFocus = null;
-      if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
-      else if (allBounds) map.fitBounds(allBounds.pad(0.1));
-    }
-    function featureIsSelected(lyr) {
-      // we infer from current style: selected has higher weight
-      return lyr.options && lyr.options.weight === cfg.style.selected.weightPx;
     }
 
   } catch (e) {
@@ -223,7 +236,7 @@
     console.error(e);
   }
 
-  // ---------- helpers ----------
+  // ---------- shared helpers ----------
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
   async function fetchJson(url) {
     const res = await fetch(url + cb(url));
@@ -254,7 +267,8 @@
     pushF(); pushR();
     return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
   }
-  // find header row including keys (and day if present)
+
+  // header row detection
   function findHeader(rows, schema) {
     const wantDay  = (schema.day  || 'day').toLowerCase();
     const wantKeys = (schema.keys || 'zone keys').toLowerCase();
@@ -271,15 +285,34 @@
     }
     return null;
   }
+
   function dimFill(perDay, cfg) {
     const base = perDay.fillOpacity != null ? perDay.fillOpacity : 0.8;
     const factor = cfg.style.dimmed.fillFactor != null ? cfg.style.dimmed.fillFactor : 0.3;
     return Math.max(0.08, base * factor);
   }
 
-  // label helpers: permanent tooltip on/off
+  function applySelectedStyle(lyr, perDay, cfg) {
+    lyr.setStyle({
+      color: perDay.stroke || '#666',
+      weight: cfg.style.selected.weightPx,
+      opacity: cfg.style.selected.strokeOpacity,
+      fillColor: perDay.fill || '#ccc',
+      fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
+    });
+  }
+
+  function applyDimmedStyle(lyr, perDay, cfg) {
+    lyr.setStyle({
+      color: perDay.stroke || '#666',
+      weight: cfg.style.dimmed.weightPx,
+      opacity: cfg.style.dimmed.strokeOpacity,
+      fillColor: perDay.fill || '#ccc',
+      fillOpacity: dimFill(perDay, cfg)
+    });
+  }
+
   function showLabel(lyr, text) {
-    // rebind to ensure 'permanent' is applied
     if (lyr.getTooltip()) lyr.unbindTooltip();
     lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' });
   }
@@ -288,30 +321,25 @@
     if (t) lyr.unbindTooltip();
   }
 
-  // smart title case for MUNICIPALITY NAMES
   function smartTitleCase(s) {
     if (!s) return '';
     s = s.toLowerCase();
-    // split by slashes or hyphens but keep the separators
     const parts = s.split(/([\/-])/g);
     const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']);
     const fixWord = (w, isFirst) => {
       if (!w) return w;
       if (!isFirst && small.has(w)) return w;
-      // St. / Mt. abbreviations
       if (w === 'st' || w === 'st.' ) return 'St.';
       if (w === 'mt' || w === 'mt.' ) return 'Mt.';
-      // normal cap
       return w.charAt(0).toUpperCase() + w.slice(1);
     };
-    // rebuild with title-casing around separators
     let tokenIdx = 0;
     for (let i=0;i<parts.length;i++){
       if (parts[i] === '/' || parts[i] === '-') continue;
-      const tokens = parts[i].split(/\s+/).map((tok, j) => fixWord(tok, tokenIdx++ === 0));
+      const tokens = parts[i].split(/\s+/).map((tok) => fixWord(tok, tokenIdx++ === 0));
       parts[i] = tokens.join(' ');
     }
-    return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
+    return parts.map(p => (p === '/' || p === '-') ? p : p).join('').replace(/\s+/g,' ').trim();
   }
 
   function renderLegend(cfg, counts) {
@@ -327,6 +355,7 @@
     }).join('');
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
   }
+
   function setStatus(msg) { document.getElementById('status').textContent = msg; }
   function showError(e) {
     const el = document.getElementById('error');
