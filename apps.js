@@ -5,19 +5,27 @@
   try {
     const cfg = await fetchJson(cfgUrl);
 
-    // Map
+    // --- map & tiles ---
     const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+
+    // grayscale base tiles
+    const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution:'&copy; OpenStreetMap contributors'
     }).addTo(map);
+    // make base grayscale
+    const baseEl = base.getContainer?.();
+    if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
-    renderLegend(cfg);
-
-    // Load day layers (keep overall bounds so we always show something)
+    // containers for layers & later boundary
     const dayLayers = [];
+    const boundaryFeatures = []; // to clip the color tiles
     let allBounds = null;
     let totalFeatures = 0;
 
+    // legend scaffold (we'll fill counts later)
+    renderLegend(cfg, {});
+
+    // --- load 4 day layers ---
     for (const Lcfg of cfg.layers) {
       const gj = await fetchJson(Lcfg.url);
       const perDay = cfg.style.perDay[Lcfg.day] || {};
@@ -34,16 +42,21 @@
         }),
         onEachFeature: (feat, lyr) => {
           totalFeatures++;
+          // collect boundary features for later tile clipping
+          boundaryFeatures.push({ type: 'Feature', geometry: feat.geometry });
+
           const p = feat.properties || {};
-          const key = (p[cfg.fields.key] ?? '').toString().toUpperCase().trim();
-          const muni = p[cfg.fields.muni] ?? '';
-          const day  = (p[cfg.fields.day] ?? Lcfg.day).toString().trim();
+          const key  = (p[cfg.fields.key]  ?? '').toString().toUpperCase().trim();
+          const muni = (p[cfg.fields.muni] ?? '').toString().trim();
+          const day  = (p[cfg.fields.day]  ?? Lcfg.day).toString().trim();
 
-          lyr._routeKey  = key;
-          lyr._day       = day;
-          lyr._perDay    = perDay;
+          lyr._routeKey = key;
+          lyr._day      = day;
+          lyr._perDay   = perDay;
 
-          lyr.bindTooltip(`${day}: ${muni || 'area'}${key ? ` (${key})` : ''}`, { sticky: true });
+          // pretty, permanent label: "s13 • PERTH EAST"
+          const label = [key, muni].filter(Boolean).join(' • ');
+          lyr.bindTooltip(label, { permanent: true, direction: 'center', className: 'lbl' });
 
           if (lyr.getBounds) {
             const b = lyr.getBounds();
@@ -52,10 +65,26 @@
         }
       }).addTo(map);
 
-      dayLayers.push(layer);
+      dayLayers.push({ day: Lcfg.day, layer, perDay });
     }
 
-    // Selection
+    // --- color tiles clipped to union of delivery polygons ---
+    try {
+      if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
+        const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
+        const colorTiles = L.TileLayer.boundaryCanvas('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          boundary: boundaryFC,
+          attribution: ''
+        });
+        colorTiles.addTo(map).setZIndex(2);
+        base.setZIndex(1);
+      }
+    } catch(e) { /* fallback to grayscale-only base if plugin not present */ }
+
+    // initial fit (in case selection is empty)
+    if (cfg.behavior.autoZoom && allBounds) map.fitBounds(allBounds.pad(0.1));
+
+    // --- selection & styling ---
     await applySelection();
     const refresh = Number(cfg.behavior.refreshSeconds || 0);
     if (refresh > 0) setInterval(applySelection, refresh * 1000);
@@ -63,51 +92,47 @@
     async function applySelection() {
       const selUrl = qs.get('sel') || cfg.selection.url;
       const csvText = await fetchText(selUrl);
+      const rowsAA = parseCsvRows(csvText);
+      const hdr = findHeader(rowsAA, cfg.selection.schema);
 
-      // Parse CSV into rows (array of arrays), then locate the header row dynamically.
-      const rows = parseCsvRows(csvText);
-      const hdr = findHeader(rows, cfg.selection.schema);
-
-      if (!hdr) {
-        setStatus('No header detected (looked for "day" and "zone keys"). Showing all dimmed.');
-        if (cfg.behavior.autoZoom && allBounds) map.fitBounds(allBounds.pad(0.1));
-        return;
-      }
-
-      const { headerIndex, colMap } = hdr;
-      const keysIdx = colMap.keys;
-      const dayIdx  = colMap.day;
-
-      // Build the selected key set
       const selected = new Set();
-      for (let i = headerIndex + 1; i < rows.length; i++) {
-        const r = rows[i];
-        if (!r || r.length === 0) continue;
-        const rawKeys = ((r[keysIdx] || '') + '')
-          .split(cfg.selection.schema.delimiter || ',')
-          .map(s => s.trim())
-          .filter(Boolean);
-        if (cfg.selection.mergeDays) {
-          rawKeys.forEach(k => selected.add(k.toUpperCase()));
-        } else {
-          const dayVal = ((r[dayIdx] || '') + '').trim();
-          rawKeys.forEach(k => selected.add(`${dayVal}||${k.toUpperCase()}`));
+      if (hdr) {
+        const { headerIndex, colMap } = hdr;
+        const keysIdx = colMap.keys;
+        const dayIdx  = colMap.day;
+
+        for (let i = headerIndex + 1; i < rowsAA.length; i++) {
+          const r = rowsAA[i];
+          if (!r || r.length === 0) continue;
+          const rawKeys = ((r[keysIdx] || '') + '')
+            .split(cfg.selection.schema.delimiter || ',')
+            .map(s => s.trim())
+            .filter(Boolean);
+          if (cfg.selection.mergeDays) {
+            rawKeys.forEach(k => selected.add(k.toUpperCase()));
+          } else {
+            const dayVal = ((r[dayIdx] || '') + '').trim();
+            rawKeys.forEach(k => selected.add(`${dayVal}||${k.toUpperCase()}`));
+          }
         }
       }
 
-      const hasSelection = selected.size > 0;
-
+      // counts per day
+      const counts = {}; // { day: { selected, total } }
       let selectedCount = 0;
       const selBounds = [];
+      const hasSelection = selected.size > 0;
 
-      dayLayers.forEach(layer => {
+      dayLayers.forEach(({ day, layer, perDay }) => {
+        let dayTotal = 0, daySel = 0;
         layer.eachLayer(lyr => {
+          dayTotal++;
           const hit = cfg.selection.mergeDays
             ? selected.has(lyr._routeKey)
             : selected.has(`${lyr._day}||${lyr._routeKey}`);
 
-          const perDay = lyr._perDay || {};
           if (hasSelection && hit) {
+            daySel++;
             lyr.setStyle({
               color: perDay.stroke || '#666',
               weight: cfg.style.selected.weightPx,
@@ -115,6 +140,10 @@
               fillColor: perDay.fill || '#ccc',
               fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
             });
+            // brighten label
+            const tip = lyr.getTooltip();
+            if (tip?.getElement()) tip.getElement().classList.remove('dim');
+
             if (lyr.getBounds) selBounds.push(lyr.getBounds());
             selectedCount++;
             layer.addLayer(lyr);
@@ -129,10 +158,15 @@
                 fillColor: perDay.fill || '#ccc',
                 fillOpacity: dimFill(perDay, cfg)
               });
+              // dim label
+              const tip = lyr.getTooltip();
+              if (tip?.getElement()) tip.getElement().classList.add('dim');
+
               layer.addLayer(lyr);
             }
           }
         });
+        counts[day] = { selected: daySel, total: dayTotal };
       });
 
       if (cfg.behavior.autoZoom) {
@@ -144,6 +178,7 @@
         }
       }
 
+      renderLegend(cfg, counts);
       setStatus(`Features on map: ${totalFeatures} • Selected: ${selectedCount} • Keys: ${hasSelection ? Array.from(selected).join(', ') : '—'}`);
     }
 
@@ -152,7 +187,7 @@
     console.error(e);
   }
 
-  // ------- helpers -------
+  // ---------- helpers ----------
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
   async function fetchJson(url) {
     const res = await fetch(url + cb(url));
@@ -185,35 +220,23 @@
       }
     }
     pushF(); pushR();
-    // trim BOM/whitespace
     return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/,'').trim()));
   }
 
-  // Find a header row that contains both a day col and a keys col (tolerant of wording)
+  // find header row that includes a keys column (and day if present)
   function findHeader(rows, schema) {
     const wantDay  = (schema.day  || 'day').toLowerCase();
     const wantKeys = (schema.keys || 'zone keys').toLowerCase();
-
-    const isDayLike  = s => {
-      s = (s||'').toLowerCase();
-      return s === wantDay || ['day','weekday'].includes(s);
-    };
-    const isKeysLike = s => {
-      s = (s||'').toLowerCase();
-      return s === wantKeys || ['zone keys','zone key','keys','route keys','selected keys'].includes(s);
-    };
-
-    for (let i=0; i<rows.length; i++) {
+    const isDayLike  = s => ['day','weekday',wantDay].includes((s||'').toLowerCase());
+    const isKeysLike = s => ['zone keys','zone key','keys','route keys','selected keys',wantKeys].includes((s||'').toLowerCase());
+    for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
-      let dayIdx = -1, keysIdx = -1;
+      let dayIdx=-1, keysIdx=-1;
       row.forEach((h, idx) => {
         if (isDayLike(h)  && dayIdx  === -1) dayIdx  = idx;
         if (isKeysLike(h) && keysIdx === -1) keysIdx = idx;
       });
-      if (keysIdx !== -1) {
-        // day column optional when mergeDays=true; still record if present
-        return { headerIndex: i, colMap: { day: dayIdx, keys: keysIdx } };
-      }
+      if (keysIdx !== -1) return { headerIndex: i, colMap: { day: dayIdx, keys: keysIdx } };
     }
     return null;
   }
@@ -224,14 +247,20 @@
     return Math.max(0.08, base * factor);
   }
 
-  function renderLegend(cfg) {
+  function renderLegend(cfg, counts) {
     const el = document.getElementById('legend');
-    const rows = Object.entries(cfg.style.perDay).map(([day, st]) =>
-      `<div class="row">
-         <span class="swatch" style="background:${st.fill}; border-color:${st.stroke}"></span>${day}
-       </div>`).join('');
-    el.innerHTML = `<h4>Layers</h4>${rows}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
+    const rowsHtml = cfg.layers.map(Lcfg => {
+      const st = cfg.style.perDay[Lcfg.day] || {};
+      const c  = (counts && counts[Lcfg.day]) ? counts[Lcfg.day] : { selected: 0, total: 0 };
+      return `<div class="row">
+        <span class="swatch" style="background:${st.fill}; border-color:${st.stroke}"></span>
+        <div>${Lcfg.day}</div>
+        <div class="counts">${c.selected}/${c.total}</div>
+      </div>`;
+    }).join('');
+    el.innerHTML = `<h4>Layers</h4>${rowsHtml}<div style="margin-top:6px;opacity:.7">Unselected: ${cfg.style.unselectedMode}</div>`;
   }
+
   function setStatus(msg) { document.getElementById('status').textContent = msg; }
   function showError(e) {
     const el = document.getElementById('error');
