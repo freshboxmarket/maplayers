@@ -29,7 +29,7 @@
     "perDay": {
       "Wednesday": { "fill": "#00cc66", "fillOpacity": 0.39, "stroke": "#00994c" },
       "Thursday":  { "fill": "#ff6666", "fillOpacity": 0.39, "stroke": "#cc0000" },
-      "Friday":    { "fill": "#a6cee3", "fillOpacity": 1.00, "stroke": "#1f78b4" },
+      "Friday":    { "fill": "#a6cee3", "fillOpacity": 0.39, "stroke": "#1f78b4" },
       "Saturday":  { "fill": "#ffff66", "fillOpacity": 0.39, "stroke": "#cccc00" }
     },
     "customers": {
