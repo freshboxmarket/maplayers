@@ -42,5 +42,11 @@
       "outside": { "stroke": "#7a7a7a", "fill": "#c7c7c7", "opacity": 0.8, "fillOpacity": 0.6 }
     }
   },
+  "drivers": {
+    "enabled": true,
+    "strokeWeightPx": 2,
+    "fillOpacity": 0.12,
+    "labelClass": "lbl dim"
+  },
   "behavior": { "autoZoom": true, "refreshSeconds": 0 }
 }
