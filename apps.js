@@ -2,6 +2,10 @@
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
+  const parseJSON = (s, fallback=null) => { try { return JSON.parse(s); } catch(e){ return fallback; } };
+  const driverMeta = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
+  const assignMap  = parseJSON(qs.get('assignMap')  || '{}', {});   // { "W1":"Devin", ... }
+
   try {
     phase('Loading config…');
     const cfg = await fetchJson(cfgUrl);
@@ -28,21 +32,24 @@
     let customerCount = 0;
     let custWithinSel = 0;
     let custOutsideSel = 0;
-
-    // per-day customers inside selection (legend fractions)
     const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
-    // one focused polygon at a time
+    // One focused polygon at a time
     let currentFocus = null;
 
-    // coverage sets for Turf
+    // For coverage checks
     const coveragePolysAll = [];       // all polygons (for _custAny & dimming)
     let coveragePolysSelected = [];    // only selected polygons
 
-    // selected municipality list (status)
+    // Selected municipality list (status)
     let selectedMunicipalities = [];
 
+    // Driver overlays (casted nets)
+    const driverOverlays = {}; // name -> { group, color, labelMarker }
+    const driversCfg = cfg.drivers || { enabled: true, strokeWeightPx: 2, fillOpacity: 0.12, labelClass: 'lbl dim' };
+
     renderLegend(cfg, null, custWithinSel, custOutsideSel);
+    renderDriversPanel(driverMeta, driverOverlays); // may render empty
 
     // --- polygons ---
     phase('Loading polygon layers…');
@@ -68,9 +75,9 @@
           const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
           const keyNorm = normalizeKey(rawKey);
           const muni = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
-          const day  = Lcfg.day; // use layer day
+          const day  = Lcfg.day;
 
-          lyr._routeKey = keyNorm;       // normalized like W1/T6/F12/S2
+          lyr._routeKey = keyNorm;       // normalized like W1/T6/F12/S2 or splits like T6_UM
           lyr._day      = day;
           lyr._perDay   = perDay;
           lyr._labelTxt = muni;
@@ -113,6 +120,12 @@
     map.on('movestart', () => { clearFocus(false); map.closePopup(); });
     map.on('zoomstart', () => { map.closePopup(); });
 
+    // --- build driver overlays if data was provided ---
+    if (driversCfg.enabled && driverMeta && driverMeta.length && assignMap && Object.keys(assignMap).length) {
+      buildDriverOverlays();
+      renderDriversPanel(driverMeta, driverOverlays); // re-render with toggles
+    }
+
     // initial selection + customers
     await applySelection();
     await loadCustomersIfAny();
@@ -127,12 +140,14 @@
     async function applySelection() {
       clearFocus(false);
 
-      const selUrl = qs.get('sel') || cfg.selection.url;
+      const selUrl = qs.get('sel') || (cfg.selection && cfg.selection.url) || '';
+      if (!selUrl) { warn('No selection URL configured.'); return; }
+
       phase('Loading selection…');
       const csvText = await fetchText(selUrl);
       const rowsAA = parseCsvRows(csvText);
 
-      const hdr = findHeaderFlexible(rowsAA, cfg.selection.schema);
+      const hdr = findHeaderFlexible(rowsAA, cfg.selection.schema || { keys: 'zone keys' });
       const selectedSet = new Set();
 
       if (hdr) {
@@ -140,13 +155,14 @@
         for (let i = headerIndex + 1; i < rowsAA.length; i++) {
           const r = rowsAA[i]; if (!r || r.length === 0) continue;
           const raw = ((r[keysCol] || '') + '');
-          const keys = splitKeys(raw, cfg.selection.schema.delimiter).map(normalizeKey).filter(Boolean);
+          const keys = splitKeys(raw, (cfg.selection.schema && cfg.selection.schema.delimiter) || ',')
+                        .map(normalizeKey).filter(Boolean);
           keys.forEach(k => selectedSet.add(k));
         }
       }
 
       if (selectedSet.size === 0) {
-        warn(`Selection parsed 0 keys. Check your published CSV has a "zone keys" column with values in B48:E51.`);
+        warn(`Selection parsed 0 keys. Check the published CSV has a "zone keys" column with values in B48:E51.`);
       } else {
         info(`Loaded ${selectedSet.size} selected key(s).`);
       }
@@ -242,7 +258,7 @@
         return;
       }
 
-      const hdrIdx = findCustomerHeaderIndex(rows, cfg.customers.schema);
+      const hdrIdx = findCustomerHeaderIndex(rows, cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
       if (hdrIdx === -1) {
         warn('Customers CSV: no header with "Verified Coordinates" or "Order Note" found.');
         custWithinSel = custOutsideSel = 0;
@@ -251,7 +267,7 @@
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
-      const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema);
+      const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
 
       // default style
       const s = cfg.style.customers || {};
@@ -299,7 +315,6 @@
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
     }
 
-    // keep this INSIDE the try so it can see custByDayInSel
     function resetDayCounts(){
       custByDayInSel.Wednesday = 0;
       custByDayInSel.Thursday  = 0;
@@ -466,6 +481,92 @@
       });
     }
 
+    // --- Driver overlays (built from query params) ---
+    function buildDriverOverlays() {
+      // Group feature geometries by driver name via assignMap (key is lyr._routeKey)
+      const byDriver = new Map(); // name -> [geojsonFeature]
+      coveragePolysAll.forEach(rec => {
+        const key = rec.layerRef && rec.layerRef._routeKey;
+        if (!key) return;
+        const drv = assignMap[key];
+        if (!drv) return;
+        if (!byDriver.has(drv)) byDriver.set(drv, []);
+        byDriver.get(drv).push(rec.layerRef._turfFeat);
+      });
+
+      byDriver.forEach((features, name) => {
+        const meta = driverMeta.find(d => (d.name || '').toLowerCase() === name.toLowerCase()) || { color: '#888' };
+        const color = meta.color || '#888';
+
+        // Draw all polygons for this driver with a transparent fill and colored stroke
+        const gj = L.geoJSON({ type: 'FeatureCollection', features }, {
+          style: () => ({
+            color: color,
+            weight: driversCfg.strokeWeightPx || 2,
+            opacity: 0.9,
+            fillColor: color,
+            fillOpacity: driversCfg.fillOpacity != null ? driversCfg.fillOpacity : 0.12
+          })
+        });
+
+        // Compute center for label
+        let bounds = null;
+        try { bounds = gj.getBounds(); } catch(e){}
+        const center = bounds ? bounds.getCenter() : null;
+
+        const group = L.featureGroup([gj]);
+
+        // Add a subtle permanent tooltip label
+        let labelMarker = null;
+        if (center) {
+          labelMarker = L.marker(center, { opacity: 0 })
+            .bindTooltip(name, { permanent: true, direction: 'center', className: driversCfg.labelClass || 'lbl dim' });
+          group.addLayer(labelMarker);
+        }
+
+        driverOverlays[name] = { group, color, labelMarker };
+      });
+    }
+
+    function renderDriversPanel(metaList, overlays) {
+      const el = document.getElementById('drivers');
+      if (!el) return;
+
+      // only show if we have something to toggle
+      const has = metaList && metaList.length && overlays && Object.keys(overlays).length;
+      if (!has) { el.innerHTML = ''; return; }
+
+      const rows = metaList.map(d => {
+        const col = d.color || '#888';
+        const safeName = escapeHtml(d.name || '');
+        return `<div class="row">
+          <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}">
+          <span class="swatch" style="background:${col}; border-color:${col}"></span>
+          <div>${safeName}</div>
+        </div>`;
+      }).join('');
+      el.innerHTML = `<h4>Drivers</h4>${rows}`;
+
+      // Wire toggles
+      el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+          const name = e.target.getAttribute('data-driver');
+          toggleDriverOverlay(name, e.target.checked);
+        });
+      });
+    }
+
+    function toggleDriverOverlay(name, on) {
+      const rec = driverOverlays[name];
+      if (!rec) return;
+      if (on) {
+        rec.group.addTo(map);
+        try { if (rec.labelMarker) rec.labelMarker.openTooltip(); } catch(e){}
+      } else {
+        map.removeLayer(rec.group);
+      }
+    }
+
   } catch (e) {
     showError(e);
     console.error(e);
@@ -479,7 +580,7 @@
   // CSV parser
   function parseCsvRows(text) {
     const out = []; let i=0, f='', r=[], q=false;
-    text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    text = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const N = text.length;
     const pushF=()=>{ r.push(f); f=''; }, pushR=()=>{ out.push(r); r=[]; };
     while (i<N) {
@@ -498,7 +599,7 @@
   // selection header finder (tolerant)
   function findHeaderFlexible(rows, schema) {
     if (!rows || !rows.length) return null;
-    const wantKeys = (schema.keys || 'zone keys').toLowerCase();
+    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase();
     const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
@@ -515,8 +616,8 @@
 
   // customers header helpers
   function findCustomerHeaderIndex(rows, schema) {
-    const wantCoords = (schema.coords || 'Verified Coordinates').toLowerCase();
-    const wantNote   = (schema.note   || 'Order Note').toLowerCase();
+    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
     for (let i=0;i<rows.length;i++) {
       const hdr = rows[i] || [];
       const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
@@ -526,8 +627,8 @@
     return -1;
   }
   function headerIndexMap(hdrRow, schema) {
-    const wantCoords = (schema.coords || 'Verified Coordinates').toLowerCase();
-    const wantNote   = (schema.note   || 'Order Note').toLowerCase();
+    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
     const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
@@ -536,8 +637,9 @@
   function splitKeys(s, delim) { return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean); }
   function normalizeKey(s) {
     s = String(s || '').trim().toUpperCase();
-    const m = s.match(/^([WTFS])0*(\d+)$/);
-    if (m) return m[1] + String(parseInt(m[2], 10));
+    // Accept split suffixes like T6_UM etc.
+    const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
+    if (m) return m[1] + String(parseInt(m[2], 10)) + (m[3] || '');
     return s;
   }
 
@@ -610,6 +712,15 @@
         <div>Customers outside selection:</div><div class="counts">${custOut ?? 0}</div>
       </div>`;
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}`;
+  }
+
+  function renderDriversPanel(metaList, overlays) {
+    const el = document.getElementById('drivers');
+    if (!el) return;
+    // if no data yet, leave empty; will re-render later if overlays appear
+    if (!metaList || !metaList.length || !overlays || !Object.keys(overlays).length) {
+      el.innerHTML = '';
+    }
   }
 
   function makeStatusLine(selMunis, inCount, outCount) {
