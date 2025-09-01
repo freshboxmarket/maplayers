@@ -68,9 +68,9 @@
           const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
           const keyNorm = normalizeKey(rawKey);
           const muni = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
-          const day  = Lcfg.day; // <-- use layer day (Wednesday/Thursday/Friday/Saturday)
+          const day  = Lcfg.day; // use layer day
 
-          lyr._routeKey = keyNorm;       // normalized: W1, T6, etc.
+          lyr._routeKey = keyNorm;       // normalized like W1/T6/F12/S2
           lyr._day      = day;
           lyr._perDay   = perDay;
           lyr._labelTxt = muni;
@@ -146,9 +146,9 @@
       }
 
       if (selectedSet.size === 0) {
-        warn(`Selection parsed 0 keys. Check the published CSV headers include a "zone keys" column and rows B48:E51 have values.`);
+        warn(`Selection parsed 0 keys. Check your published CSV has a "zone keys" column with values in B48:E51.`);
       } else {
-        info(`Loaded ${selectedSet.size} selected keys.`);
+        info(`Loaded ${selectedSet.size} selected key(s).`);
       }
 
       hasSelection = selectedSet.size > 0;
@@ -297,6 +297,14 @@
 
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+    }
+
+    // keep this INSIDE the try so it can see custByDayInSel
+    function resetDayCounts(){
+      custByDayInSel.Wednesday = 0;
+      custByDayInSel.Thursday  = 0;
+      custByDayInSel.Friday    = 0;
+      custByDayInSel.Saturday  = 0;
     }
 
     // recolor + recount
@@ -463,7 +471,7 @@
     console.error(e);
   }
 
-  // ---------- shared helpers ----------
+  // ---------- shared helpers (safe outside the try) ----------
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
@@ -497,7 +505,7 @@
       let keysCol = -1;
       row.forEach((h, idx) => {
         const v = like(h);
-        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || v.includes('selected') && v.includes('keys')))
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys'))))
           keysCol = idx;
       });
       if (keysCol !== -1) return { headerIndex: i, keysCol };
@@ -525,13 +533,9 @@
   }
 
   // key utils
-  function splitKeys(s, delim) {
-    // accept commas or semicolons regardless of config
-    return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean);
-  }
+  function splitKeys(s, delim) { return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean); }
   function normalizeKey(s) {
     s = String(s || '').trim().toUpperCase();
-    // reduce W01 -> W1; accept W/T/F/S + number
     const m = s.match(/^([WTFS])0*(\d+)$/);
     if (m) return m[1] + String(parseInt(m[2], 10));
     return s;
@@ -623,9 +627,5 @@
     const el = document.getElementById('error');
     el.style.display = 'block';
     el.innerHTML = `<strong>Load error</strong><br>${e && e.message ? escapeHtml(e.message) : e}`;
-  }
-
-  function resetDayCounts(){
-    custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
   }
 })();
