@@ -3,9 +3,11 @@
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
   try {
+    phase('Loading config…');
     const cfg = await fetchJson(cfgUrl);
 
     // --- map & tiles ---
+    phase('Initializing map…');
     const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
     const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution:'&copy; OpenStreetMap contributors'
@@ -27,22 +29,23 @@
     let custWithinSel = 0;
     let custOutsideSel = 0;
 
-    // per-day customers inside selection (for legend fractions)
+    // per-day customers inside selection (legend fractions)
     const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
     // one focused polygon at a time
     let currentFocus = null;
 
     // coverage sets for Turf
-    const coveragePolysAll = [];         // all polygons (for color-by-any-polygon + _custAny)
-    let coveragePolysSelected = [];      // selected-only (for counts + inside coloring)
+    const coveragePolysAll = [];       // all polygons (for _custAny & dimming)
+    let coveragePolysSelected = [];    // only selected polygons
 
-    // selected municipality list (for status)
+    // selected municipality list (status)
     let selectedMunicipalities = [];
 
     renderLegend(cfg, null, custWithinSel, custOutsideSel);
 
     // --- polygons ---
+    phase('Loading polygon layers…');
     for (const Lcfg of (cfg.layers || [])) {
       const gj = await fetchJson(Lcfg.url);
       const perDay = (cfg.style && cfg.style.perDay && cfg.style.perDay[Lcfg.day]) || {};
@@ -62,29 +65,26 @@
           boundaryFeatures.push({ type: 'Feature', geometry: feat.geometry });
 
           const p    = feat.properties || {};
-          const key  = (p[cfg.fields.key]  ?? '').toString().toUpperCase().trim();
+          const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
+          const keyNorm = normalizeKey(rawKey);
           const muni = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
-          const day  = (p[cfg.fields.day]  ?? Lcfg.day).toString().trim();
+          const day  = Lcfg.day; // <-- use layer day (Wednesday/Thursday/Friday/Saturday)
 
-          lyr._routeKey = key;
-          lyr._day      = day;           // "Wednesday" etc.
+          lyr._routeKey = keyNorm;       // normalized: W1, T6, etc.
+          lyr._day      = day;
           lyr._perDay   = perDay;
           lyr._labelTxt = muni;
           lyr._isSelected = false;
-          lyr._custAny = 0;              // all customers in this polygon
-          lyr._custSel = 0;              // customers in selection in this polygon
-          lyr._turfFeat = { type: 'Feature', properties: { day, muni, key }, geometry: feat.geometry };
+          lyr._custAny = 0;
+          lyr._custSel = 0;
+          lyr._turfFeat = { type: 'Feature', properties: { day, muni, key: keyNorm }, geometry: feat.geometry };
 
           coveragePolysAll.push({ feat: lyr._turfFeat, perDay, layerRef: lyr });
 
           lyr.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
-            if (currentFocus === lyr) {
-              openPolygonPopup(lyr);
-            } else {
-              focusFeature(lyr);
-              openPolygonPopup(lyr);
-            }
+            if (currentFocus === lyr) openPolygonPopup(lyr);
+            else { focusFeature(lyr); openPolygonPopup(lyr); }
           });
 
           if (lyr.getBounds) {
@@ -123,30 +123,32 @@
       await loadCustomersIfAny();
     }, refresh * 1000);
 
-    // ---------- selection over polygons ----------
+    // ---------- selection ----------
     async function applySelection() {
       clearFocus(false);
 
       const selUrl = qs.get('sel') || cfg.selection.url;
+      phase('Loading selection…');
       const csvText = await fetchText(selUrl);
       const rowsAA = parseCsvRows(csvText);
-      const hdr = findHeader(rowsAA, cfg.selection.schema);
 
+      const hdr = findHeaderFlexible(rowsAA, cfg.selection.schema);
       const selectedSet = new Set();
+
       if (hdr) {
-        const { headerIndex, colMap } = hdr;
-        const keysIdx = colMap.keys, dayIdx  = colMap.day;
+        const { headerIndex, keysCol } = hdr;
         for (let i = headerIndex + 1; i < rowsAA.length; i++) {
           const r = rowsAA[i]; if (!r || r.length === 0) continue;
-          const rawKeys = ((r[keysIdx] || '') + '')
-            .split(cfg.selection.schema.delimiter || ',')
-            .map(s => s.trim()).filter(Boolean);
-          if (cfg.selection.mergeDays) rawKeys.forEach(k => selectedSet.add(k.toUpperCase()));
-          else {
-            const dayVal = ((r[dayIdx] || '') + '').trim();
-            rawKeys.forEach(k => selectedSet.add(`${dayVal}||${k.toUpperCase()}`));
-          }
+          const raw = ((r[keysCol] || '') + '');
+          const keys = splitKeys(raw, cfg.selection.schema.delimiter).map(normalizeKey).filter(Boolean);
+          keys.forEach(k => selectedSet.add(k));
         }
+      }
+
+      if (selectedSet.size === 0) {
+        warn(`Selection parsed 0 keys. Check the published CSV headers include a "zone keys" column and rows B48:E51 have values.`);
+      } else {
+        info(`Loaded ${selectedSet.size} selected keys.`);
       }
 
       hasSelection = selectedSet.size > 0;
@@ -156,11 +158,9 @@
 
       const selBounds = [];
 
-      dayLayers.forEach(({ day, layer, perDay }) => {
+      dayLayers.forEach(({ layer, perDay }) => {
         layer.eachLayer(lyr => {
-          const hit = cfg.selection.mergeDays
-            ? selectedSet.has(lyr._routeKey)
-            : selectedSet.has(`${lyr._day}||${lyr._routeKey}`);
+          const hit = selectedSet.has(lyr._routeKey);
           lyr._isSelected = !!hit;
 
           if (hit) {
@@ -209,7 +209,7 @@
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
     }
 
-    // ---------- customers overlay ----------
+    // ---------- customers ----------
     async function loadCustomersIfAny() {
       customerLayer.clearLayers();
       customerMarkers.length = 0;
@@ -217,25 +217,26 @@
 
       const custToggle = qs.get('cust');
       if (custToggle && custToggle.toLowerCase() === 'off') {
-        custWithinSel = 0; custOutsideSel = 0;
-        custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
+        custWithinSel = custOutsideSel = 0;
+        resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
       if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
-        custWithinSel = 0; custOutsideSel = 0;
-        custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
+        custWithinSel = custOutsideSel = 0;
+        resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
 
+      phase('Loading customers…');
       const text = await fetchText(cfg.customers.url);
       const rows = parseCsvRows(text);
       if (!rows.length) {
-        custWithinSel = 0; custOutsideSel = 0;
-        custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
+        custWithinSel = custOutsideSel = 0;
+        resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
@@ -243,8 +244,9 @@
 
       const hdrIdx = findCustomerHeaderIndex(rows, cfg.customers.schema);
       if (hdrIdx === -1) {
-        custWithinSel = 0; custOutsideSel = 0;
-        custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
+        warn('Customers CSV: no header with "Verified Coordinates" or "Order Note" found.');
+        custWithinSel = custOutsideSel = 0;
+        resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
@@ -263,6 +265,7 @@
       };
 
       // markers
+      let added = 0;
       for (let i = hdrIdx + 1; i < rows.length; i++) {
         const r = rows[i]; if (!r || r.length === 0) continue;
         const coord = (mapIdx.coords !== -1) ? r[mapIdx.coords] : '';
@@ -277,8 +280,10 @@
         m.bindPopup(popupHtml, { autoClose: true, closeOnClick: true });
 
         customerMarkers.push({ marker: m, lat: ll.lat, lng: ll.lng });
-        customerCount++;
+        added++;
       }
+      customerCount = added;
+      info(`Loaded ${customerCount} customers.`);
 
       // color + count
       recolorAndRecountCustomers();
@@ -294,10 +299,10 @@
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
     }
 
-    // recolor + recount (points colored ONLY if inside SELECTED polygons; grey otherwise)
+    // recolor + recount
     function recolorAndRecountCustomers() {
       let inSel = 0, outSel = 0;
-      custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
+      resetDayCounts();
 
       // reset per-polygon counts
       coveragePolysAll.forEach(rec => { if (rec.layerRef) { rec.layerRef._custAny = 0; rec.layerRef._custSel = 0; } });
@@ -387,7 +392,7 @@
       if (center) L.popup({autoClose:true, closeOnClick:true}).setLatLng(center).setContent(html).openOn(map);
     }
 
-    // polygon focus/highlight
+    // focus/highlight helpers
     function focusFeature(lyr) {
       if (currentFocus && currentFocus !== lyr) restoreFeature(currentFocus);
       currentFocus = lyr;
@@ -433,7 +438,7 @@
       }
     }
 
-    // polygon style helpers
+    // style helpers
     function applyStyleSelected(lyr, perDay, cfg) {
       lyr.setStyle({
         color: perDay.stroke || '#666',
@@ -463,7 +468,7 @@
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
 
-  // CSV → array of arrays
+  // CSV parser
   function parseCsvRows(text) {
     const out = []; let i=0, f='', r=[], q=false;
     text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -482,20 +487,20 @@
     return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
   }
 
-  // selection header finder
-  function findHeader(rows, schema) {
-    const wantDay  = (schema.day  || 'day').toLowerCase();
+  // selection header finder (tolerant)
+  function findHeaderFlexible(rows, schema) {
+    if (!rows || !rows.length) return null;
     const wantKeys = (schema.keys || 'zone keys').toLowerCase();
-    const isDayLike  = s => ['day','weekday',wantDay].includes((s||'').toLowerCase());
-    const isKeysLike = s => ['zone keys','zone key','keys','route keys','selected keys',wantKeys].includes((s||'').toLowerCase());
+    const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
-      let dayIdx=-1, keysIdx=-1;
+      let keysCol = -1;
       row.forEach((h, idx) => {
-        if (isDayLike(h)  && dayIdx  === -1) dayIdx  = idx;
-        if (isKeysLike(h) && keysIdx === -1) keysIdx = idx;
+        const v = like(h);
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || v.includes('selected') && v.includes('keys')))
+          keysCol = idx;
       });
-      if (keysIdx !== -1) return { headerIndex: i, colMap: { day: dayIdx, keys: keysIdx } };
+      if (keysCol !== -1) return { headerIndex: i, keysCol };
     }
     return null;
   }
@@ -518,6 +523,20 @@
     const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
+
+  // key utils
+  function splitKeys(s, delim) {
+    // accept commas or semicolons regardless of config
+    return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean);
+  }
+  function normalizeKey(s) {
+    s = String(s || '').trim().toUpperCase();
+    // reduce W01 -> W1; accept W/T/F/S + number
+    const m = s.match(/^([WTFS])0*(\d+)$/);
+    if (m) return m[1] + String(parseInt(m[2], 10));
+    return s;
+  }
+
   function parseLatLng(s) {
     const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
     if (!m) return null;
@@ -567,7 +586,7 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
-  // legend
+  // legend & status & error helpers
   function renderLegend(cfg, legendCounts, custIn, custOut) {
     const el = document.getElementById('legend');
     const rowsHtml = (cfg.layers || []).map(Lcfg => {
@@ -589,7 +608,6 @@
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}`;
   }
 
-  // status line (pure)
   function makeStatusLine(selMunis, inCount, outCount) {
     const muniList = (Array.isArray(selMunis) && selMunis.length)
       ? selMunis.join(', ')
@@ -598,9 +616,16 @@
   }
 
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
+  function phase(msg){ setStatus(`⏳ ${msg}`); }
+  function info(msg){ setStatus(`ℹ️ ${msg}`); }
+  function warn(msg){ const e = document.getElementById('error'); e.style.display='block'; e.innerHTML = `<strong>Warning</strong><br>${escapeHtml(msg)}`; }
   function showError(e) {
     const el = document.getElementById('error');
     el.style.display = 'block';
-    el.innerHTML = `<strong>Load error</strong><br>${e && e.message ? e.message : e}`;
+    el.innerHTML = `<strong>Load error</strong><br>${e && e.message ? escapeHtml(e.message) : e}`;
+  }
+
+  function resetDayCounts(){
+    custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
   }
 })();
