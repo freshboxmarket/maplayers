@@ -34,13 +34,13 @@
     let currentFocus = null;
 
     // coverage sets for Turf
-    const coveragePolysAll = [];         // all polygons (for color-by-selected & any-polygon counts)
-    let coveragePolysSelected = [];      // selected-only (for counts + color)
+    const coveragePolysAll = [];         // all polygons (for color-by-any-polygon + _custAny)
+    let coveragePolysSelected = [];      // selected-only (for counts + inside coloring)
 
-    // Municipality list (selected)
+    // selected municipality list (for status)
     let selectedMunicipalities = [];
 
-    renderLegend(cfg, /*legendCounts=*/null, custWithinSel, custOutsideSel);
+    renderLegend(cfg, null, custWithinSel, custOutsideSel);
 
     // --- polygons ---
     for (const Lcfg of (cfg.layers || [])) {
@@ -67,21 +67,19 @@
           const day  = (p[cfg.fields.day]  ?? Lcfg.day).toString().trim();
 
           lyr._routeKey = key;
-          lyr._day      = day;
+          lyr._day      = day;           // "Wednesday" etc.
           lyr._perDay   = perDay;
           lyr._labelTxt = muni;
-          lyr._isSelected = false; // set during applySelection
-          lyr._custAny = 0;        // updated in recolorAndRecountCustomers()
-          lyr._custSel = 0;        // updated in recolorAndRecountCustomers()
+          lyr._isSelected = false;
+          lyr._custAny = 0;              // all customers in this polygon
+          lyr._custSel = 0;              // customers in selection in this polygon
           lyr._turfFeat = { type: 'Feature', properties: { day, muni, key }, geometry: feat.geometry };
 
-          // keep a record for coverage
           coveragePolysAll.push({ feat: lyr._turfFeat, perDay, layerRef: lyr });
 
           lyr.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
             if (currentFocus === lyr) {
-              // Still open popup on re-click
               openPolygonPopup(lyr);
             } else {
               focusFeature(lyr);
@@ -109,9 +107,8 @@
         colorTiles.addTo(map).setZIndex(2);
         base.setZIndex(1);
       }
-    } catch(e) { /* ok */ }
+    } catch(e) { /* non-fatal */ }
 
-    // clear focus interactions
     map.on('click', () => { clearFocus(true); });
     map.on('movestart', () => { clearFocus(false); map.closePopup(); });
     map.on('zoomstart', () => { map.closePopup(); });
@@ -184,7 +181,7 @@
         });
       });
 
-      // De-dupe & sort municipality list
+      // de-dupe & sort municipalities
       selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
         .sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
@@ -200,7 +197,7 @@
       // recolor + recount customers relative to the NEW selection
       recolorAndRecountCustomers();
 
-      // Legend fractions: per-day customers in selection / total in selection
+      // per-day legend fractions: day-in-selection / total-in-selection
       const legendCounts = {
         Wednesday: { selected: custByDayInSel.Wednesday, total: custWithinSel },
         Thursday:  { selected: custByDayInSel.Thursday,  total: custWithinSel },
@@ -209,7 +206,7 @@
       };
 
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
-      setStatus(makeStatusLine());
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
     }
 
     // ---------- customers overlay ----------
@@ -223,14 +220,14 @@
         custWithinSel = 0; custOutsideSel = 0;
         custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
-        setStatus(makeStatusLine());
+        setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
       if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
         custWithinSel = 0; custOutsideSel = 0;
         custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
-        setStatus(makeStatusLine());
+        setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
 
@@ -240,7 +237,7 @@
         custWithinSel = 0; custOutsideSel = 0;
         custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
-        setStatus(makeStatusLine());
+        setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
 
@@ -249,7 +246,7 @@
         custWithinSel = 0; custOutsideSel = 0;
         custByDayInSel.Wednesday = custByDayInSel.Thursday = custByDayInSel.Friday = custByDayInSel.Saturday = 0;
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
-        setStatus(makeStatusLine());
+        setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
         return;
       }
       const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema);
@@ -286,7 +283,6 @@
       // color + count
       recolorAndRecountCustomers();
 
-      // Legend fractions: per-day customers in selection / total in selection
       const legendCounts = {
         Wednesday: { selected: custByDayInSel.Wednesday, total: custWithinSel },
         Thursday:  { selected: custByDayInSel.Thursday,  total: custWithinSel },
@@ -295,7 +291,7 @@
       };
 
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
-      setStatus(makeStatusLine());
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
     }
 
     // recolor + recount (points colored ONLY if inside SELECTED polygons; grey otherwise)
@@ -333,7 +329,7 @@
         if (turfOn) {
           const pt = turf.point([rec.lng, rec.lat]);
 
-          // Count for ANY polygon (total customers per municipality)
+          // count for ANY polygon (total customers per municipality)
           for (let j = 0; j < coveragePolysAll.length; j++) {
             if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
               const lyr = coveragePolysAll[j].layerRef;
@@ -342,13 +338,12 @@
             }
           }
 
-          // Color & per-day count using SELECTED polygons only
+          // color & per-day count using SELECTED polygons only
           if (hasSelection && coveragePolysSelected.length) {
             for (let k = 0; k < coveragePolysSelected.length; k++) {
               if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
                 insideSel = true;
                 selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
-                // color by this polygon's day colors
                 const pd = coveragePolysSelected[k].perDay || {};
                 style = {
                   radius:  (cst.radius || 9),
@@ -358,7 +353,6 @@
                   fillColor: pd.fill || (cst.fill || '#ffffff'),
                   fillOpacity: (cst.fillOpacity != null ? cst.fillOpacity : 0.95)
                 };
-                // per-polygon selected count
                 const lyr = coveragePolysSelected[k].layerRef;
                 if (lyr) lyr._custSel += 1;
                 break;
@@ -381,7 +375,7 @@
       custOutsideSel = outSel;
     }
 
-    // ---------- polygon popup ----------
+    // polygon popup with counts
     function openPolygonPopup(lyr) {
       const muni = lyr._labelTxt || 'Municipality';
       const totalAny = Number(lyr._custAny || 0);
@@ -393,7 +387,7 @@
       if (center) L.popup({autoClose:true, closeOnClick:true}).setLatLng(center).setContent(html).openOn(map);
     }
 
-    // ---------- polygon focus/highlight ----------
+    // polygon focus/highlight
     function focusFeature(lyr) {
       if (currentFocus && currentFocus !== lyr) restoreFeature(currentFocus);
       currentFocus = lyr;
@@ -439,7 +433,7 @@
       }
     }
 
-    // ---------- polygon style helpers ----------
+    // polygon style helpers
     function applyStyleSelected(lyr, perDay, cfg) {
       lyr.setStyle({
         color: perDay.stroke || '#666',
@@ -595,11 +589,12 @@
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}`;
   }
 
-  function makeStatusLine() {
-    const muniList = (Array.isArray(selectedMunicipalities) && selectedMunicipalities.length)
-      ? selectedMunicipalities.join(', ')
+  // status line (pure)
+  function makeStatusLine(selMunis, inCount, outCount) {
+    const muniList = (Array.isArray(selMunis) && selMunis.length)
+      ? selMunis.join(', ')
       : '—';
-    return `Customers (in/out): ${custWithinSel}/${custOutsideSel} • Municipalities: ${muniList}`;
+    return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList}`;
   }
 
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
