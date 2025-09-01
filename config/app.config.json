@@ -9,10 +9,7 @@
     "type": "csv",
     "enabled": true,
     "url": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRMkbzNUzuGSEToTgDsF2ZSgSxmeiwwn4i3IJNgT64EJecwNytydMZWGdTQ9X2azaicITiFOGCevodA/pub?output=csv",
-    "schema": {
-      "coords": "Verified Coordinates",
-      "note": "Order Note"
-    }
+    "schema": { "coords": "Verified Coordinates", "note": "Order Note" }
   },
   "layers": [
     { "day": "Wednesday", "name": "_Wednesday_group", "url": "./_Wednesday_group.geojson" },
@@ -42,16 +39,8 @@
       "weightPx": 2,
       "opacity": 0.95,
       "fillOpacity": 0.95,
-      "outside": {
-        "stroke": "#7a7a7a",
-        "fill": "#c7c7c7",
-        "opacity": 0.8,
-        "fillOpacity": 0.6
-      }
+      "outside": { "stroke": "#7a7a7a", "fill": "#c7c7c7", "opacity": 0.8, "fillOpacity": 0.6 }
     }
   },
-  "behavior": {
-    "autoZoom": true,
-    "refreshSeconds": 0
-  }
+  "behavior": { "autoZoom": true, "refreshSeconds": 0 }
 }
