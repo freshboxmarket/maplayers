@@ -18,7 +18,7 @@
     }).addTo(map);
     const baseEl = base.getContainer?.(); if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
-    // We keep *both* sets loaded, and show/hide features per-selection.
+    // Keep both sets loaded; toggle per feature depending on selection.
     const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]
     const quadDayLayers = [];   // same shape
     const allDaySets    = [baseDayLayers, quadDayLayers];
@@ -41,18 +41,29 @@
     let coveragePolysSelected = [];   // only visible & selected polygons
     let selectedMunicipalities = [];
 
+    // Per-driver selected customer counts (for legend)
+    let driverSelectedCounts = {};     // name -> count (within selection)
+
     // Driver overlays (nets)
     const driverOverlays = {};        // name -> { group, color, labelMarker }
     const driversCfg = Object.assign(
-      { enabled: true, strokeWeightPx: 3, fillOpacity: 0.12, dashArray: '6 4', labelClass: 'lbl dim',
-        hatch: { weight: 4, space: 6, opacity: 0.32 } },
+      {
+        enabled: true,
+        strokeWeightPx: 6,                // colored outline thickness (emphasized)
+        outlineHaloWeightPx: 12,          // white halo thickness under colored line
+        haloColor: '#ffffff',
+        fillOpacity: 0.12,
+        dashArray: '6 4',
+        labelClass: 'lbl dim',
+        hatch: { weight: 4, space: 6, opacity: 0.32 }
+      },
       cfg.drivers || {}
     );
 
     renderLegend(cfg, null, custWithinSel, custOutsideSel);
-    renderDriversPanel([], {}); // empty until overlays exist
+    renderDriversPanel([], {}, false, {}, 0); // empty until overlays + counts exist
 
-    // ---------- load BOTH sets; both groups added to map (features will be toggled) ----------
+    // ---------- load BOTH sets; groups added to map (feature visibility toggled later) ----------
     phase('Loading polygon layers…');
     await loadLayerSet(cfg.layers, baseDayLayers, /*addToMap*/ true);
     if (cfg.layersQuadrants && cfg.layersQuadrants.length) {
@@ -181,9 +192,7 @@
 
       // Which base keys are being split by quadrant?
       const quadrantBaseSet = new Set();
-      for (const k of selectedSet) {
-        if (isQuadrantKey(k)) quadrantBaseSet.add(baseKeyFrom(k));
-      }
+      for (const k of selectedSet) if (isQuadrantKey(k)) quadrantBaseSet.add(baseKeyFrom(k));
 
       // Helper to (de)show a single feature
       const setFeatureVisible = (entry, lyr, visible, isSelected) => {
@@ -198,7 +207,6 @@
           else            applyStyleDim(lyr, entry.perDay, cfg);
 
           if (isSelected) {
-            // bounds + selected coverage + label list
             try { if (lyr.getBounds) {
               const b = lyr.getBounds();
               selectionBounds = selectionBounds ? selectionBounds.extend(b) : L.latLngBounds(b);
@@ -244,11 +252,8 @@
 
       // Zoom
       if (cfg.behavior?.autoZoom) {
-        if (hasSelection && selectionBounds) {
-          map.fitBounds(selectionBounds.pad(0.1));
-        } else if (allBounds) {
-          map.fitBounds(allBounds.pad(0.1));
-        }
+        if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+        else if (allBounds) map.fitBounds(allBounds.pad(0.1));
       }
 
       // recolor + recount customers relative to NEW selection
@@ -265,9 +270,12 @@
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
 
-      // Driver overlays built ONLY from the selected features
+      // Driver overlays (built from selected features) + update Drivers panel with counts
       if (driversCfg.enabled) {
         await rebuildDriverOverlays();
+        // panel re-rendered inside rebuild with counts
+      } else {
+        renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
       }
     }
 
@@ -300,6 +308,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
         return;
       }
       if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
@@ -307,6 +316,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
         return;
       }
 
@@ -318,6 +328,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
         return;
       }
 
@@ -328,6 +339,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
         return;
       }
       const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
@@ -370,6 +382,7 @@
       };
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
     }
 
     function resetDayCounts(){
@@ -382,6 +395,9 @@
     function recolorAndRecountCustomers() {
       let inSel = 0, outSel = 0;
       resetDayCounts();
+
+      // reset per-layer counters for visible polygons
+      for (const rec of coveragePolysAll) { if (rec.layerRef) { rec.layerRef._custAny = 0; rec.layerRef._custSel = 0; } }
 
       const turfOn = (typeof turf !== 'undefined');
 
@@ -418,9 +434,11 @@
           }
 
           // In selection?
+          let matchedIdx = -1;
           for (let k = 0; k < coveragePolysSelected.length; k++) {
             if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
               insideSel = true;
+              matchedIdx = k;
               selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
               const pd = coveragePolysSelected[k].perDay || {};
               style = {
@@ -450,6 +468,23 @@
 
       custWithinSel = inSel;
       custOutsideSel = outSel;
+
+      // After we’ve updated _custSel on selected polygons, aggregate per-driver counts.
+      driverSelectedCounts = computeDriverCounts();
+      // Update the drivers panel (counts) immediately if overlays already exist.
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+    }
+
+    // Aggregate polygon _custSel to per-driver totals
+    function computeDriverCounts() {
+      const out = {};
+      for (const rec of coveragePolysSelected) {
+        const lyr = rec.layerRef; if (!lyr) continue;
+        const drv = lookupDriverForKey(assignMap, lyr._routeKey);
+        if (!drv) continue;
+        out[drv] = (out[drv] || 0) + (lyr._custSel || 0);
+      }
+      return out;
     }
 
     // ===================================================================================
@@ -471,7 +506,7 @@
         byDriver.get(drv).push(rec.layerRef._turfFeat);
       });
 
-      if (byDriver.size === 0) { renderDriversPanel(driverMeta, {}, false); return; }
+      if (byDriver.size === 0) { renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel); return; }
 
       // try hatch plugin; fall back gracefully
       let hasPattern = false;
@@ -516,9 +551,33 @@
           }));
         }
 
+        // HALO outline (underlay)
+        const halo = L.geoJSON({ type: 'FeatureCollection', features }, {
+          interactive: false,
+          style: () => ({
+            color: driversCfg.haloColor || '#fff',
+            weight: driversCfg.outlineHaloWeightPx || 12,
+            opacity: 0.95,
+            lineJoin: 'round',
+            lineCap: 'round',
+            dashArray: null,
+            fill: false
+          })
+        });
+        layers.push(halo);
+
+        // Colored outline (top)
         const outline = L.geoJSON({ type: 'FeatureCollection', features }, {
           interactive: false,
-          style: () => ({ color, weight: driversCfg.strokeWeightPx || 3, opacity: 0.95, dashArray: driversCfg.dashArray || '6 4', fill: false })
+          style: () => ({
+            color,
+            weight: driversCfg.strokeWeightPx || 6,
+            opacity: 1.0,
+            lineJoin: 'round',
+            lineCap: 'round',
+            dashArray: driversCfg.dashArray || '6 4',
+            fill: false
+          })
         });
         layers.push(outline);
 
@@ -539,7 +598,8 @@
         driverOverlays[name] = { group, color, labelMarker };
       });
 
-      renderDriversPanel(driverMeta, driverOverlays, true);
+      // Show toggles (default ON) and include per-driver counts
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
     }
 
     function lookupDriverForKey(assignMap, key) {
@@ -629,38 +689,54 @@
     }
 
     // ===================================================================================
-    // DRIVERS PANEL
+    // DRIVERS PANEL  (now shows counts: x / totalSelected)
     // ===================================================================================
-    function renderDriversPanel(metaList, overlays, defaultOn=false) {
+    function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
       const el = document.getElementById('drivers');
       if (!el) return;
 
       const hasOverlays = overlays && Object.keys(overlays).length;
       const hasMeta = metaList && metaList.length;
 
-      if (!hasOverlays || !hasMeta) { el.innerHTML = ''; return; }
+      if (!hasMeta) { el.innerHTML = ''; return; }
+      if (!hasOverlays) { // still show meta, with 0 counts
+        const rows0 = metaList.map(d => rowHtml(d, null, defaultOn, countsMap, totalSelected)).join('');
+        el.innerHTML = `<h4>Drivers</h4>${rows0}`;
+        wireToggles(el);
+        return;
+      }
 
       const rows = metaList
-        .filter(d => overlays[d.name])
-        .map(d => {
-          const col = d.color || '#888';
-          const safeName = escapeHtml(d.name || '');
-          return `<div class="row">
-            <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}" ${defaultOn ? 'checked' : ''}>
-            <span class="swatch" style="background:${col}; border-color:${col}"></span>
-            <div>${safeName}</div>
-          </div>`;
-        }).join('');
+        .filter(d => overlays[d.name]) // only drivers present in selection
+        .map(d => rowHtml(d, overlays[d.name], defaultOn, countsMap, totalSelected))
+        .join('');
       el.innerHTML = `<h4>Drivers</h4>${rows}`;
+      wireToggles(el);
 
-      el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-        const name = cb.getAttribute('data-driver');
-        toggleDriverOverlay(name, !!cb.checked);
-        cb.addEventListener('change', (e) => {
-          const name = e.target.getAttribute('data-driver');
-          toggleDriverOverlay(name, e.target.checked);
+      function rowHtml(d, overlayRec, defOn, counts, total) {
+        const col = d.color || '#888';
+        const safeName = escapeHtml(d.name || '');
+        const onAttr = (overlayRec ? (defOn ? 'checked' : '') : '');
+        const haveCount = typeof counts[safeName] === 'number';
+        const frac = haveCount ? `${counts[safeName]}/${total || 0}` : `0/${total || 0}`;
+        return `<div class="row">
+          <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}" ${onAttr}>
+          <span class="swatch" style="background:${col}; border-color:${col}"></span>
+          <div>${safeName}</div>
+          <div class="counts" style="margin-left:auto">${frac}</div>
+        </div>`;
+      }
+
+      function wireToggles(container) {
+        container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+          const name = cb.getAttribute('data-driver');
+          toggleDriverOverlay(name, !!cb.checked);
+          cb.addEventListener('change', (e) => {
+            const name = e.target.getAttribute('data-driver');
+            toggleDriverOverlay(name, e.target.checked);
+          });
         });
-      });
+      }
     }
 
     function toggleDriverOverlay(name, on) {
