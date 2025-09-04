@@ -18,10 +18,10 @@
     }).addTo(map);
     const baseEl = base.getContainer?.(); if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
-    // Layer sets (base municipalities vs quadrantized)
-    const baseDayLayers = [];     // [{day, layer, perDay}]
-    const quadDayLayers = [];     // [{day, layer, perDay}]
-    let activeDayLayers = baseDayLayers;  // pointer to whichever is active
+    // We keep *both* sets loaded, and show/hide features per-selection.
+    const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]
+    const quadDayLayers = [];   // same shape
+    const allDaySets    = [baseDayLayers, quadDayLayers];
 
     // State
     let allBounds = null;
@@ -37,15 +37,14 @@
     const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
     let currentFocus = null;
-    let coveragePolysAll = [];        // rebuilt when switching active set
-    let coveragePolysSelected = [];   // only selected polygons
+    let coveragePolysAll = [];        // all *visible* polygons after selection
+    let coveragePolysSelected = [];   // only visible & selected polygons
     let selectedMunicipalities = [];
 
     // Driver overlays (nets)
     const driverOverlays = {};        // name -> { group, color, labelMarker }
     const driversCfg = Object.assign(
       { enabled: true, strokeWeightPx: 3, fillOpacity: 0.12, dashArray: '6 4', labelClass: 'lbl dim',
-        // hatch defaults (net effect = two crossed stripe patterns)
         hatch: { weight: 4, space: 6, opacity: 0.32 } },
       cfg.drivers || {}
     );
@@ -53,14 +52,14 @@
     renderLegend(cfg, null, custWithinSel, custOutsideSel);
     renderDriversPanel([], {}); // empty until overlays exist
 
-    // ---------- load BOTH sets (base + quadrants); quadrants initially hidden ----------
+    // ---------- load BOTH sets; both groups added to map (features will be toggled) ----------
     phase('Loading polygon layers…');
-    await loadLayerSet(cfg.layers, baseDayLayers);
+    await loadLayerSet(cfg.layers, baseDayLayers, /*addToMap*/ true);
     if (cfg.layersQuadrants && cfg.layersQuadrants.length) {
-      await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ false);
+      await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ true);
     }
 
-    // background tiles clipped to overall delivery union (nice focus)
+    // Boundary canvas (clipped color tiles)
     try {
       if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
         const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -95,6 +94,7 @@
         const perDay = (cfg.style?.perDay?.[Lcfg.day]) || {};
         const color = perDay.stroke || '#666';
         const fillColor = perDay.fill || '#ccc';
+        const features = [];
 
         const layer = L.geoJSON(gj, {
           style: () => ({
@@ -107,11 +107,12 @@
           onEachFeature: (feat, lyr) => {
             const p = feat.properties || {};
             const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
-            const keyNorm = normalizeKey(rawKey); // keeps suffixes like _SE
+            const keyNorm = normalizeKey(rawKey); // keeps suffixes (e.g., _SE)
             const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
             const day     = Lcfg.day;
 
             lyr._routeKey = keyNorm;
+            lyr._baseKey  = baseKeyFrom(keyNorm); // e.g., F15 for F15_SE
             lyr._day      = day;
             lyr._perDay   = perDay;
             lyr._labelTxt = muni;
@@ -121,6 +122,7 @@
             lyr._turfFeat = { type: 'Feature', properties: { day, muni, key: keyNorm }, geometry: feat.geometry };
 
             boundaryFeatures.push({ type: 'Feature', geometry: feat.geometry });
+            features.push(lyr);
 
             lyr.on('click', (e) => {
               L.DomEvent.stopPropagation(e);
@@ -135,40 +137,13 @@
           }
         });
 
-        collector.push({ day: Lcfg.day, layer, perDay });
+        collector.push({ day: Lcfg.day, layer, perDay, features });
         if (addToMap) layer.addTo(map);
       }
-
-      // (Re)build coveragePolysAll from whichever set is currently on map
-      rebuildCoverageFromActive();
     }
-
-    function setActiveLayerSet(useQuadrants) {
-      const want = useQuadrants ? quadDayLayers : baseDayLayers;
-      if (activeDayLayers === want) return;
-
-      // remove previous
-      activeDayLayers.forEach(({ layer }) => { map.removeLayer(layer); hideAllLabels(layer); });
-      // add new
-      want.forEach(({ layer }) => { map.addLayer(layer); });
-
-      activeDayLayers = want;
-      rebuildCoverageFromActive();
-    }
-
-    function rebuildCoverageFromActive() {
-      coveragePolysAll = [];
-      activeDayLayers.forEach(({ layer, perDay }) => {
-        layer.eachLayer(lyr => {
-          coveragePolysAll.push({ feat: lyr._turfFeat, perDay, layerRef: lyr });
-        });
-      });
-    }
-
-    function hideAllLabels(layer) { layer.eachLayer(lyr => hideLabel(lyr)); }
 
     // ===================================================================================
-    // SELECTION
+    // SELECTION (base + quadrants mixed correctly)
     // ===================================================================================
     async function applySelection() {
       clearFocus(false);
@@ -199,45 +174,77 @@
         info(`Loaded ${selectedSet.size} selected key(s).`);
       }
 
-      // Switch to quadrant layers if *any* quadrant keys are present,
-      // AND hide everything that is not explicitly selected.
-      const needQuadrants = Array.from(selectedSet).some(k => /_(SE|NE|NW|SW)$/i.test(k));
-      setActiveLayerSet(needQuadrants);
-
       hasSelection = selectedSet.size > 0;
       selectionBounds = null;
       coveragePolysSelected = [];
       selectedMunicipalities = [];
 
-      const selBounds = [];
-      const hideUnselected = needQuadrants || (cfg.style?.unselectedMode === 'hide' && hasSelection);
+      // Which base keys are being split by quadrant?
+      const quadrantBaseSet = new Set();
+      for (const k of selectedSet) {
+        if (isQuadrantKey(k)) quadrantBaseSet.add(baseKeyFrom(k));
+      }
 
-      activeDayLayers.forEach(({ layer, perDay }) => {
-        layer.eachLayer(lyr => {
-          const hit = selectedSet.has(lyr._routeKey); // exact match only
-          lyr._isSelected = !!hit;
+      // Helper to (de)show a single feature
+      const setFeatureVisible = (entry, lyr, visible, isSelected) => {
+        const isInGroup = entry.layer.hasLayer(lyr);
+        if (visible && !isInGroup) entry.layer.addLayer(lyr);
+        if (!visible && isInGroup) entry.layer.removeLayer(lyr);
 
-          if (hit) {
-            applyStyleSelected(lyr, perDay, cfg);
-            showLabel(lyr, lyr._labelTxt);
-            coveragePolysSelected.push({ feat: lyr._turfFeat, perDay, layerRef: lyr });
-            if (lyr.getBounds) selBounds.push(lyr.getBounds());
+        lyr._isSelected = !!(visible && isSelected);
+
+        if (visible) {
+          if (isSelected) applyStyleSelected(lyr, entry.perDay, cfg);
+          else            applyStyleDim(lyr, entry.perDay, cfg);
+
+          if (isSelected) {
+            // bounds + selected coverage + label list
+            try { if (lyr.getBounds) {
+              const b = lyr.getBounds();
+              selectionBounds = selectionBounds ? selectionBounds.extend(b) : L.latLngBounds(b);
+            }} catch(e){}
+            coveragePolysSelected.push({ feat: lyr._turfFeat, perDay: entry.perDay, layerRef: lyr });
             if (lyr._labelTxt) selectedMunicipalities.push(lyr._labelTxt);
-            layer.addLayer(lyr);
+            showLabel(lyr, lyr._labelTxt);
           } else {
             hideLabel(lyr);
-            if (hideUnselected) layer.removeLayer(lyr);
-            else { applyStyleDim(lyr, perDay, cfg); layer.addLayer(lyr); }
           }
-        });
-      });
+        } else {
+          hideLabel(lyr);
+        }
+      };
 
+      // Pass 1: BASE features — show if selected AND not overridden by quadrant(s)
+      for (const entry of baseDayLayers) {
+        for (const lyr of entry.features) {
+          const key = lyr._routeKey;
+          const base = lyr._baseKey;
+          const selectedBase = selectedSet.has(key);
+          const overriddenByQuadrants = quadrantBaseSet.has(base);
+          const visible = selectedBase && !overriddenByQuadrants;
+          setFeatureVisible(entry, lyr, visible, /*isSelected*/ visible);
+        }
+      }
+
+      // Pass 2: QUADRANT features — show only exact keys in selection
+      for (const entry of quadDayLayers) {
+        for (const lyr of entry.features) {
+          const key = lyr._routeKey;
+          const visible = selectedSet.has(key); // exact match (e.g., F15_SE)
+          setFeatureVisible(entry, lyr, visible, /*isSelected*/ visible);
+        }
+      }
+
+      // Rebuild "visible coverage" list for customer stats
+      rebuildCoverageFromVisible();
+
+      // Dedup + sort muni list for status
       selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
         .sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
+      // Zoom
       if (cfg.behavior?.autoZoom) {
-        if (hasSelection && selBounds.length) {
-          selectionBounds = selBounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(selBounds[0]));
+        if (hasSelection && selectionBounds) {
           map.fitBounds(selectionBounds.pad(0.1));
         } else if (allBounds) {
           map.fitBounds(allBounds.pad(0.1));
@@ -261,6 +268,21 @@
       // Driver overlays built ONLY from the selected features
       if (driversCfg.enabled) {
         await rebuildDriverOverlays();
+      }
+    }
+
+    function rebuildCoverageFromVisible() {
+      coveragePolysAll = [];
+      for (const arr of allDaySets) {
+        for (const entry of arr) {
+          for (const lyr of entry.features) {
+            if (entry.layer.hasLayer(lyr)) {
+              coveragePolysAll.push({ feat: lyr._turfFeat, perDay: entry.perDay, layerRef: lyr });
+              // reset per-layer counters (re-counted in recolor)
+              lyr._custAny = 0; lyr._custSel = 0;
+            }
+          }
+        }
       }
     }
 
@@ -360,7 +382,6 @@
     function recolorAndRecountCustomers() {
       let inSel = 0, outSel = 0;
       resetDayCounts();
-      coveragePolysAll.forEach(rec => { if (rec.layerRef) { rec.layerRef._custAny = 0; rec.layerRef._custSel = 0; } });
 
       const turfOn = (typeof turf !== 'undefined');
 
@@ -387,6 +408,7 @@
         if (turfOn) {
           const pt = turf.point([rec.lng, rec.lat]);
 
+          // ANY visible polygon (for muni totals)
           for (let j = 0; j < coveragePolysAll.length; j++) {
             if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
               const lyr = coveragePolysAll[j].layerRef;
@@ -395,24 +417,23 @@
             }
           }
 
-          if (hasSelection && coveragePolysSelected.length) {
-            for (let k = 0; k < coveragePolysSelected.length; k++) {
-              if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
-                insideSel = true;
-                selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
-                const pd = coveragePolysSelected[k].perDay || {};
-                style = {
-                  radius:  (cst.radius || 9),
-                  color:   pd.stroke || (cst.stroke || '#111'),
-                  weight:  (cst.weightPx || 2),
-                  opacity: (cst.opacity != null ? cst.opacity : 0.95),
-                  fillColor: pd.fill || (cst.fill || '#ffffff'),
-                  fillOpacity: (cst.fillOpacity != null ? cst.fillOpacity : 0.95)
-                };
-                const lyr = coveragePolysSelected[k].layerRef;
-                if (lyr) lyr._custSel += 1;
-                break;
-              }
+          // In selection?
+          for (let k = 0; k < coveragePolysSelected.length; k++) {
+            if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
+              insideSel = true;
+              selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
+              const pd = coveragePolysSelected[k].perDay || {};
+              style = {
+                radius:  (cst.radius || 9),
+                color:   pd.stroke || (cst.stroke || '#111'),
+                weight:  (cst.weightPx || 2),
+                opacity: (cst.opacity != null ? cst.opacity : 0.95),
+                fillColor: pd.fill || (cst.fill || '#ffffff'),
+                fillOpacity: (cst.fillOpacity != null ? cst.fillOpacity : 0.95)
+              };
+              const lyr = coveragePolysSelected[k].layerRef;
+              if (lyr) lyr._custSel += 1;
+              break;
             }
           }
         }
@@ -450,61 +471,58 @@
         byDriver.get(drv).push(rec.layerRef._turfFeat);
       });
 
-      // nothing to draw?
       if (byDriver.size === 0) { renderDriversPanel(driverMeta, {}, false); return; }
 
-      // ensure hatch plugin is available
-      await ensurePatternPlugin();
+      // try hatch plugin; fall back gracefully
+      let hasPattern = false;
+      try { hasPattern = await ensurePatternPlugin(); } catch(e) { hasPattern = false; }
 
-      // build overlays
       byDriver.forEach((features, name) => {
         const meta = driverMeta.find(d => (d.name || '').toLowerCase() === (name || '').toLowerCase()) || { color: '#888' };
         const color = meta.color || '#888';
 
-        // Create two stripe patterns (±45°) for a cross-hatch "net"
-        const p1 = new L.StripePattern({
-          patternUnits: 'userSpaceOnUse',
-          angle: 45,
-          weight: driversCfg.hatch?.weight ?? 4,
-          spaceWeight: driversCfg.hatch?.space ?? 6,
-          color,
-          opacity: driversCfg.hatch?.opacity ?? 0.32,
-          spaceOpacity: 0
-        }).addTo(map);
+        const layers = [];
 
-        const p2 = new L.StripePattern({
-          patternUnits: 'userSpaceOnUse',
-          angle: -45,
-          weight: driversCfg.hatch?.weight ?? 4,
-          spaceWeight: driversCfg.hatch?.space ?? 6,
-          color,
-          opacity: driversCfg.hatch?.opacity ?? 0.32,
-          spaceOpacity: 0
-        }).addTo(map);
+        if (hasPattern) {
+          const p1 = new L.StripePattern({
+            patternUnits: 'userSpaceOnUse',
+            angle: 45,
+            weight: driversCfg.hatch?.weight ?? 4,
+            spaceWeight: driversCfg.hatch?.space ?? 6,
+            color,
+            opacity: driversCfg.hatch?.opacity ?? 0.32,
+            spaceOpacity: 0
+          }).addTo(map);
+          const p2 = new L.StripePattern({
+            patternUnits: 'userSpaceOnUse',
+            angle: -45,
+            weight: driversCfg.hatch?.weight ?? 4,
+            spaceWeight: driversCfg.hatch?.space ?? 6,
+            color,
+            opacity: driversCfg.hatch?.opacity ?? 0.32,
+            spaceOpacity: 0
+          }).addTo(map);
 
-        // Fill layers (two patterns overlapped) + an outline layer
-        const fill1 = L.geoJSON({ type: 'FeatureCollection', features }, {
-          interactive: false,
-          style: () => ({ fill: true, fillOpacity: 1, fillPattern: p1, color: 'transparent', opacity: 0 })
-        });
-        const fill2 = L.geoJSON({ type: 'FeatureCollection', features }, {
-          interactive: false,
-          style: () => ({ fill: true, fillOpacity: 1, fillPattern: p2, color: 'transparent', opacity: 0 })
-        });
+          layers.push(L.geoJSON({ type: 'FeatureCollection', features }, {
+            interactive: false, style: () => ({ fill: true, fillOpacity: 1, fillPattern: p1, color: 'transparent', opacity: 0 })
+          }));
+          layers.push(L.geoJSON({ type: 'FeatureCollection', features }, {
+            interactive: false, style: () => ({ fill: true, fillOpacity: 1, fillPattern: p2, color: 'transparent', opacity: 0 })
+          }));
+        } else {
+          // soft translucent fill if hatch unavailable
+          layers.push(L.geoJSON({ type: 'FeatureCollection', features }, {
+            interactive: false, style: () => ({ color: 'transparent', opacity: 0, fill: true, fillColor: color, fillOpacity: driversCfg.fillOpacity ?? 0.12 })
+          }));
+        }
+
         const outline = L.geoJSON({ type: 'FeatureCollection', features }, {
           interactive: false,
-          style: () => ({
-            color,
-            weight: driversCfg.strokeWeightPx || 3,
-            opacity: 0.95,
-            dashArray: driversCfg.dashArray || '6 4',
-            fill: false
-          })
+          style: () => ({ color, weight: driversCfg.strokeWeightPx || 3, opacity: 0.95, dashArray: driversCfg.dashArray || '6 4', fill: false })
         });
+        layers.push(outline);
 
-        const group = L.featureGroup([fill1, fill2, outline]);
-
-        // Label
+        const group = L.featureGroup(layers);
         let labelMarker = null;
         try {
           const b = outline.getBounds();
@@ -521,7 +539,6 @@
         driverOverlays[name] = { group, color, labelMarker };
       });
 
-      // show toggles (default ON)
       renderDriversPanel(driverMeta, driverOverlays, true);
     }
 
@@ -667,21 +684,25 @@
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
 
-  // Dynamically load leaflet.pattern (adds L.StripePattern)
+  // Dynamically load leaflet.pattern (adds L.StripePattern). Returns true/false.
   async function ensurePatternPlugin() {
-    if (L && L.StripePattern) return;
-    await loadScript('https://unpkg.com/leaflet.pattern/dist/leaflet.pattern.min.js');
-    // wait until registered
-    const t0 = Date.now();
-    while (!L.StripePattern) {
-      await new Promise(r => setTimeout(r, 20));
-      if (Date.now() - t0 > 4000) throw new Error('leaflet.pattern failed to load');
-    }
+    if (L && L.StripePattern) return true;
+    try {
+      await loadScript('https://unpkg.com/leaflet.pattern/dist/leaflet.pattern.min.js');
+      const t0 = Date.now();
+      while (!L.StripePattern) {
+        await new Promise(r => setTimeout(r, 20));
+        if (Date.now() - t0 > 4000) break;
+      }
+      return !!L.StripePattern;
+    } catch (e) { return false; }
   }
   function loadScript(src){
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
-      s.src = src; s.async = true; s.onload = resolve; s.onerror = reject;
+      s.src = src; s.async = true;
+      s.onload = () => resolve();
+      s.onerror = (ev) => reject(ev);
       document.head.appendChild(s);
     });
   }
@@ -745,6 +766,13 @@
     const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
     if (m) return m[1] + String(parseInt(m[2], 10)) + (m[3] || '');
     return s;
+  }
+  function baseKeyFrom(key) {
+    const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/);
+    return m ? m[1] : String(key||'').toUpperCase();
+  }
+  function isQuadrantKey(key) {
+    return /_(SE|NE|NW|SW)$/i.test(String(key||''));
   }
 
   function parseLatLng(s) {
@@ -826,6 +854,16 @@
   function showError(e) {
     const el = document.getElementById('error');
     el.style.display = 'block';
-    el.innerHTML = `<strong>Load error</strong><br>${e && e.message ? escapeHtml(e.message) : e}`;
+    el.innerHTML = `<strong>Load error</strong><br>${escapeHtml(niceError(e))}`;
+  }
+  function niceError(e){
+    if (!e) return 'Unknown error';
+    if (typeof e === 'string') return e;
+    if (e.message) return e.message;
+    if (e.status) return `HTTP ${e.status}`;
+    try {
+      if (e.target && e.target.src) return `Failed to load script: ${e.target.src}`;
+      return JSON.stringify(e);
+    } catch { return String(e); }
   }
 })();
