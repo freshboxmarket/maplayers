@@ -3,8 +3,11 @@
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
   const parseJSON = (s, fallback=null) => { try { return JSON.parse(s); } catch(e){ return fallback; } };
-  const driverMeta = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
-  const assignMap  = parseJSON(qs.get('assignMap')  || '{}', {});   // { "W1":"Devin", "F15_SE":"Nithin", ... }
+  const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
+  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // optional seed
+
+  // This becomes our source of truth after we parse the CSV:
+  let activeAssignMap = { ...assignMapParam };  // key -> driverName (keys may be base like F15 or quadrant like F15_SE)
 
   try {
     phase('Loading config…');
@@ -43,6 +46,9 @@
 
     // Per-driver selected customer counts (for legend)
     let driverSelectedCounts = {};     // name -> count (within selection)
+
+    // Driver metadata (colors) — we’ll merge CSV-derived driver names into this
+    let driverMeta = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
 
     // Driver overlays (nets)
     const driverOverlays = {};        // name -> { group, color, labelMarker }
@@ -154,7 +160,7 @@
     }
 
     // ===================================================================================
-    // SELECTION (base + quadrants mixed correctly)
+    // SELECTION (base + quadrants mixed correctly) + CSV-derived driver assignments
     // ===================================================================================
     async function applySelection() {
       clearFocus(false);
@@ -166,18 +172,25 @@
       const csvText = await fetchText(selUrl);
       const rowsAA = parseCsvRows(csvText);
 
-      const hdr = findHeaderFlexible(rowsAA, cfg.selection.schema || { keys: 'zone keys' });
+      // 1) Parse selected keys (what to display)
+      const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
       const selectedSet = new Set();
       if (hdr) {
         const { headerIndex, keysCol } = hdr;
         for (let i = headerIndex + 1; i < rowsAA.length; i++) {
           const r = rowsAA[i]; if (!r || r.length === 0) continue;
           const raw = ((r[keysCol] || '') + '');
-          const keys = splitKeys(raw, (cfg.selection.schema && cfg.selection.schema.delimiter) || ',')
-                        .map(normalizeKey).filter(Boolean);
+          const keys = splitKeys(raw).map(normalizeKey).filter(Boolean);
           keys.forEach(k => selectedSet.add(k));
         }
       }
+
+      // 2) Parse driver assignments from the SAME CSV (rows 4–34 or via header detection)
+      const derivedAssign = extractAssignmentsFromCsv(rowsAA);
+      // CSV mapping is authoritative; fall back to URL param for anything missing.
+      activeAssignMap = { ...activeAssignMap, ...derivedAssign }; // keep any URL-provided extras, but CSV overwrites
+      // Merge driver names into driverMeta, giving a decent color if missing
+      driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
 
       if (selectedSet.size === 0) {
         warn(`Selection parsed 0 keys. Check the published CSV has a "zone keys" column.`);
@@ -273,7 +286,6 @@
       // Driver overlays (built from selected features) + update Drivers panel with counts
       if (driversCfg.enabled) {
         await rebuildDriverOverlays();
-        // panel re-rendered inside rebuild with counts
       } else {
         renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
       }
@@ -308,7 +320,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
+        renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
         return;
       }
       if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
@@ -316,7 +328,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
+        renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
         return;
       }
 
@@ -328,7 +340,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
+        renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
         return;
       }
 
@@ -339,7 +351,7 @@
         resetDayCounts();
         renderLegend(cfg, null, custWithinSel, custOutsideSel);
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-        renderDriversPanel(driverMeta, driverOverlays, true, {}, custWithinSel);
+        renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
         return;
       }
       const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
@@ -434,11 +446,9 @@
           }
 
           // In selection?
-          let matchedIdx = -1;
           for (let k = 0; k < coveragePolysSelected.length; k++) {
             if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
               insideSel = true;
-              matchedIdx = k;
               selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
               const pd = coveragePolysSelected[k].perDay || {};
               style = {
@@ -471,7 +481,6 @@
 
       // After we’ve updated _custSel on selected polygons, aggregate per-driver counts.
       driverSelectedCounts = computeDriverCounts();
-      // Update the drivers panel (counts) immediately if overlays already exist.
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
     }
 
@@ -480,7 +489,7 @@
       const out = {};
       for (const rec of coveragePolysSelected) {
         const lyr = rec.layerRef; if (!lyr) continue;
-        const drv = lookupDriverForKey(assignMap, lyr._routeKey);
+        const drv = lookupDriverForKey(lyr._routeKey);
         if (!drv) continue;
         out[drv] = (out[drv] || 0) + (lyr._custSel || 0);
       }
@@ -495,12 +504,12 @@
       Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch(e){} });
       for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
-      // group selected features by driver
+      // group selected features by driver — using CSV-derived mapping
       const byDriver = new Map(); // name -> [geojsonFeature]
       coveragePolysSelected.forEach(rec => {
         const key = rec.layerRef && rec.layerRef._routeKey;
         if (!key) return;
-        const drv = lookupDriverForKey(assignMap, key);
+        const drv = lookupDriverForKey(key);
         if (!drv) return;
         if (!byDriver.has(drv)) byDriver.set(drv, []);
         byDriver.get(drv).push(rec.layerRef._turfFeat);
@@ -513,7 +522,8 @@
       try { hasPattern = await ensurePatternPlugin(); } catch(e) { hasPattern = false; }
 
       byDriver.forEach((features, name) => {
-        const meta = driverMeta.find(d => (d.name || '').toLowerCase() === (name || '').toLowerCase()) || { color: '#888' };
+        const meta = (driverMeta.find(d => (d.name || '').toLowerCase() === (name || '').toLowerCase())
+                    || { name, color: colorFromName(name) });
         const color = meta.color || '#888';
 
         const layers = [];
@@ -602,11 +612,12 @@
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
     }
 
-    function lookupDriverForKey(assignMap, key) {
-      // exact match first (e.g., F15_SE); then fallback to base (F15)
-      if (assignMap[key]) return assignMap[key];
-      const m = key.match(/^([WTFS]\d+)/);
-      if (m && assignMap[m[1]]) return assignMap[m[1]];
+    // Look up driver, preferring exact key (e.g., F15_SE), then base key (F15)
+    function lookupDriverForKey(key) {
+      if (!key) return null;
+      if (activeAssignMap[key]) return activeAssignMap[key];
+      const m = String(key).match(/^([WTFS]\d+)/);
+      if (m && activeAssignMap[m[1]]) return activeAssignMap[m[1]];
       return null;
     }
 
@@ -689,54 +700,46 @@
     }
 
     // ===================================================================================
-    // DRIVERS PANEL  (now shows counts: x / totalSelected)
+    // DRIVERS PANEL  (shows counts: x / totalSelected)
     // ===================================================================================
     function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
       const el = document.getElementById('drivers');
       if (!el) return;
 
       const hasOverlays = overlays && Object.keys(overlays).length;
-      const hasMeta = metaList && metaList.length;
+      const metaByName = new Map((metaList||[]).map(d => [String(d.name||'').toLowerCase(), d]));
 
-      if (!hasMeta) { el.innerHTML = ''; return; }
-      if (!hasOverlays) { // still show meta, with 0 counts
-        const rows0 = metaList.map(d => rowHtml(d, null, defaultOn, countsMap, totalSelected)).join('');
-        el.innerHTML = `<h4>Drivers</h4>${rows0}`;
-        wireToggles(el);
-        return;
-      }
+      // Determine which drivers to show: prefer overlays (present in selection)
+      const driverNames = hasOverlays
+        ? Object.keys(overlays)
+        : Array.from(new Set(Object.values(activeAssignMap) || []));
 
-      const rows = metaList
-        .filter(d => overlays[d.name]) // only drivers present in selection
-        .map(d => rowHtml(d, overlays[d.name], defaultOn, countsMap, totalSelected))
-        .join('');
-      el.innerHTML = `<h4>Drivers</h4>${rows}`;
-      wireToggles(el);
-
-      function rowHtml(d, overlayRec, defOn, counts, total) {
-        const col = d.color || '#888';
-        const safeName = escapeHtml(d.name || '');
-        const onAttr = (overlayRec ? (defOn ? 'checked' : '') : '');
-        const haveCount = typeof counts[safeName] === 'number';
-        const frac = haveCount ? `${counts[safeName]}/${total || 0}` : `0/${total || 0}`;
+      const rows = driverNames.map(name => {
+        const meta = metaByName.get(String(name).toLowerCase()) || { name, color: colorFromName(name) };
+        const col = meta.color || '#888';
+        const safeName = escapeHtml(name || '');
+        const onAttr = hasOverlays ? (defaultOn ? 'checked' : '') : ''; // if no overlay yet, don’t pre-check
+        const count = typeof countsMap[name] === 'number' ? countsMap[name] : 0;
+        const frac = `${count}/${totalSelected || 0}`;
         return `<div class="row">
           <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}" ${onAttr}>
           <span class="swatch" style="background:${col}; border-color:${col}"></span>
           <div>${safeName}</div>
           <div class="counts" style="margin-left:auto">${frac}</div>
         </div>`;
-      }
+      }).join('');
 
-      function wireToggles(container) {
-        container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-          const name = cb.getAttribute('data-driver');
-          toggleDriverOverlay(name, !!cb.checked);
-          cb.addEventListener('change', (e) => {
-            const name = e.target.getAttribute('data-driver');
-            toggleDriverOverlay(name, e.target.checked);
-          });
+      el.innerHTML = `<h4>Drivers</h4>${rows}`;
+
+      // Wire toggles (only meaningful when overlays exist)
+      el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        const name = cb.getAttribute('data-driver');
+        toggleDriverOverlay(name, !!cb.checked);
+        cb.addEventListener('change', (e) => {
+          const name = e.target.getAttribute('data-driver');
+          toggleDriverOverlay(name, e.target.checked);
         });
-      }
+      });
     }
 
     function toggleDriverOverlay(name, on) {
@@ -748,6 +751,100 @@
       } else {
         map.removeLayer(rec.group);
       }
+    }
+
+    // ===================================================================================
+    // Assignment extraction (robust)
+    // ===================================================================================
+    // Looks for two columns: one for driver name (e.g., "driver", "name", "assigned to")
+    // and one for keys (e.g., "keys", "zones", "routes"). Falls back to rows 4–34 heuristic.
+    function extractAssignmentsFromCsv(rows) {
+      const like = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+      const isKeysHeader = (s) => {
+        const v = like(s);
+        return v.includes('key') || v.includes('zone') || v.includes('route');
+      };
+      const isDriverHeader = (s) => {
+        const v = like(s);
+        return v.includes('driver') || v === 'name' || v.includes('assigned to') || v === 'assigned';
+      };
+
+      // Try to find a header row with both columns
+      let headerIndex = -1, driverCol = -1, keysCol = -1;
+      for (let i=0; i<Math.min(rows.length, 30); i++) {
+        const row = rows[i] || [];
+        const cols = row.length;
+        let d = -1, k = -1;
+        for (let c=0;c<cols;c++) {
+          if (d === -1 && isDriverHeader(row[c])) d = c;
+          if (k === -1 && isKeysHeader(row[c]))   k = c;
+        }
+        if (d !== -1 && k !== -1) { headerIndex = i; driverCol = d; keysCol = k; break; }
+      }
+
+      const out = {};
+
+      if (headerIndex !== -1) {
+        for (let r = headerIndex + 1; r < rows.length; r++) {
+          const row = rows[r] || [];
+          const dn = (row[driverCol] || '').trim();
+          const ks = (row[keysCol] || '').trim();
+          if (!dn || !ks) continue;
+          const keys = splitKeys(ks).map(normalizeKey).filter(Boolean);
+          keys.forEach(k => { out[k] = dn; });
+        }
+        return out;
+      }
+
+      // Fallback heuristic: scan rows 4–34 (1-indexed) ≈ indices 3..33
+      for (let r = 3; r <= Math.min(rows.length - 1, 33); r++) {
+        const row = rows[r] || [];
+        if (!row.length) continue;
+
+        // Driver candidate: first non-empty cell that isn't obviously a list of keys
+        let dn = '';
+        for (let c=0;c<row.length;c++) {
+          const cell = (row[c]||'').trim();
+          if (!cell) continue;
+          if (!/[WTFS]\s*0*\d/i.test(cell)) { dn = cell; break; }
+        }
+
+        // Keys candidate: any cell containing route-like tokens (W|T|F|S + digits ± _NE/_NW/_SE/_SW)
+        let ks = '';
+        for (let c=0;c<row.length;c++) {
+          const cell = (row[c]||'').trim();
+          if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW))?/i.test(cell)) { ks = cell; break; }
+        }
+
+        if (!dn || !ks) continue;
+        const keys = splitKeys(ks).map(normalizeKey).filter(Boolean);
+        keys.forEach(k => { out[k] = dn; });
+      }
+
+      return out;
+    }
+
+    // Add missing driver color entries into driverMeta
+    function ensureDriverMeta(metaList, driverNames) {
+      const out = Array.isArray(metaList) ? [...metaList] : [];
+      const seen = new Set(out.map(d => (d.name||'').toLowerCase()));
+      for (const nm of (driverNames || [])) {
+        const low = String(nm||'').toLowerCase();
+        if (!low) continue;
+        if (!seen.has(low)) {
+          out.push({ name: nm, color: colorFromName(nm) });
+          seen.add(low);
+        }
+      }
+      return out;
+    }
+
+    // Simple stable color from name (hash to HSL)
+    function colorFromName(name) {
+      let h=0; const s=65, l=50;
+      const str = String(name||'');
+      for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
+      return `hsl(${h}, ${s}%, ${l}%)`;
     }
 
   } catch (e) {
@@ -836,7 +933,9 @@
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
 
-  function splitKeys(s, delim) { return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean); }
+  function splitKeys(s) {
+    return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean);
+  }
   function normalizeKey(s) {
     s = String(s || '').trim().toUpperCase();
     const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
