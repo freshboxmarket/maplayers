@@ -4,10 +4,11 @@
 
   const parseJSON = (s, fallback=null) => { try { return JSON.parse(s); } catch(e){ return fallback; } };
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
-  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // optional seed
+  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // optional seed mapping
 
-  // This becomes our source of truth after we parse the CSV:
-  let activeAssignMap = { ...assignMapParam };  // key -> driverName (keys may be base like F15 or quadrant like F15_SE)
+  // authoritative mapping after CSV parse
+  let activeAssignMap = { ...assignMapParam };  // { "F15": "Devin", "F15_SE": "Nithin", ... }
+  let driverMeta = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
 
   try {
     phase('Loading config…');
@@ -21,9 +22,9 @@
     }).addTo(map);
     const baseEl = base.getContainer?.(); if (baseEl) { baseEl.style.filter = 'grayscale(1)'; baseEl.style.webkitFilter = 'grayscale(1)'; }
 
-    // Keep both sets loaded; toggle per feature depending on selection.
+    // keep both layer sets; toggle visibility per feature
     const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]
-    const quadDayLayers = [];   // same shape
+    const quadDayLayers = [];
     const allDaySets    = [baseDayLayers, quadDayLayers];
 
     // State
@@ -40,23 +41,20 @@
     const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
     let currentFocus = null;
-    let coveragePolysAll = [];        // all *visible* polygons after selection
-    let coveragePolysSelected = [];   // only visible & selected polygons
+    let coveragePolysAll = [];        // visible polygons
+    let coveragePolysSelected = [];   // selected visible polygons
     let selectedMunicipalities = [];
 
-    // Per-driver selected customer counts (for legend)
-    let driverSelectedCounts = {};     // name -> count (within selection)
-
-    // Driver metadata (colors) — we’ll merge CSV-derived driver names into this
-    let driverMeta = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
+    // counts per driver (within selection)
+    let driverSelectedCounts = {};     // { "Devin": 137, ... }
 
     // Driver overlays (nets)
     const driverOverlays = {};        // name -> { group, color, labelMarker }
     const driversCfg = Object.assign(
       {
         enabled: true,
-        strokeWeightPx: 6,                // colored outline thickness (emphasized)
-        outlineHaloWeightPx: 12,          // white halo thickness under colored line
+        strokeWeightPx: 6,                // thicker colored outline
+        outlineHaloWeightPx: 12,          // white halo under outline
         haloColor: '#ffffff',
         fillOpacity: 0.12,
         dashArray: '6 4',
@@ -69,14 +67,14 @@
     renderLegend(cfg, null, custWithinSel, custOutsideSel);
     renderDriversPanel([], {}, false, {}, 0); // empty until overlays + counts exist
 
-    // ---------- load BOTH sets; groups added to map (feature visibility toggled later) ----------
+    // ---------- load BOTH sets ----------
     phase('Loading polygon layers…');
     await loadLayerSet(cfg.layers, baseDayLayers, /*addToMap*/ true);
     if (cfg.layersQuadrants && cfg.layersQuadrants.length) {
       await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ true);
     }
 
-    // Boundary canvas (clipped color tiles)
+    // optional: boundary-canvas clip
     try {
       if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
         const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -86,7 +84,7 @@
         colorTiles.addTo(map).setZIndex(2);
         base.setZIndex(1);
       }
-    } catch(e) { /* optional */ }
+    } catch(e) {}
 
     map.on('click', () => { clearFocus(true); });
     map.on('movestart', () => { clearFocus(false); map.closePopup(); });
@@ -160,7 +158,7 @@
     }
 
     // ===================================================================================
-    // SELECTION (base + quadrants mixed correctly) + CSV-derived driver assignments
+    // SELECTION (base + quadrants mixed) + robust CSV-derived assignments
     // ===================================================================================
     async function applySelection() {
       clearFocus(false);
@@ -172,24 +170,26 @@
       const csvText = await fetchText(selUrl);
       const rowsAA = parseCsvRows(csvText);
 
-      // 1) Parse selected keys (what to display)
+      // A) parse selection keys
       const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
       const selectedSet = new Set();
       if (hdr) {
         const { headerIndex, keysCol } = hdr;
         for (let i = headerIndex + 1; i < rowsAA.length; i++) {
           const r = rowsAA[i]; if (!r || r.length === 0) continue;
-          const raw = ((r[keysCol] || '') + '');
-          const keys = splitKeys(raw).map(normalizeKey).filter(Boolean);
-          keys.forEach(k => selectedSet.add(k));
+          splitKeys(r[keysCol]).map(normalizeKey).forEach(k => selectedSet.add(k));
         }
       }
 
-      // 2) Parse driver assignments from the SAME CSV (rows 4–34 or via header detection)
-      const derivedAssign = extractAssignmentsFromCsv(rowsAA);
-      // CSV mapping is authoritative; fall back to URL param for anything missing.
-      activeAssignMap = { ...activeAssignMap, ...derivedAssign }; // keep any URL-provided extras, but CSV overwrites
-      // Merge driver names into driverMeta, giving a decent color if missing
+      // B) parse driver assignments (ONLY accept known driver names if provided)
+      const knownDriverNames = new Set(
+        (driverMeta || []).map(d => String(d.name || '').toLowerCase()).filter(Boolean)
+      );
+      const derivedAssign = extractAssignmentsFromCsv(rowsAA, knownDriverNames);
+      // merge: CSV overwrites seed
+      activeAssignMap = { ...activeAssignMap, ...derivedAssign };
+
+      // ensure every driver in mapping has color
       driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
 
       if (selectedSet.size === 0) {
@@ -203,11 +203,10 @@
       coveragePolysSelected = [];
       selectedMunicipalities = [];
 
-      // Which base keys are being split by quadrant?
+      // which base keys are split by quadrant
       const quadrantBaseSet = new Set();
       for (const k of selectedSet) if (isQuadrantKey(k)) quadrantBaseSet.add(baseKeyFrom(k));
 
-      // Helper to (de)show a single feature
       const setFeatureVisible = (entry, lyr, visible, isSelected) => {
         const isInGroup = entry.layer.hasLayer(lyr);
         if (visible && !isInGroup) entry.layer.addLayer(lyr);
@@ -235,7 +234,7 @@
         }
       };
 
-      // Pass 1: BASE features — show if selected AND not overridden by quadrant(s)
+      // Base features — show if selected AND not overridden by quadrants
       for (const entry of baseDayLayers) {
         for (const lyr of entry.features) {
           const key = lyr._routeKey;
@@ -243,36 +242,31 @@
           const selectedBase = selectedSet.has(key);
           const overriddenByQuadrants = quadrantBaseSet.has(base);
           const visible = selectedBase && !overriddenByQuadrants;
-          setFeatureVisible(entry, lyr, visible, /*isSelected*/ visible);
+          setFeatureVisible(entry, lyr, visible, visible);
         }
       }
 
-      // Pass 2: QUADRANT features — show only exact keys in selection
+      // Quadrant features — show only when exact key in selection
       for (const entry of quadDayLayers) {
         for (const lyr of entry.features) {
           const key = lyr._routeKey;
-          const visible = selectedSet.has(key); // exact match (e.g., F15_SE)
-          setFeatureVisible(entry, lyr, visible, /*isSelected*/ visible);
+          const visible = selectedSet.has(key);
+          setFeatureVisible(entry, lyr, visible, visible);
         }
       }
 
-      // Rebuild "visible coverage" list for customer stats
       rebuildCoverageFromVisible();
 
-      // Dedup + sort muni list for status
       selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
         .sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
-      // Zoom
       if (cfg.behavior?.autoZoom) {
         if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
         else if (allBounds) map.fitBounds(allBounds.pad(0.1));
       }
 
-      // recolor + recount customers relative to NEW selection
       recolorAndRecountCustomers();
 
-      // per-day legend fractions: day-in-selection / total-in-selection
       const legendCounts = {
         Wednesday: { selected: custByDayInSel.Wednesday, total: custWithinSel },
         Thursday:  { selected: custByDayInSel.Thursday,  total: custWithinSel },
@@ -283,12 +277,8 @@
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
 
-      // Driver overlays (built from selected features) + update Drivers panel with counts
-      if (driversCfg.enabled) {
-        await rebuildDriverOverlays();
-      } else {
-        renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
-      }
+      if (driversCfg.enabled) await rebuildDriverOverlays();
+      else renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
     }
 
     function rebuildCoverageFromVisible() {
@@ -298,7 +288,6 @@
           for (const lyr of entry.features) {
             if (entry.layer.hasLayer(lyr)) {
               coveragePolysAll.push({ feat: lyr._turfFeat, perDay: entry.perDay, layerRef: lyr });
-              // reset per-layer counters (re-counted in recolor)
               lyr._custAny = 0; lyr._custSel = 0;
             }
           }
@@ -386,6 +375,7 @@
       info(`Loaded ${customerCount} customers.`);
 
       recolorAndRecountCustomers();
+
       const legendCounts = {
         Wednesday: { selected: custByDayInSel.Wednesday, total: custWithinSel },
         Thursday:  { selected: custByDayInSel.Thursday,  total: custWithinSel },
@@ -407,8 +397,6 @@
     function recolorAndRecountCustomers() {
       let inSel = 0, outSel = 0;
       resetDayCounts();
-
-      // reset per-layer counters for visible polygons
       for (const rec of coveragePolysAll) { if (rec.layerRef) { rec.layerRef._custAny = 0; rec.layerRef._custSel = 0; } }
 
       const turfOn = (typeof turf !== 'undefined');
@@ -436,7 +424,7 @@
         if (turfOn) {
           const pt = turf.point([rec.lng, rec.lat]);
 
-          // ANY visible polygon (for muni totals)
+          // any visible polygon
           for (let j = 0; j < coveragePolysAll.length; j++) {
             if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
               const lyr = coveragePolysAll[j].layerRef;
@@ -445,7 +433,7 @@
             }
           }
 
-          // In selection?
+          // in selection?
           for (let k = 0; k < coveragePolysSelected.length; k++) {
             if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
               insideSel = true;
@@ -479,12 +467,11 @@
       custWithinSel = inSel;
       custOutsideSel = outSel;
 
-      // After we’ve updated _custSel on selected polygons, aggregate per-driver counts.
+      // aggregate to drivers
       driverSelectedCounts = computeDriverCounts();
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
     }
 
-    // Aggregate polygon _custSel to per-driver totals
     function computeDriverCounts() {
       const out = {};
       for (const rec of coveragePolysSelected) {
@@ -497,14 +484,14 @@
     }
 
     // ===================================================================================
-    // DRIVER OVERLAYS (NET + OUTLINE, FROM SELECTED ONLY)
+    // DRIVER OVERLAYS
     // ===================================================================================
     async function rebuildDriverOverlays() {
       // remove existing
       Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch(e){} });
       for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
-      // group selected features by driver — using CSV-derived mapping
+      // group selected features by driver (using activeAssignMap)
       const byDriver = new Map(); // name -> [geojsonFeature]
       coveragePolysSelected.forEach(rec => {
         const key = rec.layerRef && rec.layerRef._routeKey;
@@ -515,9 +502,13 @@
         byDriver.get(drv).push(rec.layerRef._turfFeat);
       });
 
-      if (byDriver.size === 0) { renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel); return; }
+      // nothing to draw
+      if (byDriver.size === 0) {
+        renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
+        return;
+      }
 
-      // try hatch plugin; fall back gracefully
+      // hatch plugin if available
       let hasPattern = false;
       try { hasPattern = await ensurePatternPlugin(); } catch(e) { hasPattern = false; }
 
@@ -529,65 +520,25 @@
         const layers = [];
 
         if (hasPattern) {
-          const p1 = new L.StripePattern({
-            patternUnits: 'userSpaceOnUse',
-            angle: 45,
-            weight: driversCfg.hatch?.weight ?? 4,
-            spaceWeight: driversCfg.hatch?.space ?? 6,
-            color,
-            opacity: driversCfg.hatch?.opacity ?? 0.32,
-            spaceOpacity: 0
-          }).addTo(map);
-          const p2 = new L.StripePattern({
-            patternUnits: 'userSpaceOnUse',
-            angle: -45,
-            weight: driversCfg.hatch?.weight ?? 4,
-            spaceWeight: driversCfg.hatch?.space ?? 6,
-            color,
-            opacity: driversCfg.hatch?.opacity ?? 0.32,
-            spaceOpacity: 0
-          }).addTo(map);
-
-          layers.push(L.geoJSON({ type: 'FeatureCollection', features }, {
-            interactive: false, style: () => ({ fill: true, fillOpacity: 1, fillPattern: p1, color: 'transparent', opacity: 0 })
-          }));
-          layers.push(L.geoJSON({ type: 'FeatureCollection', features }, {
-            interactive: false, style: () => ({ fill: true, fillOpacity: 1, fillPattern: p2, color: 'transparent', opacity: 0 })
-          }));
+          const p1 = new L.StripePattern({ patternUnits:'userSpaceOnUse', angle:45,  weight:driversCfg.hatch?.weight ?? 4, spaceWeight:driversCfg.hatch?.space ?? 6, color, opacity:driversCfg.hatch?.opacity ?? 0.32, spaceOpacity:0 }).addTo(map);
+          const p2 = new L.StripePattern({ patternUnits:'userSpaceOnUse', angle:-45, weight:driversCfg.hatch?.weight ?? 4, spaceWeight:driversCfg.hatch?.space ?? 6, color, opacity:driversCfg.hatch?.opacity ?? 0.32, spaceOpacity:0 }).addTo(map);
+          layers.push(L.geoJSON({ type:'FeatureCollection', features }, { interactive:false, style:()=>({ fill:true, fillOpacity:1, fillPattern:p1, color:'transparent', opacity:0 }) }));
+          layers.push(L.geoJSON({ type:'FeatureCollection', features }, { interactive:false, style:()=>({ fill:true, fillOpacity:1, fillPattern:p2, color:'transparent', opacity:0 }) }));
         } else {
-          // soft translucent fill if hatch unavailable
-          layers.push(L.geoJSON({ type: 'FeatureCollection', features }, {
-            interactive: false, style: () => ({ color: 'transparent', opacity: 0, fill: true, fillColor: color, fillOpacity: driversCfg.fillOpacity ?? 0.12 })
-          }));
+          layers.push(L.geoJSON({ type:'FeatureCollection', features }, { interactive:false, style:()=>({ color:'transparent', opacity:0, fill:true, fillColor:color, fillOpacity:driversCfg.fillOpacity ?? 0.12 }) }));
         }
 
-        // HALO outline (underlay)
-        const halo = L.geoJSON({ type: 'FeatureCollection', features }, {
-          interactive: false,
-          style: () => ({
-            color: driversCfg.haloColor || '#fff',
-            weight: driversCfg.outlineHaloWeightPx || 12,
-            opacity: 0.95,
-            lineJoin: 'round',
-            lineCap: 'round',
-            dashArray: null,
-            fill: false
-          })
+        // halo
+        const halo = L.geoJSON({ type:'FeatureCollection', features }, {
+          interactive:false,
+          style:()=>({ color:driversCfg.haloColor || '#fff', weight:driversCfg.outlineHaloWeightPx || 12, opacity:0.95, lineJoin:'round', lineCap:'round', dashArray:null, fill:false })
         });
         layers.push(halo);
 
-        // Colored outline (top)
-        const outline = L.geoJSON({ type: 'FeatureCollection', features }, {
-          interactive: false,
-          style: () => ({
-            color,
-            weight: driversCfg.strokeWeightPx || 6,
-            opacity: 1.0,
-            lineJoin: 'round',
-            lineCap: 'round',
-            dashArray: driversCfg.dashArray || '6 4',
-            fill: false
-          })
+        // colored outline
+        const outline = L.geoJSON({ type:'FeatureCollection', features }, {
+          interactive:false,
+          style:()=>({ color, weight:driversCfg.strokeWeightPx || 6, opacity:1.0, lineJoin:'round', lineCap:'round', dashArray:driversCfg.dashArray || '6 4', fill:false })
         });
         layers.push(outline);
 
@@ -598,7 +549,7 @@
           const center = b && b.getCenter ? b.getCenter() : null;
           if (center) {
             labelMarker = L.marker(center, { opacity: 0 })
-              .bindTooltip(name, { permanent: true, direction: 'center', className: driversCfg.labelClass || 'lbl dim' });
+              .bindTooltip(name, { permanent:true, direction:'center', className: driversCfg.labelClass || 'lbl dim' });
             group.addLayer(labelMarker);
           }
         } catch(e){}
@@ -608,11 +559,10 @@
         driverOverlays[name] = { group, color, labelMarker };
       });
 
-      // Show toggles (default ON) and include per-driver counts
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
     }
 
-    // Look up driver, preferring exact key (e.g., F15_SE), then base key (F15)
+    // exact key, then base key
     function lookupDriverForKey(key) {
       if (!key) return null;
       if (activeAssignMap[key]) return activeAssignMap[key];
@@ -648,9 +598,7 @@
         weight: hiWeight,
         opacity: 1.0,
         fillColor: perDay.fill || '#ccc',
-        fillOpacity: lyr._isSelected
-          ? (perDay.fillOpacity != null ? perDay.fillOpacity : 0.8)
-          : dimFill(perDay, cfg)
+        fillOpacity: lyr._isSelected ? (perDay.fillOpacity != null ? perDay.fillOpacity : 0.8) : dimFill(perDay, cfg)
       });
 
       showLabel(lyr, lyr._labelTxt);
@@ -661,17 +609,11 @@
     }
     function restoreFeature(lyr) {
       const perDay = lyr._perDay || {};
-      if (lyr._isSelected) {
-        applyStyleSelected(lyr, perDay, cfg); showLabel(lyr, lyr._labelTxt);
-      } else {
-        applyStyleDim(lyr, perDay, cfg); hideLabel(lyr);
-      }
+      if (lyr._isSelected) { applyStyleSelected(lyr, perDay, cfg); showLabel(lyr, lyr._labelTxt); }
+      else { applyStyleDim(lyr, perDay, cfg); hideLabel(lyr); }
     }
     function clearFocus(recenter) {
-      if (!currentFocus) {
-        if (recenter && hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
-        return;
-      }
+      if (!currentFocus) { if (recenter && hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1)); return; }
       restoreFeature(currentFocus);
       currentFocus = null;
       if (recenter) {
@@ -679,7 +621,6 @@
         else if (allBounds) map.fitBounds(allBounds.pad(0.1));
       }
     }
-
     function applyStyleSelected(lyr, perDay, cfg) {
       lyr.setStyle({
         color: perDay.stroke || '#666',
@@ -700,29 +641,41 @@
     }
 
     // ===================================================================================
-    // DRIVERS PANEL  (shows counts: x / totalSelected)
+    // DRIVERS PANEL (toggleable with counts)
     // ===================================================================================
     function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
       const el = document.getElementById('drivers');
       if (!el) return;
 
-      const hasOverlays = overlays && Object.keys(overlays).length;
       const metaByName = new Map((metaList||[]).map(d => [String(d.name||'').toLowerCase(), d]));
+      const overlayDrivers = Object.keys(overlays || {});
+      const haveOverlays = overlayDrivers.length > 0;
 
-      // Determine which drivers to show: prefer overlays (present in selection)
-      const driverNames = hasOverlays
-        ? Object.keys(overlays)
-        : Array.from(new Set(Object.values(activeAssignMap) || []));
+      // Prefer to show drivers that actually appear in selection (overlays),
+      // ordered by meta list if available; otherwise fall back to all drivers known in mapping.
+      const allDriverNames = haveOverlays
+        ? overlayDrivers
+        : Array.from(new Set(Object.values(activeAssignMap))).sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
 
-      const rows = driverNames.map(name => {
-        const meta = metaByName.get(String(name).toLowerCase()) || { name, color: colorFromName(name) };
+      // order by meta list if possible
+      const orderIndex = new Map((metaList||[]).map((d,i)=>[String(d.name||'').toLowerCase(), i]));
+      allDriverNames.sort((a,b)=>{
+        const ia = orderIndex.has(a.toLowerCase()) ? orderIndex.get(a.toLowerCase()) : 9999;
+        const ib = orderIndex.has(b.toLowerCase()) ? orderIndex.get(b.toLowerCase()) : 9999;
+        if (ia !== ib) return ia - ib;
+        return a.toLowerCase().localeCompare(b.toLowerCase());
+      });
+
+      const rows = allDriverNames.map(name => {
+        const meta = metaByName.get(name.toLowerCase()) || { name, color: colorFromName(name) };
         const col = meta.color || '#888';
         const safeName = escapeHtml(name || '');
-        const onAttr = hasOverlays ? (defaultOn ? 'checked' : '') : ''; // if no overlay yet, don’t pre-check
+        const isPresent = !!overlays?.[name];
+        const onAttr = isPresent && defaultOn ? 'checked' : '';
         const count = typeof countsMap[name] === 'number' ? countsMap[name] : 0;
         const frac = `${count}/${totalSelected || 0}`;
         return `<div class="row">
-          <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}" ${onAttr}>
+          <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}" ${onAttr} ${isPresent ? '' : 'disabled'}>
           <span class="swatch" style="background:${col}; border-color:${col}"></span>
           <div>${safeName}</div>
           <div class="counts" style="margin-left:auto">${frac}</div>
@@ -731,9 +684,9 @@
 
       el.innerHTML = `<h4>Drivers</h4>${rows}`;
 
-      // Wire toggles (only meaningful when overlays exist)
       el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
         const name = cb.getAttribute('data-driver');
+        if (!overlays?.[name]) return; // disabled
         toggleDriverOverlay(name, !!cb.checked);
         cb.addEventListener('change', (e) => {
           const name = e.target.getAttribute('data-driver');
@@ -754,28 +707,32 @@
     }
 
     // ===================================================================================
-    // Assignment extraction (robust)
+    // Assignment extraction – ONLY accept known driver names, avoid days like "Sat"
     // ===================================================================================
-    // Looks for two columns: one for driver name (e.g., "driver", "name", "assigned to")
-    // and one for keys (e.g., "keys", "zones", "routes"). Falls back to rows 4–34 heuristic.
-    function extractAssignmentsFromCsv(rows) {
+    function extractAssignmentsFromCsv(rows, knownNamesSet) {
       const like = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-      const isKeysHeader = (s) => {
+      const dayWords = new Set(['mon','monday','tue','tues','tuesday','wed','weds','wednesday','thu','thur','thurs','thursday','fri','friday','sat','saturday','sun','sunday']);
+      const looksLikeName = (s) => {
         const v = like(s);
-        return v.includes('key') || v.includes('zone') || v.includes('route');
+        if (!v) return false;
+        if (dayWords.has(v)) return false;
+        if (knownNamesSet && knownNamesSet.size) return knownNamesSet.has(v);
+        // heuristic “person-ish” string
+        return /^[a-z][a-z .'\-]{1,30}$/.test(v) && !/\d/.test(v);
+      };
+      const isKeysHeader = (s) => {
+        const v = like(s); return v.includes('key') || v.includes('zone') || v.includes('route');
       };
       const isDriverHeader = (s) => {
-        const v = like(s);
-        return v.includes('driver') || v === 'name' || v.includes('assigned to') || v === 'assigned';
+        const v = like(s); return v.includes('driver') || v === 'name' || v.includes('assigned to') || v === 'assigned';
       };
 
-      // Try to find a header row with both columns
+      // 1) header-based table (best path)
       let headerIndex = -1, driverCol = -1, keysCol = -1;
-      for (let i=0; i<Math.min(rows.length, 30); i++) {
+      for (let i=0; i<Math.min(rows.length, 50); i++) {
         const row = rows[i] || [];
-        const cols = row.length;
-        let d = -1, k = -1;
-        for (let c=0;c<cols;c++) {
+        let d=-1, k=-1;
+        for (let c=0;c<row.length;c++) {
           if (d === -1 && isDriverHeader(row[c])) d = c;
           if (k === -1 && isKeysHeader(row[c]))   k = c;
         }
@@ -788,61 +745,57 @@
         for (let r = headerIndex + 1; r < rows.length; r++) {
           const row = rows[r] || [];
           const dn = (row[driverCol] || '').trim();
-          const ks = (row[keysCol] || '').trim();
+          const ks = (row[keysCol]   || '').trim();
           if (!dn || !ks) continue;
-          const keys = splitKeys(ks).map(normalizeKey).filter(Boolean);
-          keys.forEach(k => { out[k] = dn; });
+          if (!looksLikeName(dn)) continue; // reject “Sat”, etc.
+          splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
         }
         return out;
       }
 
-      // Fallback heuristic: scan rows 4–34 (1-indexed) ≈ indices 3..33
+      // 2) fallback: scan rows (4–34 like your sheet), only accept KNOWN names
       for (let r = 3; r <= Math.min(rows.length - 1, 33); r++) {
         const row = rows[r] || [];
         if (!row.length) continue;
 
-        // Driver candidate: first non-empty cell that isn't obviously a list of keys
+        // find name cell
         let dn = '';
         for (let c=0;c<row.length;c++) {
           const cell = (row[c]||'').trim();
           if (!cell) continue;
-          if (!/[WTFS]\s*0*\d/i.test(cell)) { dn = cell; break; }
+          if (looksLikeName(cell)) { dn = cell; break; }
         }
+        if (!dn) continue;
 
-        // Keys candidate: any cell containing route-like tokens (W|T|F|S + digits ± _NE/_NW/_SE/_SW)
-        let ks = '';
+        // find any cell(s) with keys and merge
+        let allKeys = [];
         for (let c=0;c<row.length;c++) {
           const cell = (row[c]||'').trim();
-          if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW))?/i.test(cell)) { ks = cell; break; }
+          if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW))?/i.test(cell)) {
+            allKeys = allKeys.concat(splitKeys(cell).map(normalizeKey));
+          }
         }
-
-        if (!dn || !ks) continue;
-        const keys = splitKeys(ks).map(normalizeKey).filter(Boolean);
-        keys.forEach(k => { out[k] = dn; });
+        allKeys = Array.from(new Set(allKeys)).filter(Boolean);
+        allKeys.forEach(k => { out[k] = dn; });
       }
 
       return out;
     }
 
-    // Add missing driver color entries into driverMeta
+    // ensure every driver referenced has a color entry
     function ensureDriverMeta(metaList, driverNames) {
       const out = Array.isArray(metaList) ? [...metaList] : [];
-      const seen = new Set(out.map(d => (d.name||'').toLowerCase()));
+      const seen = new Set(out.map(d => String(d.name||'').toLowerCase()));
       for (const nm of (driverNames || [])) {
-        const low = String(nm||'').toLowerCase();
-        if (!low) continue;
-        if (!seen.has(low)) {
-          out.push({ name: nm, color: colorFromName(nm) });
-          seen.add(low);
-        }
+        const low = String(nm||'').toLowerCase(); if (!low) continue;
+        if (!seen.has(low)) { out.push({ name: nm, color: colorFromName(nm) }); seen.add(low); }
       }
       return out;
     }
 
-    // Simple stable color from name (hash to HSL)
+    // stable HSL from name
     function colorFromName(name) {
-      let h=0; const s=65, l=50;
-      const str = String(name||'');
+      let h=0; const s=65, l=50; const str = String(name||'');
       for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
       return `hsl(${h}, ${s}%, ${l}%)`;
     }
@@ -857,7 +810,7 @@
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
 
-  // Dynamically load leaflet.pattern (adds L.StripePattern). Returns true/false.
+  // leaflet.pattern
   async function ensurePatternPlugin() {
     if (L && L.StripePattern) return true;
     try {
@@ -933,9 +886,7 @@
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
 
-  function splitKeys(s) {
-    return String(s||'').split(/[;,]/).map(x => x.trim()).filter(Boolean);
-  }
+  function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
   function normalizeKey(s) {
     s = String(s || '').trim().toUpperCase();
     const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
@@ -946,9 +897,7 @@
     const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/);
     return m ? m[1] : String(key||'').toUpperCase();
   }
-  function isQuadrantKey(key) {
-    return /_(SE|NE|NW|SW)$/i.test(String(key||''));
-  }
+  function isQuadrantKey(key) { return /_(SE|NE|NW|SW)$/i.test(String(key||'')); }
 
   function parseLatLng(s) {
     const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
