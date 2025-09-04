@@ -21,9 +21,9 @@
     // Layer sets (base municipalities vs quadrantized)
     const baseDayLayers = [];     // [{day, layer, perDay}]
     const quadDayLayers = [];     // [{day, layer, perDay}]
-    let activeDayLayers = baseDayLayers;  // reference to whichever is active
+    let activeDayLayers = baseDayLayers;  // pointer to whichever is active
 
-    // Global-ish state
+    // State
     let allBounds = null;
     let selectionBounds = null;
     let hasSelection = false;
@@ -37,25 +37,30 @@
     const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
     let currentFocus = null;
-    let coveragePolysAll = [];        // rebuilt when switching active layer set
+    let coveragePolysAll = [];        // rebuilt when switching active set
     let coveragePolysSelected = [];   // only selected polygons
     let selectedMunicipalities = [];
 
+    // Driver overlays (nets)
     const driverOverlays = {};        // name -> { group, color, labelMarker }
-    const driversCfg = cfg.drivers || { enabled: true, strokeWeightPx: 3, fillOpacity: 0.15, dashArray: '6 4', labelClass: 'lbl dim' };
+    const driversCfg = Object.assign(
+      { enabled: true, strokeWeightPx: 3, fillOpacity: 0.12, dashArray: '6 4', labelClass: 'lbl dim',
+        // hatch defaults (net effect = two crossed stripe patterns)
+        hatch: { weight: 4, space: 6, opacity: 0.32 } },
+      cfg.drivers || {}
+    );
 
     renderLegend(cfg, null, custWithinSel, custOutsideSel);
-    renderDriversPanel([] /*meta for now*/, {} /*none yet*/);
+    renderDriversPanel([], {}); // empty until overlays exist
 
-    // ---------- load BOTH sets (base + quadrants), keep quadrants hidden ----------
-
+    // ---------- load BOTH sets (base + quadrants); quadrants initially hidden ----------
     phase('Loading polygon layers…');
     await loadLayerSet(cfg.layers, baseDayLayers);
     if (cfg.layersQuadrants && cfg.layersQuadrants.length) {
       await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ false);
     }
 
-    // boundary canvas clipped to union of all polygons (ok to include both sets)
+    // background tiles clipped to overall delivery union (nice focus)
     try {
       if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
         const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -65,7 +70,7 @@
         colorTiles.addTo(map).setZIndex(2);
         base.setZIndex(1);
       }
-    } catch(e) { /* non-fatal */ }
+    } catch(e) { /* optional */ }
 
     map.on('click', () => { clearFocus(true); });
     map.on('movestart', () => { clearFocus(false); map.closePopup(); });
@@ -75,7 +80,7 @@
     await applySelection();
     await loadCustomersIfAny();
 
-    const refresh = Number(cfg.behavior.refreshSeconds || 0);
+    const refresh = Number(cfg.behavior?.refreshSeconds || 0);
     if (refresh > 0) setInterval(async () => {
       await applySelection();
       await loadCustomersIfAny();
@@ -87,22 +92,22 @@
     async function loadLayerSet(arr, collector, addToMap = true) {
       for (const Lcfg of (arr || [])) {
         const gj = await fetchJson(Lcfg.url);
-        const perDay = (cfg.style && cfg.style.perDay && cfg.style.perDay[Lcfg.day]) || {};
+        const perDay = (cfg.style?.perDay?.[Lcfg.day]) || {};
         const color = perDay.stroke || '#666';
         const fillColor = perDay.fill || '#ccc';
 
         const layer = L.geoJSON(gj, {
           style: () => ({
             color,
-            weight: cfg.style.dimmed.weightPx,
-            opacity: cfg.style.dimmed.strokeOpacity,
+            weight: cfg.style?.dimmed?.weightPx ?? 1,
+            opacity: cfg.style?.dimmed?.strokeOpacity ?? 0.35,
             fillColor,
             fillOpacity: dimFill(perDay, cfg)
           }),
           onEachFeature: (feat, lyr) => {
             const p = feat.properties || {};
             const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
-            const keyNorm = normalizeKey(rawKey); // preserves suffixes like _SE
+            const keyNorm = normalizeKey(rawKey); // keeps suffixes like _SE
             const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
             const day     = Lcfg.day;
 
@@ -194,7 +199,8 @@
         info(`Loaded ${selectedSet.size} selected key(s).`);
       }
 
-      // NEW/CHANGED: decide whether to use quadrant layers
+      // Switch to quadrant layers if *any* quadrant keys are present,
+      // AND hide everything that is not explicitly selected.
       const needQuadrants = Array.from(selectedSet).some(k => /_(SE|NE|NW|SW)$/i.test(k));
       setActiveLayerSet(needQuadrants);
 
@@ -204,6 +210,7 @@
       selectedMunicipalities = [];
 
       const selBounds = [];
+      const hideUnselected = needQuadrants || (cfg.style?.unselectedMode === 'hide' && hasSelection);
 
       activeDayLayers.forEach(({ layer, perDay }) => {
         layer.eachLayer(lyr => {
@@ -216,13 +223,11 @@
             coveragePolysSelected.push({ feat: lyr._turfFeat, perDay, layerRef: lyr });
             if (lyr.getBounds) selBounds.push(lyr.getBounds());
             if (lyr._labelTxt) selectedMunicipalities.push(lyr._labelTxt);
+            layer.addLayer(lyr);
           } else {
-            if (cfg.style.unselectedMode === 'hide' && hasSelection) {
-              hideLabel(lyr); layer.removeLayer(lyr);
-            } else {
-              applyStyleDim(lyr, perDay, cfg);
-              hideLabel(lyr); layer.addLayer(lyr);
-            }
+            hideLabel(lyr);
+            if (hideUnselected) layer.removeLayer(lyr);
+            else { applyStyleDim(lyr, perDay, cfg); layer.addLayer(lyr); }
           }
         });
       });
@@ -230,7 +235,7 @@
       selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
         .sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
-      if (cfg.behavior.autoZoom) {
+      if (cfg.behavior?.autoZoom) {
         if (hasSelection && selBounds.length) {
           selectionBounds = selBounds.reduce((acc, b) => acc.extend(b), L.latLngBounds(selBounds[0]));
           map.fitBounds(selectionBounds.pad(0.1));
@@ -239,7 +244,7 @@
         }
       }
 
-      // recolor + recount customers for new selection
+      // recolor + recount customers relative to NEW selection
       recolorAndRecountCustomers();
 
       // per-day legend fractions: day-in-selection / total-in-selection
@@ -253,14 +258,14 @@
       renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
 
-      // NEW/CHANGED: rebuild driver overlays FROM SELECTED FEATURES ONLY
+      // Driver overlays built ONLY from the selected features
       if (driversCfg.enabled) {
-        rebuildDriverOverlays(selectedSet);
+        await rebuildDriverOverlays();
       }
     }
 
     // ===================================================================================
-    // CUSTOMERS (unchanged except for counting after selection switch)
+    // CUSTOMERS
     // ===================================================================================
     async function loadCustomersIfAny() {
       customerLayer.clearLayers();
@@ -305,7 +310,7 @@
       }
       const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
 
-      const s = cfg.style.customers || {};
+      const s = cfg.style?.customers || {};
       const baseStyle = {
         radius: s.radius || 9,
         color:  s.stroke || '#111',
@@ -359,7 +364,7 @@
 
       const turfOn = (typeof turf !== 'undefined');
 
-      const cst = cfg.style.customers || {};
+      const cst = cfg.style?.customers || {};
       const out = cst.outside || {};
       const outsideStroke = out.stroke || '#7a7a7a';
       const outsideFill   = out.fill   || '#c7c7c7';
@@ -427,10 +432,10 @@
     }
 
     // ===================================================================================
-    // DRIVER OVERLAYS (NEW/CHANGED)
+    // DRIVER OVERLAYS (NET + OUTLINE, FROM SELECTED ONLY)
     // ===================================================================================
-    function rebuildDriverOverlays(selectedSet) {
-      // remove any existing overlays
+    async function rebuildDriverOverlays() {
+      // remove existing
       Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch(e){} });
       for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
@@ -445,45 +450,85 @@
         byDriver.get(drv).push(rec.layerRef._turfFeat);
       });
 
+      // nothing to draw?
+      if (byDriver.size === 0) { renderDriversPanel(driverMeta, {}, false); return; }
+
+      // ensure hatch plugin is available
+      await ensurePatternPlugin();
+
       // build overlays
       byDriver.forEach((features, name) => {
         const meta = driverMeta.find(d => (d.name || '').toLowerCase() === (name || '').toLowerCase()) || { color: '#888' };
         const color = meta.color || '#888';
 
-        const gj = L.geoJSON({ type: 'FeatureCollection', features }, {
+        // Create two stripe patterns (±45°) for a cross-hatch "net"
+        const p1 = new L.StripePattern({
+          patternUnits: 'userSpaceOnUse',
+          angle: 45,
+          weight: driversCfg.hatch?.weight ?? 4,
+          spaceWeight: driversCfg.hatch?.space ?? 6,
+          color,
+          opacity: driversCfg.hatch?.opacity ?? 0.32,
+          spaceOpacity: 0
+        }).addTo(map);
+
+        const p2 = new L.StripePattern({
+          patternUnits: 'userSpaceOnUse',
+          angle: -45,
+          weight: driversCfg.hatch?.weight ?? 4,
+          spaceWeight: driversCfg.hatch?.space ?? 6,
+          color,
+          opacity: driversCfg.hatch?.opacity ?? 0.32,
+          spaceOpacity: 0
+        }).addTo(map);
+
+        // Fill layers (two patterns overlapped) + an outline layer
+        const fill1 = L.geoJSON({ type: 'FeatureCollection', features }, {
+          interactive: false,
+          style: () => ({ fill: true, fillOpacity: 1, fillPattern: p1, color: 'transparent', opacity: 0 })
+        });
+        const fill2 = L.geoJSON({ type: 'FeatureCollection', features }, {
+          interactive: false,
+          style: () => ({ fill: true, fillOpacity: 1, fillPattern: p2, color: 'transparent', opacity: 0 })
+        });
+        const outline = L.geoJSON({ type: 'FeatureCollection', features }, {
+          interactive: false,
           style: () => ({
-            color: color,
+            color,
             weight: driversCfg.strokeWeightPx || 3,
             opacity: 0.95,
             dashArray: driversCfg.dashArray || '6 4',
-            fillColor: color,
-            fillOpacity: driversCfg.fillOpacity != null ? driversCfg.fillOpacity : 0.15
+            fill: false
           })
         });
 
-        let bounds = null;
-        try { bounds = gj.getBounds(); } catch(e){}
-        const center = bounds ? bounds.getCenter() : null;
-        const group = L.featureGroup([gj]);
+        const group = L.featureGroup([fill1, fill2, outline]);
 
+        // Label
         let labelMarker = null;
-        if (center) {
-          labelMarker = L.marker(center, { opacity: 0 })
-            .bindTooltip(name, { permanent: true, direction: 'center', className: driversCfg.labelClass || 'lbl dim' });
-          group.addLayer(labelMarker);
-        }
+        try {
+          const b = outline.getBounds();
+          const center = b && b.getCenter ? b.getCenter() : null;
+          if (center) {
+            labelMarker = L.marker(center, { opacity: 0 })
+              .bindTooltip(name, { permanent: true, direction: 'center', className: driversCfg.labelClass || 'lbl dim' });
+            group.addLayer(labelMarker);
+          }
+        } catch(e){}
 
+        group.addTo(map);
+        try { outline.bringToFront(); } catch(e) {}
         driverOverlays[name] = { group, color, labelMarker };
       });
 
-      // (re)render toggles; default them ON if present
-      renderDriversPanel(driverMeta, driverOverlays, /*defaultOn=*/true);
+      // show toggles (default ON)
+      renderDriversPanel(driverMeta, driverOverlays, true);
     }
 
     function lookupDriverForKey(assignMap, key) {
       // exact match first (e.g., F15_SE); then fallback to base (F15)
       if (assignMap[key]) return assignMap[key];
-      const m = key.match(/^([WTFS]\d+)/); // base without suffix
+      const m = key.match(/^([WTFS]\d+)/);
       if (m && assignMap[m[1]]) return assignMap[m[1]];
       return null;
     }
@@ -507,7 +552,7 @@
       currentFocus = lyr;
 
       const perDay = lyr._perDay || {};
-      const baseWeight = lyr._isSelected ? cfg.style.selected.weightPx : cfg.style.dimmed.weightPx;
+      const baseWeight = lyr._isSelected ? (cfg.style?.selected?.weightPx ?? 2) : (cfg.style?.dimmed?.weightPx ?? 1);
       const hiWeight = Math.max(3, Math.round(baseWeight * 3));
 
       lyr.setStyle({
@@ -550,8 +595,8 @@
     function applyStyleSelected(lyr, perDay, cfg) {
       lyr.setStyle({
         color: perDay.stroke || '#666',
-        weight: cfg.style.selected.weightPx,
-        opacity: cfg.style.selected.strokeOpacity,
+        weight: cfg.style?.selected?.weightPx ?? 2,
+        opacity: cfg.style?.selected?.strokeOpacity ?? 1.0,
         fillColor: perDay.fill || '#ccc',
         fillOpacity: perDay.fillOpacity != null ? perDay.fillOpacity : 0.8
       });
@@ -559,15 +604,15 @@
     function applyStyleDim(lyr, perDay, cfg) {
       lyr.setStyle({
         color: perDay.stroke || '#666',
-        weight: cfg.style.dimmed.weightPx,
-        opacity: cfg.style.dimmed.strokeOpacity,
+        weight: cfg.style?.dimmed?.weightPx ?? 1,
+        opacity: cfg.style?.dimmed?.strokeOpacity ?? 0.35,
         fillColor: perDay.fill || '#ccc',
         fillOpacity: dimFill(perDay, cfg)
       });
     }
 
     // ===================================================================================
-    // DRIVERS PANEL (CHANGED: defaultOn support)
+    // DRIVERS PANEL
     // ===================================================================================
     function renderDriversPanel(metaList, overlays, defaultOn=false) {
       const el = document.getElementById('drivers');
@@ -579,7 +624,7 @@
       if (!hasOverlays || !hasMeta) { el.innerHTML = ''; return; }
 
       const rows = metaList
-        .filter(d => overlays[d.name]) // show only drivers present in selection
+        .filter(d => overlays[d.name])
         .map(d => {
           const col = d.color || '#888';
           const safeName = escapeHtml(d.name || '');
@@ -591,7 +636,6 @@
         }).join('');
       el.innerHTML = `<h4>Drivers</h4>${rows}`;
 
-      // Wire toggles (and apply default state)
       el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
         const name = cb.getAttribute('data-driver');
         toggleDriverOverlay(name, !!cb.checked);
@@ -622,6 +666,25 @@
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
+
+  // Dynamically load leaflet.pattern (adds L.StripePattern)
+  async function ensurePatternPlugin() {
+    if (L && L.StripePattern) return;
+    await loadScript('https://unpkg.com/leaflet.pattern/dist/leaflet.pattern.min.js');
+    // wait until registered
+    const t0 = Date.now();
+    while (!L.StripePattern) {
+      await new Promise(r => setTimeout(r, 20));
+      if (Date.now() - t0 > 4000) throw new Error('leaflet.pattern failed to load');
+    }
+  }
+  function loadScript(src){
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src; s.async = true; s.onload = resolve; s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
 
   function parseCsvRows(text) {
     const out = []; let i=0, f='', r=[], q=false;
@@ -695,7 +758,7 @@
 
   function dimFill(perDay, cfg) {
     const base = perDay.fillOpacity != null ? perDay.fillOpacity : 0.8;
-    const factor = cfg.style.dimmed.fillFactor != null ? cfg.style.dimmed.fillFactor : 0.3;
+    const factor = cfg.style?.dimmed?.fillFactor != null ? cfg.style.dimmed.fillFactor : 0.3;
     return Math.max(0.08, base * factor);
   }
 
@@ -733,7 +796,7 @@
   function renderLegend(cfg, legendCounts, custIn, custOut) {
     const el = document.getElementById('legend');
     const rowsHtml = (cfg.layers || []).map(Lcfg => {
-      const st = (cfg.style && cfg.style.perDay && cfg.style.perDay[Lcfg.day]) || {};
+      const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
       const c  = (legendCounts && legendCounts[Lcfg.day]) ? legendCounts[Lcfg.day] : { selected: 0, total: 0 };
       const frac = (c.total > 0) ? `${c.selected}/${c.total}` : '0/0';
       return `<div class="row">
@@ -752,9 +815,7 @@
   }
 
   function makeStatusLine(selMunis, inCount, outCount) {
-    const muniList = (Array.isArray(selMunis) && selMunis.length)
-      ? selMunis.join(', ')
-      : '—';
+    const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
     return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList}`;
   }
 
