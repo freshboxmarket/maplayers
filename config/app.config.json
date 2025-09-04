@@ -11,17 +11,27 @@
     "url": "https://docs.google.com/spreadsheets/d/e/2PACX-1vRMkbzNUzuGSEToTgDsF2ZSgSxmeiwwn4i3IJNgT64EJecwNytydMZWGdTQ9X2azaicITiFOGCevodA/pub?output=csv",
     "schema": { "coords": "Verified Coordinates", "note": "Order Note" }
   },
+
   "layers": [
     { "day": "Wednesday", "name": "_Wednesday_group", "url": "./_Wednesday_group.geojson" },
     { "day": "Thursday",  "name": "_Thursday_group",  "url": "./_Thursday_group.geojson" },
     { "day": "Friday",    "name": "_Friday_group",    "url": "./_Friday_group.geojson" },
     { "day": "Saturday",  "name": "_Saturday_group",  "url": "./_Saturday_group.geojson" }
   ],
+
+  "layersQuadrants": [
+    { "day": "Wednesday", "name": "_Wednesday_group_quadrants", "url": "./_Wednesday_group_quadrants.geojson" },
+    { "day": "Thursday",  "name": "_Thursday_group_quadrants",  "url": "./_Thursday_group_quadrants.geojson" },
+    { "day": "Friday",    "name": "_Friday_group_quadrants",    "url": "./_Friday_group_quadrants.geojson" },
+    { "day": "Saturday",  "name": "_Saturday_group_quadrants",  "url": "./_Saturday_group_quadrants.geojson" }
+  ],
+
   "fields": {
     "key": "zone key",
     "day": "Zone",
     "muni": "Municipality"
   },
+
   "style": {
     "unselectedMode": "dim",
     "selected": { "strokeOpacity": 1.0, "weightPx": 2 },
@@ -42,11 +52,14 @@
       "outside": { "stroke": "#7a7a7a", "fill": "#c7c7c7", "opacity": 0.8, "fillOpacity": 0.6 }
     }
   },
+
   "drivers": {
     "enabled": true,
-    "strokeWeightPx": 2,
-    "fillOpacity": 0.12,
+    "strokeWeightPx": 3,
+    "fillOpacity": 0.15,
+    "dashArray": "6 4",
     "labelClass": "lbl dim"
   },
+
   "behavior": { "autoZoom": true, "refreshSeconds": 0 }
 }
