@@ -1,10 +1,8 @@
 /* apps.js — robust, splice-aware viewer with outside-customers toggle
-   - Loads base + quadrant layers, shows exact splices when selected,
-     hides base when any of its splices are selected.
-   - Uses zone-key prefix (W/T/F/S) as the day truth.
+   - Loads base + quadrant layers; if any quadrant is selected, the base is hidden.
+   - Uses zone-key prefix (W/T/F/S) as day truth.
    - Driver overlays from assignMap (URL param and/or CSV-derived).
-   - Optional boundary-canvas is guarded.
-   - Added toggle to highlight “Customers outside selection”.
+   - Toggle to highlight customers outside selection (XXL grey + white outline).
 */
 (async function () {
   // ------------------------- URL / config -------------------------
@@ -15,12 +13,9 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);  // [{name,color}, ...]
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});  // { "S9": "Devin", "S9_SE":"Devin", ... }
 
-  // authoritative mapping after CSV parse/merge
-  let activeAssignMap = { ...assignMapParam };
+  let activeAssignMap = { ...assignMapParam };                 // authoritative mapping after CSV parse/merge
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
-
-  // Toggle: highlight outside customers (user UI)
-  let highlightOutside = false;
+  let highlightOutside = false;                                // user toggle
 
   // ------------------------- map init -------------------------
   phase('Loading config…');
@@ -31,11 +26,14 @@
 
   const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
   const base = L.tileLayer(osmTiles, { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
-  try { const el = base.getContainer?.(); if (el) { el.style.filter = 'grayscale(1)'; el.style.webkitFilter = 'grayscale(1)'; } } catch {}
+  try {
+    const el = base.getContainer?.();
+    if (el) { el.style.filter = 'grayscale(1)'; el.style.webkitFilter = 'grayscale(1)'; }
+  } catch {}
 
-  // These hold each day’s layer bundle
+  // day-layer holders
   const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]
-  const quadDayLayers = [];   // same shape
+  const quadDayLayers = [];
   const allDaySets    = [baseDayLayers, quadDayLayers];
 
   // State
@@ -43,9 +41,9 @@
   let selectionBounds = null;
   let hasSelection = false;
 
-  const boundaryFeatures = []; // for optional boundary-canvas
+  const boundaryFeatures = [];     // for optional boundary-canvas
   const customerLayer = L.layerGroup().addTo(map);
-  const customerMarkers = [];  // [{marker, lat, lng}]
+  const customerMarkers = [];      // [{marker, lat, lng}]
   let customerCount = 0;
   let custWithinSel = 0;
   let custOutsideSel = 0;
@@ -53,14 +51,11 @@
 
   let currentFocus = null;
   let coveragePolysAll = [];       // all currently visible polygons
-  let coveragePolysSelected = [];  // polygons that are in current selection
+  let coveragePolysSelected = [];  // polygons in current selection
   let selectedMunicipalities = [];
 
-  // counts per driver (within selection polygons)
-  let driverSelectedCounts = {};    // { "Devin": n, ... }
-
-  // Driver overlays (colored “nets” + labels)
-  const driverOverlays = {};        // name -> { group, color, labelMarker }
+  let driverSelectedCounts = {};   // { "Devin": n, ... } (selected only)
+  const driverOverlays = {};       // name -> { group, color, labelMarker }
 
   // Render empty panels first
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
@@ -73,7 +68,7 @@
     await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ true);
   }
 
-  // Optional boundary-canvas; do not crash if plugin missing
+  // Optional boundary-canvas; guard plugin
   try {
     if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
       const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -82,8 +77,7 @@
       base.setZIndex(1);
     }
   } catch (e) {
-    // non-fatal
-    console.warn('boundaryCanvas not available:', e);
+    console.warn('boundaryCanvas unavailable (non-fatal):', e);
   }
 
   map.on('click', () => { clearFocus(true); });
@@ -112,7 +106,6 @@
       const fillColor = perDay.fill || '#ccc';
       const features = [];
 
-      // Keep single geoJSON layer per set; we’ll add/remove individual feature-layers from it
       const layer = L.geoJSON(gj, {
         style: () => ({
           color,
@@ -126,7 +119,7 @@
           const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
           const keyNorm = normalizeKey(rawKey);  // keep suffix (_SE) intact
           const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
-          const day     = Lcfg.day;             // label from config entry
+          const day     = Lcfg.day;
 
           lyr._routeKey  = keyNorm;
           lyr._baseKey   = baseKeyFrom(keyNorm);
@@ -138,7 +131,6 @@
           lyr._custSel   = 0;
           lyr._turfFeat  = { type:'Feature', properties:{ day, muni, key:keyNorm }, geometry: feat.geometry };
 
-          // add to global boundary for clipping
           boundaryFeatures.push({ type:'Feature', geometry: feat.geometry });
           features.push(lyr);
 
@@ -173,7 +165,7 @@
     const csvText = await fetchText(selUrl);
     const rowsAA = parseCsvRows(csvText);
 
-    // A) parse selection keys from “zone keys” (or configured)
+    // A) parse selection keys from “zone keys”
     const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
     const selectedSet = new Set();
     if (hdr) {
@@ -274,7 +266,6 @@
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
     setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
 
-    // Driver overlays after selection
     await rebuildDriverOverlays();
   }
 
@@ -423,7 +414,7 @@
       if (turfOn) {
         const pt = turf.point([rec.lng, rec.lat]);
 
-        // any visible polygon
+        // any visible polygon (for popup totalAny)
         for (let j = 0; j < coveragePolysAll.length; j++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
             const lyr = coveragePolysAll[j].layerRef;
@@ -483,14 +474,14 @@
   }
 
   // =================================================================
-  // DRIVER OVERLAYS (no external pattern plugin; robust)
+  // DRIVER OVERLAYS
   // =================================================================
   async function rebuildDriverOverlays() {
     // remove existing
     Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch {} });
     for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
-    // group selected features by driver (using activeAssignMap exact → base fallback)
+    // group selected features by driver
     const byDriver = new Map(); // name -> [geoJSON Feature]
     coveragePolysSelected.forEach(rec => {
       const key = rec.layerRef && rec.layerRef._routeKey;
@@ -501,7 +492,6 @@
       byDriver.get(drv).push(rec.layerRef._turfFeat);
     });
 
-    // nothing to draw
     if (byDriver.size === 0) {
       renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
       return;
@@ -512,7 +502,7 @@
                    || { name, color: colorFromName(name) });
       const color = meta.color || '#888';
 
-      // White halo under colored outline
+      // halo under colored outline
       const halo = L.geoJSON({ type:'FeatureCollection', features }, {
         interactive:false,
         style:()=>({ color:'#ffffff', weight:(cfg.drivers?.outlineHaloWeightPx ?? 10), opacity:0.95, lineJoin:'round', lineCap:'round', fill:false })
@@ -706,7 +696,6 @@
         <div>Customers outside selection:</div><div class="counts">${custOut ?? 0}</div>
       </div>`;
 
-    // NEW: toggle to highlight outside customers
     const toggle = `<div class="row" style="margin-top:4px">
         <input type="checkbox" id="toggleOutside" ${outsideToggle ? 'checked' : ''} aria-label="Highlight outside customers">
         <div>Highlight outside customers</div>
@@ -798,6 +787,15 @@
   function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
   function isQuadrantKey(key) { return /_(SE|NE|NW|SW)$/i.test(String(key||'')); }
 
+  function parseLatLng(s) {
+    const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
+    if (!m) return null;
+    const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+    return { lat, lng };
+  }
+
   function dimFill(perDay, cfg) {
     const base = perDay.fillOpacity != null ? perDay.fillOpacity : 0.8;
     const factor = cfg.style?.dimmed?.fillFactor != null ? cfg.style.dimmed.fillFactor : 0.3;
@@ -844,6 +842,11 @@
   function info(msg){ setStatus(`ℹ️ ${msg}`); }
   function warn(msg){ const e = document.getElementById('error'); e.style.display='block'; e.innerHTML = `<strong>Warning</strong><br>${escapeHtml(msg)}`; }
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
+
+  function makeStatusLine(selMunis, inCount, outCount) {
+    const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
+    return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList}`;
+  }
 
   // Assignment extraction – ONLY accept known driver names, avoid day words like “Sat”
   function extractAssignmentsFromCsv(rows, knownNamesSet) {
@@ -929,7 +932,6 @@
     return `hsl(${h}, ${s}%, ${l}%)`;
   }
 
-  // ---------------------- end IIFE try/catch ----------------------
 })().catch(e => {
   const el = document.getElementById('error');
   if (el) {
@@ -938,52 +940,3 @@
   }
   console.error(e);
 });
-
-/* --------------------- helpers used above (out of IIFE scope) --------------------- */
-function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
-function normalizeKey(s) {
-  s = String(s || '').trim().toUpperCase();
-  const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
-  if (m) return m[1] + String(parseInt(m[2], 10)) + (m[3] || '');
-  return s;
-}
-function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
-function isQuadrantKey(key) { return /_(SE|NE|NW|SW)$/i.test(String(key||'')); }
-
-function dimFill(perDay, cfg) {
-  const base = perDay.fillOpacity != null ? perDay.fillOpacity : 0.8;
-  const factor = cfg.style?.dimmed?.fillFactor != null ? cfg.style.dimmed.fillFactor : 0.3;
-  return Math.max(0.08, base * factor);
-}
-function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
-function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
-
-function escapeHtml(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-function smartTitleCase(s) {
-  if (!s) return '';
-  s = s.toLowerCase();
-  const parts = s.split(/([\/-])/g);
-  const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']);
-  const fixWord = (w, isFirst) => {
-    if (!w) return w;
-    if (!isFirst && small.has(w)) return w;
-    if (w === 'st' || w === 'st.') return 'St.';
-    if (w === 'mt' || w === 'mt.') return 'Mt.';
-    return w.charAt(0).toUpperCase() + w.slice(1);
-  };
-  let tokenIdx = 0;
-  for (let i=0;i<parts.length;i++){
-    if (parts[i] === '/' || parts[i] === '-') continue;
-    const tokens = parts[i].split(/\s+/).map(tok => fixWord(tok, tokenIdx++ === 0));
-    parts[i] = tokens.join(' ');
-  }
-  return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
-}
-function renderLegend(){} // shadowed by in-IIFE version, kept to avoid accidental hoist issues
-function renderDriversPanel(){} // shadowed in-IIFE
-function parseCsvRows(text){ return []; } // shadowed in-IIFE
