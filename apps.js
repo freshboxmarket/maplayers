@@ -3,43 +3,37 @@
    - Uses zone-key prefix (W/T/F/S) as day truth.
    - Driver overlays from assignMap (URL param and/or CSV-derived).
    - Toggle to highlight customers outside selection (XXL grey + white outline).
+   - NEW: Never-blank fallback — if selection is missing/empty, show ALL zones dimmed.
 */
 (async function () {
-  // Surface uncaught errors to the page error box (nice for prod & testing)
-  window.addEventListener('error', (e) => {
-    const el = document.getElementById('error');
-    if (el) {
-      el.style.display = 'block';
-      el.innerHTML = `<strong>Script error</strong><br>${(e && e.message) ? e.message : String(e)}`;
-    }
-  });
-  window.addEventListener('unhandledrejection', (e) => {
-    const el = document.getElementById('error');
-    if (el) {
-      el.style.display = 'block';
-      el.innerHTML = `<strong>Promise error</strong><br>${(e && e.reason && e.reason.message) ? e.reason.message : String(e.reason || e)}`;
-    }
-  });
+  // ---- Surface uncaught errors to the page error box ----
+  window.addEventListener('error', (e) => showTopError('Script error', (e && e.message) ? e.message : String(e)));
+  window.addEventListener('unhandledrejection', (e) => showTopError('Promise error', (e?.reason?.message) || String(e?.reason || e)));
 
-  // ------------------------- URL / config -------------------------
+  // ---- URL / config ----
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
-  const parseJSON = (s, fallback = null) => { try { return JSON.parse(s); } catch { return fallback; } };
-  const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);  // [{name,color}, ...]
-  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});  // { "S9": "Devin", "S9_SE":"Devin", ... }
+  const parseJSON = (s, fb=null) => { try { return JSON.parse(s); } catch { return fb; } };
+  const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
+  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // {"S9":"Devin","S9_SE":"Devin",...}
 
-  let activeAssignMap = { ...assignMapParam };                 // authoritative mapping after CSV parse/merge
+  let activeAssignMap = { ...assignMapParam };     // authoritative mapping after CSV merge
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
-  let highlightOutside = false;                                // user toggle
+  let highlightOutside = false;
 
-  // ------------------------- map init -------------------------
+  // ---- map init ----
   phase('Loading config…');
   const cfg = await fetchJson(cfgUrl);
 
+  // Guard: Leaflet present?
+  if (typeof L === 'undefined' || !document.getElementById('map')) {
+    renderError('Leaflet or #map element not available. Check <link/script> tags and container element.');
+    return;
+  }
+
   phase('Initializing map…');
   const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
-
   const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
   const base = L.tileLayer(osmTiles, { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
   try {
@@ -47,17 +41,16 @@
     if (el) { el.style.filter = 'grayscale(1)'; el.style.webkitFilter = 'grayscale(1)'; }
   } catch {}
 
-  // day-layer holders
-  const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]
+  // ---- collections / state ----
+  const baseDayLayers = [];  // [{day, layer, perDay, features: LeafletLayer[]}]
   const quadDayLayers = [];
   const allDaySets    = [baseDayLayers, quadDayLayers];
 
-  // State
   let allBounds = null;
   let selectionBounds = null;
   let hasSelection = false;
 
-  const boundaryFeatures = [];     // for optional boundary-canvas
+  const boundaryFeatures = [];
   const customerLayer = L.layerGroup().addTo(map);
   const customerMarkers = [];      // [{marker, lat, lng}]
   let customerCount = 0;
@@ -66,8 +59,8 @@
   const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
   let currentFocus = null;
-  let coveragePolysAll = [];       // all currently visible polygons
-  let coveragePolysSelected = [];  // polygons in current selection
+  let coveragePolysAll = [];       // visible polygons (all)
+  let coveragePolysSelected = [];  // visible polygons in current selection
   let selectedMunicipalities = [];
 
   let driverSelectedCounts = {};   // { "Devin": n, ... } (selected only)
@@ -77,14 +70,14 @@
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
   renderDriversPanel([], {}, false, {}, 0);
 
-  // ------------------------- load layers -------------------------
+  // ---- load polygon layers ----
   phase('Loading polygon layers…');
   await loadLayerSet(cfg.layers, baseDayLayers, /*addToMap*/ true);
   if (cfg.layersQuadrants && cfg.layersQuadrants.length) {
     await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ true);
   }
 
-  // Optional boundary-canvas; guard plugin
+  // Optional boundary-canvas
   try {
     if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
       const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -92,16 +85,14 @@
       maskTiles.addTo(map).setZIndex(2);
       base.setZIndex(1);
     }
-  } catch (e) {
-    console.warn('boundaryCanvas unavailable (non-fatal):', e);
-  }
+  } catch (e) { console.warn('boundaryCanvas unavailable (non-fatal):', e); }
 
   map.on('click', () => { clearFocus(true); });
   map.on('movestart', () => { clearFocus(false); map.closePopup(); });
   map.on('zoomstart', () => { map.closePopup(); });
 
-  // initial selection + customers
-  await applySelection();
+  // ---- initial selection + customers ----
+  await applySelection();       // will never leave map blank now
   await loadCustomersIfAny();
 
   // optional auto-refresh
@@ -133,19 +124,19 @@
         onEachFeature: (feat, lyr) => {
           const p = feat.properties || {};
           const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
-          const keyNorm = normalizeKey(rawKey);  // keep suffix (_SE) intact
+          const keyNorm = normalizeKey(rawKey);
           const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
           const day     = Lcfg.day;
 
-          lyr._routeKey  = keyNorm;
-          lyr._baseKey   = baseKeyFrom(keyNorm);
-          lyr._day       = day;
-          lyr._perDay    = perDay;
-          lyr._labelTxt  = muni;
+          lyr._routeKey   = keyNorm;                 // e.g., S9 or S9_SE
+          lyr._baseKey    = baseKeyFrom(keyNorm);    // e.g., S9
+          lyr._day        = day;
+          lyr._perDay     = perDay;
+          lyr._labelTxt   = muni;
           lyr._isSelected = false;
-          lyr._custAny   = 0;
-          lyr._custSel   = 0;
-          lyr._turfFeat  = { type:'Feature', properties:{ day, muni, key:keyNorm }, geometry: feat.geometry };
+          lyr._custAny    = 0;
+          lyr._custSel    = 0;
+          lyr._turfFeat   = { type:'Feature', properties:{ day, muni, key:keyNorm }, geometry: feat.geometry };
 
           boundaryFeatures.push({ type:'Feature', geometry: feat.geometry });
           features.push(lyr);
@@ -169,41 +160,49 @@
   }
 
   // =================================================================
-  // SELECTION (base + quadrants mixed) + robust CSV-derived assignments
+  // SELECTION (base + quadrants) + robust CSV-derived assignments
   // =================================================================
   async function applySelection() {
     clearFocus(false);
 
     const selUrl = qs.get('sel') || (cfg.selection && cfg.selection.url) || '';
-    if (!selUrl) { warn('No selection URL configured.'); return; }
+    let selectedSet = new Set();
+    let loadedSelectionCsv = false;
 
-    phase('Loading selection…');
-    const csvText = await fetchText(selUrl);
-    const rowsAA = parseCsvRows(csvText);
+    if (!selUrl) {
+      warn('No selection URL configured — showing all zones.');
+    } else {
+      phase('Loading selection…');
+      try {
+        const csvText = await fetchText(selUrl);
+        const rowsAA = parseCsvRows(csvText);
+        loadedSelectionCsv = rowsAA?.length > 0;
 
-    // A) parse selection keys from “zone keys”
-    const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
-    const selectedSet = new Set();
-    if (hdr) {
-      const { headerIndex, keysCol } = hdr;
-      for (let i = headerIndex + 1; i < rowsAA.length; i++) {
-        const r = rowsAA[i]; if (!r || r.length === 0) continue;
-        splitKeys(r[keysCol]).map(normalizeKey).forEach(k => selectedSet.add(k));
+        // A) parse selection keys from “zone keys”
+        const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
+        if (hdr) {
+          const { headerIndex, keysCol } = hdr;
+          for (let i = headerIndex + 1; i < rowsAA.length; i++) {
+            const r = rowsAA[i]; if (!r || r.length === 0) continue;
+            splitKeys(r[keysCol]).map(normalizeKey).forEach(k => selectedSet.add(k));
+          }
+        }
+
+        // B) parse driver assignments (ONLY accept known driver names if provided)
+        const knownDriverNames = new Set(
+          (driverMeta || []).map(d => String(d.name || '').toLowerCase()).filter(Boolean)
+        );
+        const derivedAssign = extractAssignmentsFromCsv(rowsAA, knownDriverNames);
+        activeAssignMap = { ...activeAssignMap, ...derivedAssign };  // CSV overwrites seed
+        driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
+      } catch (e) {
+        warn(`Selection CSV load failed (${e && e.message ? e.message : String(e)}). Showing all zones.`);
       }
     }
 
-    // B) parse driver assignments (ONLY accept known driver names if provided)
-    const knownDriverNames = new Set(
-      (driverMeta || []).map(d => String(d.name || '').toLowerCase()).filter(Boolean)
-    );
-    const derivedAssign = extractAssignmentsFromCsv(rowsAA, knownDriverNames);
-    activeAssignMap = { ...activeAssignMap, ...derivedAssign };  // CSV overwrites seed
-    driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
-
-    if (selectedSet.size === 0) warn(`Selection parsed 0 keys. Check the published CSV has a "zone keys" column.`);
-    else info(`Loaded ${selectedSet.size} selected key(s).`);
-
-    hasSelection = selectedSet.size > 0;
+    // --- Never blank: if no keys parsed, show ALL zones dimmed ---
+    const noKeys = selectedSet.size === 0;
+    hasSelection = !noKeys;
     selectionBounds = null;
     coveragePolysSelected = [];
     selectedMunicipalities = [];
@@ -239,35 +238,51 @@
       }
     };
 
-    // Base features — show if base key is selected AND no quadrant selected for same base
-    for (const entry of baseDayLayers) {
-      for (const lyr of entry.features) {
-        const key = lyr._routeKey;          // e.g., S9
-        const base = lyr._baseKey;          // S9
-        const selectedBase = selectedSet.has(key);
-        const overriddenByQuadrants = quadrantBaseSet.has(base);
-        const visible = selectedBase && !overriddenByQuadrants;
-        setFeatureVisible(entry, lyr, visible, visible);
+    if (noKeys) {
+      // Show EVERYTHING dimmed
+      info(loadedSelectionCsv ? 'No selection keys found; showing all zones.' : 'Showing all zones.');
+      for (const arr of allDaySets) {
+        for (const entry of arr) {
+          for (const lyr of entry.features) {
+            setFeatureVisible(entry, lyr, true, false); // visible, not "selected"
+          }
+        }
       }
-    }
-
-    // Quadrant features — show only when exact key in selection
-    for (const entry of quadDayLayers) {
-      for (const lyr of entry.features) {
-        const key = lyr._routeKey;          // e.g., S9_SE
-        const visible = selectedSet.has(key);
-        setFeatureVisible(entry, lyr, visible, visible);
+      rebuildCoverageFromVisible();
+      selectedMunicipalities = []; // none selected specifically
+      if (cfg.behavior?.autoZoom) {
+        if (allBounds) map.fitBounds(allBounds.pad(0.1));
       }
-    }
+    } else {
+      // Base features — show if base key is selected AND no quadrant selected for same base
+      for (const entry of baseDayLayers) {
+        for (const lyr of entry.features) {
+          const key = lyr._routeKey;          // e.g., S9
+          const base = lyr._baseKey;          // S9
+          const selectedBase = selectedSet.has(key);
+          const overriddenByQuadrants = quadrantBaseSet.has(base);
+          const visible = selectedBase && !overriddenByQuadrants;
+          setFeatureVisible(entry, lyr, visible, visible);
+        }
+      }
+      // Quadrant features — show only when exact key in selection
+      for (const entry of quadDayLayers) {
+        for (const lyr of entry.features) {
+          const key = lyr._routeKey;          // e.g., S9_SE
+          const visible = selectedSet.has(key);
+          setFeatureVisible(entry, lyr, visible, visible);
+        }
+      }
 
-    rebuildCoverageFromVisible();
+      rebuildCoverageFromVisible();
+      selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
+        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
-    selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
-      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-
-    if (cfg.behavior?.autoZoom) {
-      if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
-      else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+      if (cfg.behavior?.autoZoom) {
+        if (selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
+        else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+      }
+      info(`Loaded ${selectedSet.size} selected key(s).`);
     }
 
     recolorAndRecountCustomers();
@@ -281,7 +296,6 @@
 
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
     setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-
     await rebuildDriverOverlays();
   }
 
@@ -562,7 +576,6 @@
   // =================================================================
   function openPolygonPopup(lyr) {
     const muni = lyr._labelTxt || 'Municipality';
-    the_totalAny = Number(lyr._custAny || 0); // keep legacy variable name if you referenced it elsewhere
     const totalAny = Number(lyr._custAny || 0);
     const inSel    = Number(lyr._custSel || 0);
     const html = `<div><strong>${escapeHtml(muni)}</strong><br>Customers: ${totalAny}` +
@@ -736,7 +749,7 @@
     }
   }
 
-  // ------------------------- helpers -------------------------
+  // ---- helpers ----
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
@@ -761,14 +774,14 @@
 
   function findHeaderFlexible(rows, schema) {
     if (!rows || !rows.length) return null;
-    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase(); // FIX: && not 'and'
+    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase(); // FIXED
     const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
       let keysCol = -1;
       row.forEach((h, idx) => {
         const v = like(h);
-        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys')))) // FIX: && not 'and'
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys')))) // FIXED
           keysCol = idx;
       });
       if (keysCol !== -1) return { headerIndex: i, keysCol };
@@ -850,14 +863,16 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
-  function renderError(msg) {
+  function showTopError(title, msg) {
     const el = document.getElementById('error');
+    if (!el) return;
     el.style.display = 'block';
-    el.innerHTML = `<strong>Load error</strong><br>${escapeHtml(msg)}`;
+    el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`;
   }
+  function renderError(msg) { showTopError('Load error', msg); }
   function phase(msg){ setStatus(`⏳ ${msg}`); }
   function info(msg){ setStatus(`ℹ️ ${msg}`); }
-  function warn(msg){ const e = document.getElementById('error'); e.style.display='block'; e.innerHTML = `<strong>Warning</strong><br>${escapeHtml(msg)}`; }
+  function warn(msg){ showTopError('Warning', msg); }
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
 
   function makeStatusLine(selMunis, inCount, outCount) {
