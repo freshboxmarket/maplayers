@@ -67,7 +67,7 @@
     "enabled": true,
 
     // 1) Replace with your deployed Apps Script Web App URL (doPost endpoint)
-    "endpoint": "https://script.google.com/macros/s/YOUR_WEB_APP_DEPLOYMENT_ID/exec",
+    "endpoint": "https://script.google.com/macros/s/AKfycbyKvbiYLUuH3JzC-lGHZ076MgUIOvkR-arhlSrQGjdmFizvjo0FdS5ccEY9rGDH-7h0/exec",
 
     // 2) Default: hide basemap tiles during capture to avoid CORS “tainted canvas” issues.
     //    If you switch to a tile source that sends proper CORS headers, set this to true.
