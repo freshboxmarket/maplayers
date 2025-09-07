@@ -14,7 +14,7 @@
       max-width: 360px; z-index: 1000;
     }
     #legend { top: 10px; }
-    #drivers { top: 10px; left: auto; right: 10px; }
+    #drivers { top: 10px; left: auto; right: 10px; } /* place on the right */
     .panel h4 { margin: 0 0 6px 0; font-size: 14px; }
     .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
     .swatch { width: 16px; height: 16px; border-radius: 3px; border: 2px solid #888; box-sizing: border-box; }
@@ -35,30 +35,14 @@
       text-shadow: 0 0 2px rgba(255,255,255,.9), 0 0 6px rgba(255,255,255,.7);
     }
     .leaflet-tooltip.lbl.dim { opacity: .55; font-weight: 500; }
-
-    /* Export panel */
-    #exportPanel {
-      position: absolute; bottom: 10px; right: 10px;
-      background: #fff; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,.15);
-      padding: 10px 12px; font: 13px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      z-index: 1000; max-width: 280px;
-    }
-    #btnExport { padding: 6px 10px; border-radius: 8px; border: 1px solid #ddd; cursor: pointer; }
-    #btnExport:disabled { opacity: .6; cursor: default; }
-    #exportMsg { margin-top: 6px; font-size: 12px; }
+    #drivers input[type="checkbox"] { cursor: pointer; }
   </style>
 </head>
 <body>
   <div id="map" role="region" aria-label="Selected Zones Map"></div>
 
   <div id="legend" class="panel" aria-live="polite"></div>
-  <div id="drivers" class="panel" aria-live="polite"></div>
-
-  <div id="exportPanel" aria-live="polite">
-    <div style="font-weight:600;margin-bottom:6px;">Weekly Dispatch Snapshot</div>
-    <button id="btnExport">🖼️ Export snapshot</button>
-    <div id="exportMsg" aria-live="polite"></div>
-  </div>
+  <div id="drivers" class="panel" aria-live="polite"></div> <!-- NEW: driver toggles -->
 
   <div id="status" aria-live="polite"></div>
   <div id="error" role="alert"></div>
@@ -66,8 +50,6 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
   <script src="https://unpkg.com/leaflet-boundary-canvas/dist/leaflet-boundary-canvas.min.js"></script>
-  <!-- DOM snapshot -->
-  <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="./apps.js" defer></script>
 
   <noscript>
