@@ -1,10 +1,9 @@
-/* apps.js — viewer + client-side snapshot export
-   - Adds an “Export snapshot” button that captures the current map (SVG overlays + labels + customers).
-   - By default hides basemap tiles during capture to avoid CORS-tainted canvases (config.exporter.includeTiles=false).
-   - POSTs a PNG + state to an Apps Script Web App which files the image & builds a one-page report.
-*/
+/* apps.js — viewer + client-side snapshot export */
 (async function () {
   // ------------------------- URL / config -------------------------
+  // IMPORTANT: use var to avoid TDZ; declare FIRST in the file
+  var driverOverlays = {}; // name -> { group, color, labelMarker }
+
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
@@ -12,8 +11,6 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);  // [{name,color}, ...]
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});  // { "S9": "Devin", "S9_SE":"Devin", ... }
 
-  // Global-ish state used across modules (declare BEFORE any usage)
-  const driverOverlays = {};                     // name -> { group, color, labelMarker }
   let activeAssignMap = { ...assignMapParam };
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
   let highlightOutside = false;
@@ -61,9 +58,9 @@
   let coveragePolysAll = [];
   let coveragePolysSelected = [];
 
-  // Render empty panels first (use safe empty overlays map)
+  // Render empty panels first (pass a safe overlays map)
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
-  renderDriversPanel([], {}, false, {}, 0);
+  renderDriversPanel([], /*overlays*/ {}, false, {}, 0);
 
   // ------------------------- load layers -------------------------
   phase('Loading polygon layers…');
@@ -252,10 +249,8 @@
       for (const lyr of entry.features) {
         const key = lyr._routeKey;
         const baseK = lyr._baseKey;
-        const selectedBase = selectedSet.has(key);
-        const overriddenByQuadrants = quadrantBaseSet.has(baseK);
-        const visible = selectedBase && !overriddenByQuadrants;
-        setFeatureVisible(entry, lyr, visible, visible);
+        theVisible = selectedSet.has(key) && !quadrantBaseSet.has(baseK);
+        setFeatureVisible(entry, lyr, theVisible, theVisible);
       }
     }
     // quadrants
@@ -320,7 +315,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, /*overlays*/ driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
       return;
     }
     if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
@@ -328,7 +323,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
       return;
     }
 
@@ -340,7 +335,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
       return;
     }
 
@@ -351,7 +346,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
       return;
     }
     const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
@@ -395,7 +390,7 @@
     };
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
     setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-    renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+    renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
   }
 
   function resetDayCounts(){
@@ -478,7 +473,7 @@
 
     // aggregate to drivers (selected only)
     driverSelectedCounts = computeDriverCounts();
-    renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+    renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
   }
 
   function computeDriverCounts() {
@@ -511,7 +506,7 @@
     });
 
     if (byDriver.size === 0) {
-      renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, /*overlays*/ {}, false, driverSelectedCounts, custWithinSel);
       return;
     }
 
@@ -736,7 +731,7 @@
 
   // ------------------------- helpers -------------------------
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
-  async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`)); return res.json(); }
+  async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
 
   function parseCsvRows(text) {
@@ -959,7 +954,7 @@
     if (!showTiles) try { base.setOpacity(0.0); } catch {}
 
     // Bring driver outlines to the front for the snapshot
-    try { Object.values(driverOverlays).forEach(rec => rec.group.bringToFront()); } catch {}
+    try { Object.values(driverOverlays || {}).forEach(rec => rec.group.bringToFront()); } catch {}
 
     const mapNode = document.getElementById('map');
     const canvas = await html2canvas(mapNode, {
