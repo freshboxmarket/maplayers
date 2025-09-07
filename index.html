@@ -4,9 +4,7 @@
   <meta charset="utf-8" />
   <title>Selected Zones Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-
   <style>
     html, body, #map { height: 100%; margin: 0; }
     .panel {
@@ -16,28 +14,11 @@
       max-width: 360px; z-index: 1000;
     }
     #legend { top: 10px; }
-    #drivers { top: 10px; left: auto; right: 10px; } /* place on the right */
-
-    /* NEW: export panel (below drivers) */
-    #exportPanel {
-      position: absolute; right: 10px; top: 140px;
-      background: #fff; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,.15);
-      padding: 10px 12px; font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      z-index: 1000; width: 260px;
-    }
-    #exportPanel button {
-      display: inline-flex; align-items: center; gap: 8px;
-      border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; cursor: pointer;
-      background: #0ea5e9; color: #fff; font-weight: 600;
-    }
-    #exportPanel button:disabled { opacity: .6; cursor: not-allowed; }
-    #exportPanel .hint { font-size: 12px; opacity: .8; margin-top: 6px; }
-
+    #drivers { top: 10px; left: auto; right: 10px; }
     .panel h4 { margin: 0 0 6px 0; font-size: 14px; }
     .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
     .swatch { width: 16px; height: 16px; border-radius: 3px; border: 2px solid #888; box-sizing: border-box; }
     .counts { margin-left: auto; opacity: .8; font-variant-numeric: tabular-nums; }
-
     #status {
       position: absolute; bottom: 10px; left: 10px; right: 10px;
       background: rgba(255,255,255,.92); border-radius: 8px; padding: 6px 10px;
@@ -54,7 +35,17 @@
       text-shadow: 0 0 2px rgba(255,255,255,.9), 0 0 6px rgba(255,255,255,.7);
     }
     .leaflet-tooltip.lbl.dim { opacity: .55; font-weight: 500; }
-    #drivers input[type="checkbox"] { cursor: pointer; }
+
+    /* Export panel */
+    #exportPanel {
+      position: absolute; bottom: 10px; right: 10px;
+      background: #fff; border-radius: 10px; box-shadow: 0 2px 12px rgba(0,0,0,.15);
+      padding: 10px 12px; font: 13px/1.2 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      z-index: 1000; max-width: 280px;
+    }
+    #btnExport { padding: 6px 10px; border-radius: 8px; border: 1px solid #ddd; cursor: pointer; }
+    #btnExport:disabled { opacity: .6; cursor: default; }
+    #exportMsg { margin-top: 6px; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -63,16 +54,10 @@
   <div id="legend" class="panel" aria-live="polite"></div>
   <div id="drivers" class="panel" aria-live="polite"></div>
 
-  <!-- NEW: export controls -->
-  <div id="exportPanel" class="panel" aria-live="polite">
-    <h4>Weekly Dispatch Snapshot</h4>
-    <button id="btnExport" type="button" aria-label="Export snapshot of current map view">
-      🖼️ Export snapshot
-    </button>
-    <div class="hint">
-      Exports the polygons, labels, and customer dots. Basemap tiles are hidden by default to avoid CORS issues.
-    </div>
-    <div id="exportMsg" class="hint" aria-live="polite" style="margin-top:6px;"></div>
+  <div id="exportPanel" aria-live="polite">
+    <div style="font-weight:600;margin-bottom:6px;">Weekly Dispatch Snapshot</div>
+    <button id="btnExport">🖼️ Export snapshot</button>
+    <div id="exportMsg" aria-live="polite"></div>
   </div>
 
   <div id="status" aria-live="polite"></div>
@@ -81,10 +66,8 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
   <script src="https://unpkg.com/leaflet-boundary-canvas/dist/leaflet-boundary-canvas.min.js"></script>
-
-  <!-- NEW: html2canvas for DOM capture -->
-  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
-
+  <!-- DOM snapshot -->
+  <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="./apps.js" defer></script>
 
   <noscript>
