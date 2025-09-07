@@ -58,7 +58,7 @@
   "behavior": { "autoZoom": true, "refreshSeconds": 0 },
   "exporter": {
     "enabled": true,
-    "webAppUrl": "PASTE_YOUR_WEB_APP_URL",
+    "webAppUrl": "https://script.google.com/macros/s/AKfycbyKvbiYLUuH3JzC-lGHZ076MgUIOvkR-arhlSrQGjdmFizvjo0FdS5ccEY9rGDH-7h0/exec",
     "folderId": "1e6xVJykI3xypfwbQdunqtvobCdJsBkF-",
     "sheetLog": null,
     "makePublic": true
