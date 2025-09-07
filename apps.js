@@ -5,6 +5,22 @@
    - Toggle to highlight customers outside selection (XXL grey + white outline).
 */
 (async function () {
+  // Surface uncaught errors to the page error box (nice for prod & testing)
+  window.addEventListener('error', (e) => {
+    const el = document.getElementById('error');
+    if (el) {
+      el.style.display = 'block';
+      el.innerHTML = `<strong>Script error</strong><br>${(e && e.message) ? e.message : String(e)}`;
+    }
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const el = document.getElementById('error');
+    if (el) {
+      el.style.display = 'block';
+      el.innerHTML = `<strong>Promise error</strong><br>${(e && e.reason && e.reason.message) ? e.reason.message : String(e.reason || e)}`;
+    }
+  });
+
   // ------------------------- URL / config -------------------------
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
@@ -546,6 +562,7 @@
   // =================================================================
   function openPolygonPopup(lyr) {
     const muni = lyr._labelTxt || 'Municipality';
+    the_totalAny = Number(lyr._custAny || 0); // keep legacy variable name if you referenced it elsewhere
     const totalAny = Number(lyr._custAny || 0);
     const inSel    = Number(lyr._custSel || 0);
     const html = `<div><strong>${escapeHtml(muni)}</strong><br>Customers: ${totalAny}` +
@@ -744,14 +761,14 @@
 
   function findHeaderFlexible(rows, schema) {
     if (!rows || !rows.length) return null;
-    const wantKeys = ((schema and schema.keys) || 'zone keys').toLowerCase();
+    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase(); // FIX: && not 'and'
     const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
       let keysCol = -1;
       row.forEach((h, idx) => {
         const v = like(h);
-        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') and v.includes('keys'))))
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys')))) // FIX: && not 'and'
           keysCol = idx;
       });
       if (keysCol !== -1) return { headerIndex: i, keysCol };
