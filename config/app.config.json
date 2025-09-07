@@ -61,6 +61,7 @@
     "webAppUrl": "https://script.google.com/macros/s/AKfycbyKvbiYLUuH3JzC-lGHZ076MgUIOvkR-arhlSrQGjdmFizvjo0FdS5ccEY9rGDH-7h0/exec",
     "folderId": "1e6xVJykI3xypfwbQdunqtvobCdJsBkF-",
     "sheetLog": null,
-    "makePublic": true
+    "makePublic": true,
+    "includeTiles": false
   }
 }
