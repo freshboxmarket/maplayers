@@ -1,9 +1,11 @@
-/* apps.js — viewer + client-side snapshot export */
+/* apps.js — robust, splice-aware viewer with outside-customers toggle
+   - Loads base + quadrant layers; if any quadrant is selected, the base is hidden.
+   - Uses zone-key prefix (W/T/F/S) as day truth.
+   - Driver overlays from assignMap (URL param and/or CSV-derived).
+   - Toggle to highlight customers outside selection (XXL grey + white outline).
+*/
 (async function () {
   // ------------------------- URL / config -------------------------
-  // IMPORTANT: use var to avoid TDZ; declare FIRST in the file
-  var driverOverlays = {}; // name -> { group, color, labelMarker }
-
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
 
@@ -11,29 +13,19 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);  // [{name,color}, ...]
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});  // { "S9": "Devin", "S9_SE":"Devin", ... }
 
-  let activeAssignMap = { ...assignMapParam };
+  let activeAssignMap = { ...assignMapParam };                 // authoritative mapping after CSV parse/merge
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
-  let highlightOutside = false;
-
-  // snapshot-related state
-  let currentSelectedKeys = new Set();
-  let selectedMunicipalities = [];
-  let driverSelectedCounts = {};
-  let custWithinSel = 0;
-  let custOutsideSel = 0;
+  let highlightOutside = false;                                // user toggle
 
   // ------------------------- map init -------------------------
   phase('Loading config…');
   const cfg = await fetchJson(cfgUrl);
 
   phase('Initializing map…');
-  const map = L.map('map').setView([43.55, -80.25], 8);
+  const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
 
   const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-  const base = L.tileLayer(osmTiles, {
-    attribution: '&copy; OpenStreetMap contributors'
-  }).addTo(map);
-
+  const base = L.tileLayer(osmTiles, { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
   try {
     const el = base.getContainer?.();
     if (el) { el.style.filter = 'grayscale(1)'; el.style.webkitFilter = 'grayscale(1)'; }
@@ -44,23 +36,30 @@
   const quadDayLayers = [];
   const allDaySets    = [baseDayLayers, quadDayLayers];
 
-  // bounds + feature storage
+  // State
   let allBounds = null;
   let selectionBounds = null;
   let hasSelection = false;
-  const boundaryFeatures = [];
+
+  const boundaryFeatures = [];     // for optional boundary-canvas
   const customerLayer = L.layerGroup().addTo(map);
-  const customerMarkers = [];
+  const customerMarkers = [];      // [{marker, lat, lng}]
   let customerCount = 0;
+  let custWithinSel = 0;
+  let custOutsideSel = 0;
   const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
   let currentFocus = null;
-  let coveragePolysAll = [];
-  let coveragePolysSelected = [];
+  let coveragePolysAll = [];       // all currently visible polygons
+  let coveragePolysSelected = [];  // polygons in current selection
+  let selectedMunicipalities = [];
 
-  // Render empty panels first (pass a safe overlays map)
+  let driverSelectedCounts = {};   // { "Devin": n, ... } (selected only)
+  const driverOverlays = {};       // name -> { group, color, labelMarker }
+
+  // Render empty panels first
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
-  renderDriversPanel([], /*overlays*/ {}, false, {}, 0);
+  renderDriversPanel([], {}, false, {}, 0);
 
   // ------------------------- load layers -------------------------
   phase('Loading polygon layers…');
@@ -85,41 +84,16 @@
   map.on('movestart', () => { clearFocus(false); map.closePopup(); });
   map.on('zoomstart', () => { map.closePopup(); });
 
+  // initial selection + customers
   await applySelection();
   await loadCustomersIfAny();
 
+  // optional auto-refresh
   const refresh = Number(cfg.behavior?.refreshSeconds || 0);
   if (refresh > 0) setInterval(async () => {
     await applySelection();
     await loadCustomersIfAny();
   }, refresh * 1000);
-
-  // ====================== SNAPSHOT UI WIRING ======================
-  const exportBtn = document.getElementById('btnExport');
-  const exportMsg = document.getElementById('exportMsg');
-  if (exportBtn) {
-    exportBtn.addEventListener('click', async () => {
-      try {
-        exportBtn.disabled = true;
-        exportMsg.textContent = 'Preparing snapshot…';
-        const resp = await exportSnapshot();
-        if (resp && resp.ok) {
-          const bits = [];
-          if (resp.slidesUrl) bits.push(`<a href="${resp.slidesUrl}" target="_blank" rel="noopener">Slides</a>`);
-          if (resp.pdfUrl)    bits.push(`<a href="${resp.pdfUrl}" target="_blank" rel="noopener">PDF</a>`);
-          if (resp.pngUrl)    bits.push(`<a href="${resp.pngUrl}" target="_blank" rel="noopener">PNG</a>`);
-          exportMsg.innerHTML = `✅ Snapshot exported. ${bits.join(' · ')}`;
-        } else {
-          exportMsg.textContent = '❌ Export failed. See console for details.';
-        }
-      } catch (e) {
-        console.error(e);
-        exportMsg.textContent = '❌ Export failed. See console for details.';
-      } finally {
-        exportBtn.disabled = false;
-      }
-    });
-  }
 
   // =================================================================
   // LOADERS
@@ -143,7 +117,7 @@
         onEachFeature: (feat, lyr) => {
           const p = feat.properties || {};
           const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
-          const keyNorm = normalizeKey(rawKey);
+          const keyNorm = normalizeKey(rawKey);  // keep suffix (_SE) intact
           const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
           const day     = Lcfg.day;
 
@@ -179,7 +153,7 @@
   }
 
   // =================================================================
-  // SELECTION
+  // SELECTION (base + quadrants mixed) + robust CSV-derived assignments
   // =================================================================
   async function applySelection() {
     clearFocus(false);
@@ -191,6 +165,7 @@
     const csvText = await fetchText(selUrl);
     const rowsAA = parseCsvRows(csvText);
 
+    // A) parse selection keys from “zone keys”
     const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
     const selectedSet = new Set();
     if (hdr) {
@@ -200,20 +175,24 @@
         splitKeys(r[keysCol]).map(normalizeKey).forEach(k => selectedSet.add(k));
       }
     }
-    currentSelectedKeys = selectedSet;
 
-    // driver assignments
-    const knownDriverNames = new Set((driverMeta || []).map(d => String(d.name || '').toLowerCase()).filter(Boolean));
+    // B) parse driver assignments (ONLY accept known driver names if provided)
+    const knownDriverNames = new Set(
+      (driverMeta || []).map(d => String(d.name || '').toLowerCase()).filter(Boolean)
+    );
     const derivedAssign = extractAssignmentsFromCsv(rowsAA, knownDriverNames);
-    activeAssignMap = { ...activeAssignMap, ...derivedAssign };
+    activeAssignMap = { ...activeAssignMap, ...derivedAssign };  // CSV overwrites seed
     driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
 
     if (selectedSet.size === 0) warn(`Selection parsed 0 keys. Check the published CSV has a "zone keys" column.`);
+    else info(`Loaded ${selectedSet.size} selected key(s).`);
+
     hasSelection = selectedSet.size > 0;
     selectionBounds = null;
     coveragePolysSelected = [];
     selectedMunicipalities = [];
 
+    // Track which base keys are present as exact quadrant keys
     const quadrantBaseSet = new Set();
     for (const k of selectedSet) if (isQuadrantKey(k)) quadrantBaseSet.add(baseKeyFrom(k));
 
@@ -244,19 +223,22 @@
       }
     };
 
-    // base features
+    // Base features — show if base key is selected AND no quadrant selected for same base
     for (const entry of baseDayLayers) {
       for (const lyr of entry.features) {
-        const key = lyr._routeKey;
-        const baseK = lyr._baseKey;
-        theVisible = selectedSet.has(key) && !quadrantBaseSet.has(baseK);
-        setFeatureVisible(entry, lyr, theVisible, theVisible);
+        const key = lyr._routeKey;          // e.g., S9
+        const base = lyr._baseKey;          // S9
+        const selectedBase = selectedSet.has(key);
+        const overriddenByQuadrants = quadrantBaseSet.has(base);
+        const visible = selectedBase && !overriddenByQuadrants;
+        setFeatureVisible(entry, lyr, visible, visible);
       }
     }
-    // quadrants
+
+    // Quadrant features — show only when exact key in selection
     for (const entry of quadDayLayers) {
       for (const lyr of entry.features) {
-        const key = lyr._routeKey;
+        const key = lyr._routeKey;          // e.g., S9_SE
         const visible = selectedSet.has(key);
         setFeatureVisible(entry, lyr, visible, visible);
       }
@@ -315,7 +297,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, /*overlays*/ driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
     if (!cfg.customers || cfg.customers.enabled === false || !cfg.customers.url) {
@@ -323,7 +305,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
 
@@ -335,7 +317,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
 
@@ -346,7 +328,7 @@
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
       setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-      renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
     const mapIdx = headerIndexMap(rows[hdrIdx], cfg.customers.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
@@ -370,8 +352,8 @@
       if (!ll) continue;
 
       const m = L.circleMarker([ll.lat, ll.lng], baseStyle).addTo(customerLayer);
-      const popupHtml = note ? `<div style="max-width:260px">${escapeHtml(note)}</div>` :
-                               `<div>${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}</div>`;
+      const popupHtml = note ? `<div style="max-width:260px">${escapeHtml(note)}</div>`
+                             : `<div>${ll.lat.toFixed(6)}, ${ll.lng.toFixed(6)}</div>`;
       m.bindPopup(popupHtml, { autoClose: true, closeOnClick: true });
 
       customerMarkers.push({ marker: m, lat: ll.lat, lng: ll.lng });
@@ -390,7 +372,7 @@
     };
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
     setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
-    renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
+    renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
 
   function resetDayCounts(){
@@ -431,6 +413,8 @@
 
       if (turfOn) {
         const pt = turf.point([rec.lng, rec.lat]);
+
+        // any visible polygon (for popup totalAny)
         for (let j = 0; j < coveragePolysAll.length; j++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
             const lyr = coveragePolysAll[j].layerRef;
@@ -438,6 +422,8 @@
             break;
           }
         }
+
+        // in selection?
         for (let k = 0; k < coveragePolysSelected.length; k++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
             insideSel = true;
@@ -473,7 +459,7 @@
 
     // aggregate to drivers (selected only)
     driverSelectedCounts = computeDriverCounts();
-    renderDriversPanel(driverMeta, driverOverlays || {}, true, driverSelectedCounts, custWithinSel);
+    renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
 
   function computeDriverCounts() {
@@ -495,7 +481,8 @@
     Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch {} });
     for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
-    const byDriver = new Map();
+    // group selected features by driver
+    const byDriver = new Map(); // name -> [geoJSON Feature]
     coveragePolysSelected.forEach(rec => {
       const key = rec.layerRef && rec.layerRef._routeKey;
       if (!key) return;
@@ -506,7 +493,7 @@
     });
 
     if (byDriver.size === 0) {
-      renderDriversPanel(driverMeta, /*overlays*/ {}, false, driverSelectedCounts, custWithinSel);
+      renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
       return;
     }
 
@@ -515,6 +502,7 @@
                    || { name, color: colorFromName(name) });
       const color = meta.color || '#888';
 
+      // halo under colored outline
       const halo = L.geoJSON({ type:'FeatureCollection', features }, {
         interactive:false,
         style:()=>({ color:'#ffffff', weight:(cfg.drivers?.outlineHaloWeightPx ?? 10), opacity:0.95, lineJoin:'round', lineCap:'round', fill:false })
@@ -544,6 +532,7 @@
     renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
 
+  // exact key, then base key
   function lookupDriverForKey(key) {
     if (!key) return null;
     if (activeAssignMap[key]) return activeAssignMap[key];
@@ -636,6 +625,7 @@
       ? overlayDrivers
       : Array.from(new Set(Object.values(activeAssignMap))).sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
 
+    // order drivers by meta order, else alphabetical
     const orderIndex = new Map((metaList||[]).map((d,i)=>[String(d.name||'').toLowerCase(), i]));
     allDriverNames.sort((a,b)=>{
       const ia = orderIndex.has(a.toLowerCase()) ? orderIndex.get(a.toLowerCase()) : 9999;
@@ -754,14 +744,14 @@
 
   function findHeaderFlexible(rows, schema) {
     if (!rows || !rows.length) return null;
-    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase();
+    const wantKeys = ((schema and schema.keys) || 'zone keys').toLowerCase();
     const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
       let keysCol = -1;
       row.forEach((h, idx) => {
         const v = like(h);
-        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys'))))
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') and v.includes('keys'))))
           keysCol = idx;
       });
       if (keysCol !== -1) return { headerIndex: i, keysCol };
@@ -858,6 +848,7 @@
     return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList}`;
   }
 
+  // Assignment extraction – ONLY accept known driver names, avoid day words like “Sat”
   function extractAssignmentsFromCsv(rows, knownNamesSet) {
     const like = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     const dayWords = new Set(['mon','monday','tue','tues','tuesday','wed','weds','wednesday','thu','thur','thurs','thursday','fri','friday','sat','saturday','sun','sunday']);
@@ -871,6 +862,7 @@
     const isKeysHeader = (s) => { const v = like(s); return v.includes('key') || v.includes('zone') || v.includes('route'); };
     const isDriverHeader = (s) => { const v = like(s); return v.includes('driver') || v === 'name' || v.includes('assigned'); };
 
+    // Try header-based table
     let headerIndex = -1, driverCol = -1, keysCol = -1;
     for (let i=0; i<Math.min(rows.length, 50); i++) {
       const row = rows[i] || [];
@@ -889,12 +881,13 @@
         const dn = (row[driverCol] || '').trim();
         const ks = (row[keysCol]   || '').trim();
         if (!dn || !ks) continue;
-        if (!looksLikeName(dn)) continue;
+        if (!looksLikeName(dn)) continue; // reject “Sat”
         splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
       }
       return out;
     }
 
+    // Fallback: scan first 40 rows; only accept KNOWN names
     for (let r = 0; r < Math.min(rows.length, 40); r++) {
       const row = rows[r] || [];
       if (!row.length) continue;
@@ -907,6 +900,7 @@
       }
       if (!dn) continue;
 
+      // find any cell(s) with keys and merge
       let allKeys = [];
       for (let c=0;c<row.length;c++) {
         const cell = (row[c]||'').trim();
@@ -920,6 +914,7 @@
     return out;
   }
 
+  // ensure every driver referenced has a color entry
   function ensureDriverMeta(metaList, driverNames) {
     const out = Array.isArray(metaList) ? [...metaList] : [];
     const seen = new Set(out.map(d => String(d.name||'').toLowerCase()));
@@ -930,88 +925,11 @@
     return out;
   }
 
+  // stable HSL from name
   function colorFromName(name) {
     let h=0; const s=65, l=50; const str = String(name||'');
     for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
     return `hsl(${h}, ${s}%, ${l}%)`;
-  }
-
-  // ====================== SNAPSHOT CORE ======================
-  async function exportSnapshot() {
-    const exp = cfg.exporter || {};
-    if (!exp.enabled) {
-      console.warn('Exporter disabled in config.');
-      return { ok: false, error: 'disabled' };
-    }
-    const endpoint = exp.webAppUrl;
-    if (!endpoint) {
-      console.error('Missing config.exporter.webAppUrl');
-      return { ok: false, error: 'no-endpoint' };
-    }
-
-    // Optionally hide base tiles to avoid CORS taint
-    const showTiles = !!exp.includeTiles;
-    if (!showTiles) try { base.setOpacity(0.0); } catch {}
-
-    // Bring driver outlines to the front for the snapshot
-    try { Object.values(driverOverlays || {}).forEach(rec => rec.group.bringToFront()); } catch {}
-
-    const mapNode = document.getElementById('map');
-    const canvas = await html2canvas(mapNode, {
-      useCORS: true,
-      backgroundColor: '#ffffff',
-      scale: 2
-    });
-
-    if (!showTiles) try { base.setOpacity(1.0); } catch {}
-
-    const dataUrl = canvas.toDataURL('image/png');
-
-    const body = {
-      imageDataUrl: dataUrl,
-      viewerUrl: location.href,
-      timestampIso: new Date().toISOString(),
-      weekLabel: guessWeekLabel(),
-      selectedMunicipalities,
-      counts: {
-        customersIn: custWithinSel,
-        customersOut: custOutsideSel,
-        selectedKeysCount: currentSelectedKeys.size
-      },
-      selectedKeys: Array.from(currentSelectedKeys),
-      driverCounts: driverSelectedCounts,
-      assignMap: activeAssignMap,
-      driverMeta,
-      folderId: exp.folderId || null,
-      makePublic: !!exp.makePublic,
-      sheetLog: exp.sheetLog || null
-    };
-
-    const resp = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    if (!resp.ok) {
-      const t = await resp.text().catch(()=> '');
-      console.error('Snapshot POST failed:', resp.status, t);
-      return { ok: false, error: 'post-failed', status: resp.status };
-    }
-    const json = await resp.json().catch(()=> ({}));
-    return { ok: true, ...json };
-  }
-
-  function guessWeekLabel() {
-    const w = (qs.get('week') || '').trim();
-    if (w) return w;
-    const d = new Date();
-    const dayNum = (d.getDay() + 6) % 7; // Mon=0..Sun=6
-    const thu = new Date(d); thu.setDate(d.getDate() - dayNum + 3);
-    const firstThu = new Date(thu.getFullYear(), 0, 4);
-    const diff = (thu - firstThu) / 86400000;
-    const week = 1 + Math.floor((diff + ((firstThu.getDay()+6)%7)) / 7);
-    const year = thu.getFullYear();
-    return `${year}-W${String(week).padStart(2,'0')}`;
   }
 
 })().catch(e => {
