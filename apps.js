@@ -1,10 +1,11 @@
 /* apps.js — 3-tier (base → quadrants → subquadrants) splice-aware viewer
    - Loads base, quadrant, and subquadrant layers (if present in config).
-   - Selection precedence: Subquadrant > Quadrant > Base for the same base key.
-   - Uses zone-key prefix (W/T/F/S) as day truth.
-   - Driver overlays from assignMap (URL param and/or CSV-derived).
-   - Toggle to highlight customers outside selection (XXL grey + white outline).
-   - Never-blank fallback — if selection is missing/empty, show ALL zones dimmed.
+   - Visibility precedence (per base): Subquadrant > Quadrant > Base.
+     * Base (e.g., W1) shows only if selected AND no quads/subquads of that base are selected.
+     * A Quadrant (e.g., W1_NE) shows only if selected AND no subquads exist for that quadrant (W1_NE_*).
+     * Subquadrants (e.g., W1_SW_TL) show if selected.
+   - Exact "active zone keys" shown in status, using the selection order and only keys actually drawn.
+   - All existing features kept: outside-customer toggle, never-blank fallback, driver overlays, labels, CSV parsing, counts.
 */
 (async function () {
   // ---- Surface uncaught errors to the page error box ----
@@ -67,6 +68,10 @@
   let driverSelectedCounts = {};   // { "Devin": n, ... } (selected only)
   const driverOverlays = {};       // name -> { group, color, labelMarker }
 
+  // For status line: preserve selection ORDER + show only keys actually drawn
+  let selectedOrderedKeys = [];     // normalized (upper) in order parsed from CSV
+  let visibleSelectedKeysSet = new Set(); // keys that actually rendered due to precedence
+
   // Render empty panels first
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
   renderDriversPanel([], {}, false, {}, 0);
@@ -81,7 +86,7 @@
     await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
   }
 
-  // Optional boundary-canvas mask using all features we load
+  // Optional boundary-canvas mask
   try {
     if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
       const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -170,7 +175,8 @@
     clearFocus(false);
 
     const selUrl = qs.get('sel') || (cfg.selection && cfg.selection.url) || '';
-    let selectedSet = new Set();
+    const selectedSet = new Set();
+    selectedOrderedKeys = [];
     let loadedSelectionCsv = false;
 
     if (!selUrl) {
@@ -188,7 +194,10 @@
           const { headerIndex, keysCol } = hdr;
           for (let i = headerIndex + 1; i < rowsAA.length; i++) {
             const r = rowsAA[i]; if (!r || r.length === 0) continue;
-            splitKeys(r[keysCol]).map(normalizeKey).forEach(k => selectedSet.add(k));
+            const ks = splitKeys(r[keysCol]).map(normalizeKey);
+            for (const k of ks) {
+              if (!selectedSet.has(k)) { selectedSet.add(k); selectedOrderedKeys.push(k); }
+            }
           }
         }
 
@@ -209,6 +218,30 @@
     selectionBounds = null;
     coveragePolysSelected = [];
     selectedMunicipalities = [];
+    visibleSelectedKeysSet = new Set();
+
+    // Helper: record keys that truly rendered as selected
+    const recordVisibleSelectedKey = (k) => { if (k) visibleSelectedKeysSet.add(k); };
+
+    // Override tracking:
+    //  - bases with any selected quadrants
+    //  - bases with any selected subquadrants
+    //  - specific quadrants (e.g., W1_SW) that have selected subquadrants
+    const quadBasesSelected = new Set();
+    const subqBasesSelected = new Set();
+    const subqQuadsSelected = new Set(); // strings like "W1_NE"
+
+    if (!noKeys) {
+      for (const k of selectedSet) {
+        if (isSubquadrantKey(k)) {
+          subqBasesSelected.add(baseKeyFrom(k));
+          const pq = basePlusQuad(k);
+          if (pq) subqQuadsSelected.add(pq);
+        } else if (isQuadrantKey(k)) {
+          quadBasesSelected.add(baseKeyFrom(k));
+        }
+      }
+    }
 
     const setFeatureVisible = (entry, lyr, visible, isSelected) => {
       const has = entry.layer.hasLayer(lyr);
@@ -222,6 +255,7 @@
         else            applyStyleDim(lyr, entry.perDay, cfg);
 
         if (isSelected) {
+          recordVisibleSelectedKey(lyr._routeKey);
           if (lyr.getBounds) {
             const b = lyr.getBounds();
             selectionBounds = selectionBounds ? selectionBounds.extend(b) : L.latLngBounds(b);
@@ -252,36 +286,27 @@
         if (allBounds) map.fitBounds(allBounds.pad(0.1));
       }
     } else {
-      // Build override sets for precedence: Subquadrant > Quadrant > Base
-      const subqBaseSet = new Set(); // base keys that have any subquadrant selected
-      const quadBaseSet = new Set(); // base keys that have any quadrant selected
-
-      for (const k of selectedSet) {
-        if (isSubquadrantKey(k)) subqBaseSet.add(baseKeyFrom(k));
-        else if (isQuadrantKey(k)) quadBaseSet.add(baseKeyFrom(k));
-      }
-
-      // BASE: show only if base key selected AND not overridden by quad or subquad
+      // BASE: show only if base key selected AND no quad/subquad selected for that base
       for (const entry of baseDayLayers) {
         for (const lyr of entry.features) {
-          const keyBase = lyr._routeKey; // base layer uses base key (e.g., F12)
-          const visible = selectedSet.has(keyBase) && !quadBaseSet.has(keyBase) && !subqBaseSet.has(keyBase);
+          const keyBase = lyr._routeKey; // base layer uses base key (e.g., W1)
+          const visible = selectedSet.has(keyBase) && !quadBasesSelected.has(keyBase) && !subqBasesSelected.has(keyBase);
           setFeatureVisible(entry, lyr, visible, visible);
         }
       }
-      // QUADRANTS: show only if exact quad selected AND not overridden by subquads
+      // QUADRANTS: show only if exact quad selected AND no subquads selected for that specific quadrant
       for (const entry of quadDayLayers) {
         for (const lyr of entry.features) {
-          const kQuad = lyr._routeKey;      // e.g., F12_NE
-          const kBase = baseKeyFrom(kQuad); // F12
-          const visible = selectedSet.has(kQuad) && !subqBaseSet.has(kBase);
+          const kQuad = lyr._routeKey;      // e.g., W1_NE
+          const bq = basePlusQuad(kQuad);   // "W1_NE"
+          const visible = selectedSet.has(kQuad) && !subqQuadsSelected.has(bq);
           setFeatureVisible(entry, lyr, visible, visible);
         }
       }
       // SUBQUADRANTS: show only if exact subquad selected
       for (const entry of subqDayLayers) {
         for (const lyr of entry.features) {
-          const kSub = lyr._routeKey; // e.g., F12_NE_TL
+          const kSub = lyr._routeKey; // e.g., W1_NE_TL
           const visible = selectedSet.has(kSub);
           setFeatureVisible(entry, lyr, visible, visible);
         }
@@ -307,8 +332,13 @@
       Saturday:  { selected: custByDayInSel.Saturday,  total: custWithinSel }
     };
 
+    // Build "active zone keys" list in original selection order, but only keys that actually drew
+    const activeKeysOrderedLower = selectedOrderedKeys
+      .filter(k => visibleSelectedKeysSet.has(k))
+      .map(k => k.toLowerCase());
+
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
-    setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+    setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, activeKeysOrderedLower));
     await rebuildDriverOverlays();
   }
 
@@ -339,7 +369,7 @@
       custWithinSel = custOutsideSel = 0;
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
-      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, []));
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
@@ -347,7 +377,7 @@
       custWithinSel = custOutsideSel = 0;
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
-      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, []));
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
@@ -359,7 +389,7 @@
       custWithinSel = custOutsideSel = 0;
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
-      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, []));
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
@@ -370,7 +400,7 @@
       custWithinSel = custOutsideSel = 0;
       resetDayCounts();
       renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
-      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, []));
       renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
       return;
     }
@@ -414,7 +444,13 @@
       Saturday:  { selected: custByDayInSel.Saturday,  total: custWithinSel }
     };
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
-    setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel));
+
+    // keep previously computed active keys in status
+    const activeKeysOrderedLower = selectedOrderedKeys
+      .filter(k => visibleSelectedKeysSet.has(k))
+      .map(k => k.toLowerCase());
+    setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, activeKeysOrderedLower));
+
     renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
 
@@ -758,6 +794,12 @@
           Saturday:  { selected: custByDayInSel.Saturday,  total: custWithinSel }
         };
         renderLegend(cfg, legendCounts2, custWithinSel, custOutsideSel, highlightOutside);
+
+        // Keep active keys text stable
+        const activeKeysOrderedLower = selectedOrderedKeys
+          .filter(k => visibleSelectedKeysSet.has(k))
+          .map(k => k.toLowerCase());
+        setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, activeKeysOrderedLower));
       });
     }
   }
@@ -829,10 +871,14 @@
   }
   function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
 
-  // quadrant + subquadrant detectors
+  // quadrant + subquadrant helpers
   function quadParts(key) {
     const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/);
     return m ? { quad: m[1], sub: m[2] || null } : null;
+  }
+  function basePlusQuad(key) {
+    const p = quadParts(key);
+    return p ? (baseKeyFrom(key) + '_' + p.quad) : null; // e.g., "W1_SW"
   }
   function isSubquadrantKey(k) { const p = quadParts(k); return !!(p && p.sub); }
   function isQuadrantKey(k)    { const p = quadParts(k); return !!(p && !p.sub); }
@@ -893,11 +939,15 @@
   function phase(msg){ setStatus(`⏳ ${msg}`); }
   function info(msg){ setStatus(`ℹ️ ${msg}`); }
   function warn(msg){ showTopError('Warning', msg); }
-  function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
 
-  function makeStatusLine(selMunis, inCount, outCount) {
+  // Status line now includes "active zone keys"
+  function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
+  function makeStatusLine(selMunis, inCount, outCount, activeKeysLowerArray) {
     const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
-    return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList}`;
+    const keysTxt = (Array.isArray(activeKeysLowerArray) && activeKeysLowerArray.length)
+      ? activeKeysLowerArray.join(', ')
+      : '—';
+    return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList} • active zone keys: ${keysTxt}`;
   }
 
   // Assignment extraction – ONLY accept known driver names, avoid day words like “Sat”
