@@ -1,9 +1,10 @@
-/* apps.js — robust, splice-aware viewer with outside-customers toggle
-   - Loads base + quadrant layers; if any quadrant is selected, the base is hidden.
+/* apps.js — 3-tier (base → quadrants → subquadrants) splice-aware viewer
+   - Loads base, quadrant, and subquadrant layers (if present in config).
+   - Selection precedence: Subquadrant > Quadrant > Base for the same base key.
    - Uses zone-key prefix (W/T/F/S) as day truth.
    - Driver overlays from assignMap (URL param and/or CSV-derived).
    - Toggle to highlight customers outside selection (XXL grey + white outline).
-   - NEW: Never-blank fallback — if selection is missing/empty, show ALL zones dimmed.
+   - Never-blank fallback — if selection is missing/empty, show ALL zones dimmed.
 */
 (async function () {
   // ---- Surface uncaught errors to the page error box ----
@@ -16,7 +17,7 @@
 
   const parseJSON = (s, fb=null) => { try { return JSON.parse(s); } catch { return fb; } };
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
-  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // {"S9":"Devin","S9_SE":"Devin",...}
+  const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // {"S9":"Devin","S9_NE_TL":"Devin",...}
 
   let activeAssignMap = { ...assignMapParam };     // authoritative mapping after CSV merge
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
@@ -26,7 +27,6 @@
   phase('Loading config…');
   const cfg = await fetchJson(cfgUrl);
 
-  // Guard: Leaflet present?
   if (typeof L === 'undefined' || !document.getElementById('map')) {
     renderError('Leaflet or #map element not available. Check <link/script> tags and container element.');
     return;
@@ -42,9 +42,10 @@
   } catch {}
 
   // ---- collections / state ----
-  const baseDayLayers = [];  // [{day, layer, perDay, features: LeafletLayer[]}]
-  const quadDayLayers = [];
-  const allDaySets    = [baseDayLayers, quadDayLayers];
+  const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]  (W1, W2, F12…)
+  const quadDayLayers = [];   // same for quadrants (…_NE, …_SW…)
+  const subqDayLayers = [];   // same for subquadrants (…_NE_TL, …_SW_LR…)
+  const allDaySets    = [baseDayLayers, quadDayLayers, subqDayLayers];
 
   let allBounds = null;
   let selectionBounds = null;
@@ -70,14 +71,17 @@
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
   renderDriversPanel([], {}, false, {}, 0);
 
-  // ---- load polygon layers ----
+  // ---- load polygon layers (base → quads → subquads) ----
   phase('Loading polygon layers…');
-  await loadLayerSet(cfg.layers, baseDayLayers, /*addToMap*/ true);
+  await loadLayerSet(cfg.layers, baseDayLayers, true); // required
   if (cfg.layersQuadrants && cfg.layersQuadrants.length) {
-    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, /*addToMap*/ true);
+    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
+  }
+  if (cfg.layersSubquadrants && cfg.layersSubquadrants.length) {
+    await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
   }
 
-  // Optional boundary-canvas
+  // Optional boundary-canvas mask using all features we load
   try {
     if (L.TileLayer && L.TileLayer.boundaryCanvas && boundaryFeatures.length) {
       const boundaryFC = { type: 'FeatureCollection', features: boundaryFeatures };
@@ -92,7 +96,7 @@
   map.on('zoomstart', () => { map.closePopup(); });
 
   // ---- initial selection + customers ----
-  await applySelection();       // will never leave map blank now
+  await applySelection();       // never blank
   await loadCustomersIfAny();
 
   // optional auto-refresh
@@ -128,8 +132,8 @@
           const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
           const day     = Lcfg.day;
 
-          lyr._routeKey   = keyNorm;                 // e.g., S9 or S9_SE
-          lyr._baseKey    = baseKeyFrom(keyNorm);    // e.g., S9
+          lyr._routeKey   = keyNorm;                 // exact key: S9 / S9_NE / S9_NE_TL
+          lyr._baseKey    = baseKeyFrom(keyNorm);    // base: S9
           lyr._day        = day;
           lyr._perDay     = perDay;
           lyr._labelTxt   = muni;
@@ -160,7 +164,7 @@
   }
 
   // =================================================================
-  // SELECTION (base + quadrants) + robust CSV-derived assignments
+  // SELECTION (base + quadrants + subquadrants) + CSV-derived assignments
   // =================================================================
   async function applySelection() {
     clearFocus(false);
@@ -200,16 +204,11 @@
       }
     }
 
-    // --- Never blank: if no keys parsed, show ALL zones dimmed ---
     const noKeys = selectedSet.size === 0;
     hasSelection = !noKeys;
     selectionBounds = null;
     coveragePolysSelected = [];
     selectedMunicipalities = [];
-
-    // Track which base keys are present as exact quadrant keys
-    const quadrantBaseSet = new Set();
-    for (const k of selectedSet) if (isQuadrantKey(k)) quadrantBaseSet.add(baseKeyFrom(k));
 
     const setFeatureVisible = (entry, lyr, visible, isSelected) => {
       const has = entry.layer.hasLayer(lyr);
@@ -239,7 +238,6 @@
     };
 
     if (noKeys) {
-      // Show EVERYTHING dimmed
       info(loadedSelectionCsv ? 'No selection keys found; showing all zones.' : 'Showing all zones.');
       for (const arr of allDaySets) {
         for (const entry of arr) {
@@ -249,27 +247,42 @@
         }
       }
       rebuildCoverageFromVisible();
-      selectedMunicipalities = []; // none selected specifically
+      selectedMunicipalities = [];
       if (cfg.behavior?.autoZoom) {
         if (allBounds) map.fitBounds(allBounds.pad(0.1));
       }
     } else {
-      // Base features — show if base key is selected AND no quadrant selected for same base
+      // Build override sets for precedence: Subquadrant > Quadrant > Base
+      const subqBaseSet = new Set(); // base keys that have any subquadrant selected
+      const quadBaseSet = new Set(); // base keys that have any quadrant selected
+
+      for (const k of selectedSet) {
+        if (isSubquadrantKey(k)) subqBaseSet.add(baseKeyFrom(k));
+        else if (isQuadrantKey(k)) quadBaseSet.add(baseKeyFrom(k));
+      }
+
+      // BASE: show only if base key selected AND not overridden by quad or subquad
       for (const entry of baseDayLayers) {
         for (const lyr of entry.features) {
-          const key = lyr._routeKey;          // e.g., S9
-          const base = lyr._baseKey;          // S9
-          const selectedBase = selectedSet.has(key);
-          const overriddenByQuadrants = quadrantBaseSet.has(base);
-          const visible = selectedBase && !overriddenByQuadrants;
+          const keyBase = lyr._routeKey; // base layer uses base key (e.g., F12)
+          const visible = selectedSet.has(keyBase) && !quadBaseSet.has(keyBase) && !subqBaseSet.has(keyBase);
           setFeatureVisible(entry, lyr, visible, visible);
         }
       }
-      // Quadrant features — show only when exact key in selection
+      // QUADRANTS: show only if exact quad selected AND not overridden by subquads
       for (const entry of quadDayLayers) {
         for (const lyr of entry.features) {
-          const key = lyr._routeKey;          // e.g., S9_SE
-          const visible = selectedSet.has(key);
+          const kQuad = lyr._routeKey;      // e.g., F12_NE
+          const kBase = baseKeyFrom(kQuad); // F12
+          const visible = selectedSet.has(kQuad) && !subqBaseSet.has(kBase);
+          setFeatureVisible(entry, lyr, visible, visible);
+        }
+      }
+      // SUBQUADRANTS: show only if exact subquad selected
+      for (const entry of subqDayLayers) {
+        for (const lyr of entry.features) {
+          const kSub = lyr._routeKey; // e.g., F12_NE_TL
+          const visible = selectedSet.has(kSub);
           setFeatureVisible(entry, lyr, visible, visible);
         }
       }
@@ -774,14 +787,14 @@
 
   function findHeaderFlexible(rows, schema) {
     if (!rows || !rows.length) return null;
-    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase(); // FIXED
+    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase();
     const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     for (let i=0;i<rows.length;i++){
       const row = rows[i] || [];
       let keysCol = -1;
       row.forEach((h, idx) => {
         const v = like(h);
-        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys')))) // FIXED
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys'))))
           keysCol = idx;
       });
       if (keysCol !== -1) return { headerIndex: i, keysCol };
@@ -815,7 +828,14 @@
     return s;
   }
   function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
-  function isQuadrantKey(key) { return /_(SE|NE|NW|SW)$/i.test(String(key||'')); }
+
+  // quadrant + subquadrant detectors
+  function quadParts(key) {
+    const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/);
+    return m ? { quad: m[1], sub: m[2] || null } : null;
+  }
+  function isSubquadrantKey(k) { const p = quadParts(k); return !!(p && p.sub); }
+  function isQuadrantKey(k)    { const p = quadParts(k); return !!(p && !p.sub); }
 
   function parseLatLng(s) {
     const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
@@ -936,7 +956,7 @@
       let allKeys = [];
       for (let c=0;c<row.length;c++) {
         const cell = (row[c]||'').trim();
-        if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW))?/i.test(cell)) {
+        if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW)(_(TL|TR|LL|LR))?)?/i.test(cell)) {
           allKeys = allKeys.concat(splitKeys(cell).map(normalizeKey));
         }
       }
