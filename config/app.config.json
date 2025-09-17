@@ -18,19 +18,20 @@
     { "day": "Friday",    "name": "_Friday_group",    "url": "./_Friday_group.geojson" },
     { "day": "Saturday",  "name": "_Saturday_group",  "url": "./_Saturday_group.geojson" }
   ],
-
   "layersQuadrants": [
     { "day": "Wednesday", "name": "_Wednesday_group_quadrants", "url": "./_Wednesday_group_quadrants.geojson" },
     { "day": "Thursday",  "name": "_Thursday_group_quadrants",  "url": "./_Thursday_group_quadrants.geojson" },
     { "day": "Friday",    "name": "_Friday_group_quadrants",    "url": "./_Friday_group_quadrants.geojson" },
     { "day": "Saturday",  "name": "_Saturday_group_quadrants",  "url": "./_Saturday_group_quadrants.geojson" }
   ],
+  "layersSubquadrants": [
+    { "day": "Wednesday", "name": "_Wednesday_subquadrants",           "url": "./_Wednesday_subquadrants.geojson" },
+    { "day": "Thursday",  "name": "_Thursday_group_subquadrants",      "url": "./_Thursday_group_subquadrants.geojson" },
+    { "day": "Friday",    "name": "_Friday_group_subquadrants",        "url": "./_Friday_group_subquadrants.geojson" },
+    { "day": "Saturday",  "name": "_Saturday_group__subquadrants",     "url": "./_Saturday_group__subquadrants.geojson" }
+  ],
 
-  "fields": {
-    "key": "zone key",
-    "day": "Zone",
-    "muni": "Municipality"
-  },
+  "fields": { "key": "zone key", "day": "Zone", "muni": "Municipality" },
 
   "style": {
     "unselectedMode": "dim",
@@ -43,23 +44,12 @@
       "Saturday":  { "fill": "#ffff66", "fillOpacity": 0.39, "stroke": "#cccc00" }
     },
     "customers": {
-      "radius": 9,
-      "stroke": "#111",
-      "fill": "#ffffff",
-      "weightPx": 2,
-      "opacity": 0.95,
-      "fillOpacity": 0.95,
+      "radius": 9, "stroke": "#111", "fill": "#ffffff", "weightPx": 2,
+      "opacity": 0.95, "fillOpacity": 0.95,
       "outside": { "stroke": "#7a7a7a", "fill": "#c7c7c7", "opacity": 0.8, "fillOpacity": 0.6 }
     }
   },
 
-  "drivers": {
-    "enabled": true,
-    "strokeWeightPx": 3,
-    "fillOpacity": 0.15,
-    "dashArray": "6 4",
-    "labelClass": "lbl dim"
-  },
-
+  "drivers": { "enabled": true, "strokeWeightPx": 3, "fillOpacity": 0.15, "dashArray": "6 4", "labelClass": "lbl dim" },
   "behavior": { "autoZoom": true, "refreshSeconds": 0 }
 }
