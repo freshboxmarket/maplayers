@@ -898,13 +898,12 @@
           `Apts: ${s.apartments || 0}`
         ].forEach(t => { ctx.fillText(t, x, y); y += lineH * 1.0; });
 
-        // POST PNG to Apps Script receiver
+        // POST PNG to Apps Script receiver — use no-cors and NO headers (avoid preflight)
         const png = canvas.toDataURL('image/png');
         if (cbUrl) {
           await fetch(cbUrl, {
             method: 'POST',
-            mode: 'cors',
-            headers: { 'Content-Type': 'application/json' },
+            mode: 'no-cors',
             body: JSON.stringify({
               name: it.outName || (it.driver + '_' + it.day + '.png'),
               day: it.day,
