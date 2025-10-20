@@ -231,7 +231,7 @@
   function trySumExpression(s){
     if (!s) return null;
     const t = String(s).trim();
-    // support "12+1", "12 + 1", "12.5+1.25", ignore stray text
+    // support "12+1", "12 + 1", "12.5+1.25"
     if (!/[+\d]/.test(t)) return null;
     const parts = t.replace(/[^0-9.+-]/g,'').split('+').map(x=>x.trim()).filter(Boolean);
     if (parts.length < 2) return null;
@@ -241,7 +241,7 @@
       if (Number.isFinite(n)) { sum += n; any = true; }
       else return null;
     }
-    return any ? (Number.isInteger(sum) ? String(sum) : String(sum)) : null;
+    return any ? String(sum) : null;
   }
   function normalizeQty(s){
     const str = stringifyStat(s);
@@ -831,14 +831,6 @@
       if (hasCoords || hasNote) return i;
     }
     return -1;
-  }
-  function headerIndexMap(hdrRow, schema) {
-    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-    aconst wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
-    const idx = (name) => Array.isArray(hdrRow)
-      ? hdrRow.findIndex(h => (h||'').toLowerCase() === name)
-      : -1;
-    return { coords: idx(wantCoords), note: idx(wantNote) };
   }
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
