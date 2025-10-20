@@ -81,6 +81,15 @@
   if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
   if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
 
+  // 👇 Guard to explain "empty app" if nothing loaded
+  try {
+    const _totalFeatures = [...baseDayLayers, ...quadDayLayers, ...subqDayLayers]
+      .reduce((acc,e) => acc + (e.features?.length || 0), 0);
+    if (_totalFeatures === 0) {
+      renderError('No polygon features loaded. Check cfg.layers URLs (CORS/404) or the GeoJSON format.');
+    }
+  } catch {}
+
   // Optional boundary mask
   try {
     if (L.TileLayer?.boundaryCanvas && boundaryFeatures.length) {
@@ -279,7 +288,7 @@
   }
   function getStatsTexts(statsObj) {
     const s = statsObj || {};
-    const baseTxt = normalizeQty(findByKeywords(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes);
+       const baseTxt = normalizeQty(findByKeywords(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes);
     const custTxt = normalizeQty(findByKeywords(s, 'custom')      || s.customsText || s.customs);
     const addTxt  = normalizeQty(findByKeywords(s, 'addon')       || s.addOnsText  || s.addOns || s.add_ons);
     return { baseTxt, custTxt, addTxt };
@@ -833,7 +842,7 @@
     return -1;
   }
 
-  // ✅ Correct, in-scope version (fixes the aconst → const bug and removes duplication)
+  // ✅ Correct, in-scope version
   function headerIndexMap(hdrRow, schema) {
     const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
     const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
@@ -842,6 +851,8 @@
       : -1;
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
+  // Also publish globally for compatibility with any external callers:
+  try { window.headerIndexMap = window.headerIndexMap || headerIndexMap; } catch {}
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
   function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
@@ -935,7 +946,7 @@
       for (let r = headerIndex + 1; r < rows.length; r++) {
         const row = rows[r] || [];
         const dn = (row[driverCol] || '').trim();
-        const ks = (row[keysCol]   || '').trim();
+               const ks = (row[keysCol]   || '').trim();
         if (!dn || !ks) continue;
         if (!looksLikeName(dn)) continue;
         splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
@@ -1607,4 +1618,14 @@ function extractDriveFolderId(str){
   if (/^[A-Za-z0-9_-]{10,}$/.test(str)) return str;
   return '';
 }
+
+// Restore global for compatibility with any other pages/scripts:
+window.headerIndexMap = window.headerIndexMap || function headerIndexMap(hdrRow, schema) {
+  const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+  const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+  const idx = (name) => Array.isArray(hdrRow)
+    ? hdrRow.findIndex(h => (h || '').toLowerCase() === name)
+    : -1;
+  return { coords: idx(wantCoords), note: idx(wantNote) };
+};
 </script>
