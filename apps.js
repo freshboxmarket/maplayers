@@ -1228,6 +1228,14 @@
   }
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
+
+  // Collect a de-duplicated list of all zone keys across batch items
+  function unionAllKeys(items){
+    const set = new Set();
+    (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k))));
+    return Array.from(set);
+  }
+
   function normalizeKey(s) {
     s = String(s || '').trim().toUpperCase();
     const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
@@ -1383,6 +1391,20 @@
     let h=0; const s=65, l=50; const str = String(name||'');
     for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
     return `hsl(${h}, ${s}%, ${l}%)`;
+  }
+
+  // Download fallback for local save when no cbUrl or upload fails
+  function downloadFallback(dataUrl, name){
+    try{
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = name || 'snapshot.png';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(()=>a.remove(), 0);
+    }catch(e){
+      console.warn('downloadFallback failed:', e);
+    }
   }
 
 })().catch(e => {
