@@ -44,7 +44,7 @@
   const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
   const base = L.tileLayer(osmTiles, {
     attribution: '&copy; OpenStreetMap contributors',
-    crossOrigin: true // NEW: required for canvas export (leaflet-image)
+    crossOrigin: true // required for canvas export (leaflet-image)
   }).addTo(map);
   try {
     const el = base.getContainer?.();
@@ -856,9 +856,20 @@
         await applySelection();
         await loadCustomersIfAny();
 
-        // Fit and settle
-        if (selectionBounds) map.fitBounds(selectionBounds.pad(0.08));
-        await new Promise(r => setTimeout(r, 400));
+        // --- NEW: per-item view frame (pad + zoom clamp)
+        const v = it.view || {};
+        const pad = (typeof v.padPct === 'number') ? v.padPct : 0.10;
+
+        if (selectionBounds) map.fitBounds(selectionBounds.pad(pad));
+        else if (allBounds)  map.fitBounds(allBounds.pad(pad));
+
+        // Allow Leaflet to compute zoom, then clamp if requested
+        await settle(120);
+        try {
+          if (typeof v.maxZoom === 'number' && map.getZoom() > v.maxZoom) map.setZoom(v.maxZoom);
+          if (typeof v.minZoom === 'number' && map.getZoom() < v.minZoom) map.setZoom(v.minZoom);
+        } catch {}
+        await settle(300);
 
         // Render to canvas (leaflet-image)
         const canvas = await new Promise((resolve, reject) =>
@@ -870,18 +881,18 @@
         // Stat card overlay (compact, legible)
         const ctx = canvas.getContext('2d');
         const w = canvas.width, h = canvas.height;
-        const pad = Math.round(Math.min(w, h) * 0.02);
+        const padPx = Math.round(Math.min(w, h) * 0.02);
         const boxW = Math.min(Math.round(w * 0.5), 620);
         const lineH = Math.round(Math.min(w, h) * 0.03);
-        const boxH = lineH * 6 + pad * 2;
+        const boxH = lineH * 6 + padPx * 2;
 
         ctx.fillStyle = 'rgba(255,255,255,0.92)';
-        roundRect(ctx, w - boxW - pad, pad, boxW, boxH, 10).fill();
+        roundRect(ctx, w - boxW - padPx, padPx, boxW, boxH, 10).fill();
 
         ctx.fillStyle = '#111';
         ctx.font = 'bold ' + (lineH * 0.9) + 'px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-        const x = w - boxW - pad + pad;
-        let y = pad + lineH;
+        const x = w - boxW - padPx + padPx;
+        let y = padPx + lineH;
 
         const title = `${it.day} — ${it.driver}`;
         ctx.fillText(title, x, y); y += lineH * 1.1;
@@ -1165,6 +1176,9 @@
     for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
     return `hsl(${h}, ${s}%, ${l}%)`;
   }
+
+  // Small settle helper for map transitions
+  function settle(ms=300){ return new Promise(r => setTimeout(r, ms)); }
 
 })().catch(e => {
   const el = document.getElementById('error');
