@@ -1,19 +1,10 @@
-/* apps.js — manual route viewer + bottom banner + framed snapshots
-   ----------------------------------------------------------------
-   What’s new:
-   • Bottom-center dispatch banner (3 rows, bold labels). Accepts rich text:
-       stats.baseBoxesText, stats.customsText, stats.addOnsText
-     Falls back to stats.baseBoxes / stats.customs / stats.addOns (numbers).
-   • Two-step “Snap”:
-       1) Click once → shows resizable frame, Snap button turns red, helper text appears.
-       2) Click Snap again → captures exactly the framed area (DOM-first via html2canvas;
-          auto-fallback to leaflet-image for map), flashes, uploads to Apps Script (or downloads).
-   • Keeps your existing map, layers, CSV selection, driver overlays, manual flow.
-
-   URL flags:
-   • manual=1  → force toolbar/manual controls (default if batch present)
-   • auto=1    → run legacy auto-export loop
-   • cbAck=1   → expect JSON ack ({ok, webViewLink, fileId, folder}) from Apps Script
+/* apps.js — manual route viewer + bottom banner + framed snapshots (vNext)
+   -----------------------------------------------------------------------
+   Key upgrades:
+   • Next/Prev cycles: overview → 1 → … → n → overview (Prev reverse)
+   • Draggable dispatch banner, starts ~78% down; accepts rich text fields with smart fallbacks
+   • Two-step Snap (frame → capture): DOM-first via html2canvas with Leaflet fallback
+   • Fixed TDZ errors (“Cannot access 'snapEls' / 'snapArmed' before initialization”)
 */
 
 (async function () {
@@ -37,13 +28,18 @@
 
   // ---------- runtime state ----------
   let batchItems = parseBatchItems(batchParam); // [{name, day, driver, keys[], stats, outName, view?}]
-  let currentIndex = -1;         // -1 = overview (all routes)
-  let statsVisible = false;      // banner toggle
-  let manualSelectedKeys = null; // overrides selection when set
-  let runtimeCustEnabled = null; // null=open cfg; true=force on; false=force off
+  // cycle index: -1 = overview; [0..n-1] = focused routes
+  let currentIndex = -1;
+  let statsVisible = false;
+  let manualSelectedKeys = null;
+  let runtimeCustEnabled = null;
 
   let activeAssignMap = { ...assignMapParam };
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
+
+  // --- SNAPSHOT STATE DECLARED EARLY TO AVOID TDZ ---
+  let snapArmed = false;
+  let snapEls = null; // {overlay, helper, frame, flash, toast}
 
   // ---------- map init ----------
   phase('Loading config…');
@@ -58,7 +54,6 @@
   const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
   const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
   const base = L.tileLayer(osmTiles, { attribution: '&copy; OpenStreetMap contributors', crossOrigin: true }).addTo(map);
-  try { const el = base.getContainer?.(); if (el) el.style.filter = 'grayscale(1)'; } catch {}
 
   // ---------- collections / state ----------
   const baseDayLayers = [], quadDayLayers = [], subqDayLayers = [], allDaySets=[baseDayLayers,quadDayLayers,subqDayLayers];
@@ -66,7 +61,7 @@
 
   const boundaryFeatures = [];
   const customerLayer = L.layerGroup().addTo(map);
-  const customerMarkers = [];   // [{ marker, lat, lng, visible:bool }]
+  const customerMarkers = [];
   let customerCount=0, custWithinSel=0, custOutsideSel=0;
   const custByDayInSel = { Wednesday:0, Thursday:0, Friday:0, Saturday:0 };
 
@@ -78,7 +73,6 @@
   let selectedOrderedKeys = [];
   let visibleSelectedKeysSet = new Set();
 
-  // Render empty panels first
   renderLegend(cfg, null, custWithinSel, custOutsideSel, false);
   renderDriversPanel([], {}, false, {}, 0);
 
@@ -129,11 +123,12 @@
       .route-toolbar button:hover{opacity:1}
       .route-toolbar button.armed{background:#c62828}
 
-      /* bottom-center banner */
-      .dispatch-banner{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);z-index:8500;
+      /* draggable banner (starts ~78% down) */
+      .dispatch-banner{position:fixed;left:50%;top:78vh;transform:translateX(-50%);z-index:8500;cursor:grab;
         background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);
         border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);
         padding:10px 14px;max-width:min(80vw,1100px);display:none}
+      .dispatch-banner.dragging{cursor:grabbing; user-select:none}
       .dispatch-banner.visible{display:block}
       .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word}
       .dispatch-banner .row strong{font-weight:700}
@@ -164,31 +159,33 @@
     const bar = document.createElement('div');
     bar.className = 'route-toolbar';
     bar.innerHTML = `
-      <button id="btnPrev" title="Previous route" aria-label="Previous route">◀ Prev</button>
-      <button id="btnNext" title="Next route" aria-label="Next route">Next ▶</button>
+      <button id="btnPrev" title="Previous (overview ↔ routes)" aria-label="Previous route">◀ Prev</button>
+      <button id="btnNext" title="Next (overview ↔ routes)" aria-label="Next route">Next ▶</button>
       <button id="btnStats" title="Toggle dispatch banner" aria-label="Toggle stats">Stats</button>
       <button id="btnSnap"  title="Frame & capture snapshot" aria-label="Snapshot">📸 Snap</button>
     `;
     document.body.appendChild(bar);
 
-    // Bottom banner (DOM preview; snapshot draws a matching banner on canvas)
+    // Banner
     const banner = document.createElement('div');
     banner.id = 'dispatchBanner';
     banner.className = 'dispatch-banner';
     banner.innerHTML = `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
     document.body.appendChild(banner);
+    restoreBannerPos(banner);
+    makeBannerDraggable(banner);
 
     // Wire buttons
-    document.getElementById('btnPrev').addEventListener('click', async () => { await stepRoute(-1); });
-    document.getElementById('btnNext').addEventListener('click', async () => { await stepRoute(+1); });
+    document.getElementById('btnPrev').addEventListener('click', async () => { await stepRouteCycle(-1); });
+    document.getElementById('btnNext').addEventListener('click', async () => { await stepRouteCycle(+1); });
     document.getElementById('btnStats').addEventListener('click', () => toggleStats());
     document.getElementById('btnSnap').addEventListener('click', onSnapClick);
 
-    // keyboard niceties
+    // keyboard
     window.addEventListener('keydown', async (e)=>{
       if (!batchItems.length) return;
-      if (e.key === 'ArrowRight') { e.preventDefault(); await stepRoute(+1); }
-      else if (e.key === 'ArrowLeft') { e.preventDefault(); await stepRoute(-1); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); await stepRouteCycle(+1); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); await stepRouteCycle(-1); }
       else if (e.key.toLowerCase() === 's') { e.preventDefault(); toggleStats(); }
       else if (e.key === 'Escape') { cancelFraming(); }
     });
@@ -200,19 +197,31 @@
     statsVisible = !statsVisible;
     const banner = document.getElementById('dispatchBanner');
     if (!banner) return;
-    if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
+    banner.classList.toggle('visible', statsVisible);
+  }
+
+  function getStatsTexts(statsObj) {
+    const s = statsObj || {};
+    const firstNonEmpty = (...cands) => {
+      for (const c of cands) {
+        if (c === null || c === undefined) continue;
+        const v = typeof c === 'string' ? c : (typeof c === 'number' ? String(c) : Array.isArray(c) ? c.join(' | ') : (typeof c === 'object' ? Object.values(c).join(' | ') : ''));
+        if (String(v).trim().length) return String(v);
+      }
+      return '0';
+    };
+    return {
+      baseTxt: firstNonEmpty(s.baseBoxesText, s.baseText, s.base, s.baseBoxesString, s.baseBoxes, s.base_boxes, s.baseboxes),
+      custTxt: firstNonEmpty(s.customsText,   s.customText, s.customs, s.custom_boxes, s.customBoxes),
+      addTxt:  firstNonEmpty(s.addOnsText,    s.addOns, s.addonsText, s.addons, s.add_ons)
+    };
   }
 
   function renderDispatchBanner(it){
     const banner = document.getElementById('dispatchBanner'); if (!banner) return;
     if (!it) { banner.classList.remove('visible'); return; }
     const s = it?.stats || {};
-    const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
-                  : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
-    const custTxt = (s.customsText   != null) ? String(s.customsText)
-                  : (s.customs   != null)     ? String(s.customs)   : '0';
-    const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
-                  : (s.addOns    != null)     ? String(s.addOns)    : '0';
+    const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
 
     const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
     const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
@@ -221,20 +230,14 @@
     banner.querySelector('.r1').innerHTML = row1;
     banner.querySelector('.r2').innerHTML = row2;
     banner.querySelector('.r3').innerHTML = row3;
-
-    if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
+    if (statsVisible) banner.classList.add('visible');
   }
 
   // Canvas banner (for saved PNG)
   function drawBannerOntoCanvas(canvas, it){
     if (!it) return;
     const s = it?.stats || {};
-    const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
-                  : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
-    const custTxt = (s.customsText   != null) ? String(s.customsText)
-                  : (s.customs   != null)     ? String(s.customs)   : '0';
-    const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
-                  : (s.addOns    != null)     ? String(s.addOns)    : '0';
+    const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
 
     const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
     const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
@@ -247,11 +250,8 @@
     const lineH = Math.max(16, Math.round(Math.min(W,H)*0.027));
 
     const lines = [row1,row2,row3];
-    ctx.font = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    ctx.fillStyle='#111';
-
-    // measure wrapped lines to compute banner height
-    let wrapped = [];
+    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
     const wrap = (text, font) => {
       ctx.font = font;
       const words = text.split(/\s+/);
@@ -264,19 +264,14 @@
       if (cur) out.push(cur);
       return out;
     };
-
-    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    wrapped = [
-      ...wrap(lines[0], fBold),
-      ...wrap(lines[1], fNorm),
-      ...wrap(lines[2], fNorm)
-    ];
+    const wrapped = [...wrap(lines[0], fBold), ...wrap(lines[1], fNorm), ...wrap(lines[2], fNorm)];
     const totalLines = wrapped.length;
     const boxW = maxW;
     const boxH = pad*2 + totalLines*lineH + Math.round(lineH*0.2);
+
+    // Draw near bottom-center (not at the very bottom)
     const x = Math.round((W - boxW)/2);
-    const y = H - boxH - pad;
+    const y = Math.round(H - boxH - Math.max(pad*2, H*0.12));
 
     // background
     ctx.fillStyle = 'rgba(255,255,255,0.92)';
@@ -285,12 +280,11 @@
     // text
     let yy = y + pad + lineH;
     ctx.fillStyle='#111';
-    let cursor = 0;
-    const L0 = wrap(lines[0], fBold).length;
     ctx.font = fBold;
-    for (let i=0;i<L0;i++) { ctx.fillText(wrapped[cursor++], x+pad, yy); yy += lineH; }
+    const L0 = wrap(lines[0], fBold).length;
+    for (let i=0;i<L0;i++) { ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
     ctx.font = fNorm;
-    for (;cursor<wrapped.length;cursor++){ ctx.fillText(wrapped[cursor], x+pad, yy); yy += lineH; }
+    for (let i=L0;i<wrapped.length;i++){ ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
   }
 
   function roundRect(ctx, x, y, w, h, r) {
@@ -304,7 +298,7 @@
     return ctx;
   }
 
-  // ---------- Zoom helper with hints ----------
+  // ---------- Zoom helpers ----------
   function fitWithHints(bounds, hints){
     try{
       const padPct = Math.max(0, Math.min(0.25, (hints && hints.padPct) || 0.10));
@@ -317,12 +311,22 @@
     }catch(e){}
   }
 
-  async function stepRoute(delta){
-    if (!batchItems.length) return;
+  async function stepRouteCycle(delta){
+    // delta: +1 next, -1 prev; cycle includes overview as a step
+    const N = batchItems.length;
+    if (!N) return;
 
-    if (currentIndex === -1 && delta > 0) currentIndex = 0;
-    else if (currentIndex === -1 && delta < 0) currentIndex = batchItems.length - 1;
-    else currentIndex = (currentIndex + delta + batchItems.length) % batchItems.length;
+    if (delta > 0) {
+      if (currentIndex === -1) currentIndex = 0;            // overview -> first
+      else if (currentIndex === N - 1) currentIndex = -1;   // last -> overview
+      else currentIndex += 1;                                // otherwise next
+    } else {
+      if (currentIndex === -1) currentIndex = N - 1;        // overview -> last
+      else if (currentIndex === 0) currentIndex = -1;       // first -> overview
+      else currentIndex -= 1;                                // otherwise prev
+    }
+
+    if (currentIndex === -1) { await zoomToOverview(); return; }
 
     const it = batchItems[currentIndex];
     manualSelectedKeys = (it.keys || []).map(normalizeKey);
@@ -331,7 +335,6 @@
     await loadCustomersIfAny();
 
     if (selectionBounds) fitWithHints(selectionBounds, (it && it.view) || null);
-
     renderDispatchBanner(it);
     updateButtons();
   }
@@ -341,7 +344,6 @@
     manualSelectedKeys = unionAllKeys(batchItems);
     runtimeCustEnabled = false; // hide customers
     statsVisible = false; renderDispatchBanner(null);
-
     await applySelection();
     await loadCustomersIfAny();
     if (selectionBounds) fitWithHints(selectionBounds, null);
@@ -363,11 +365,9 @@
   // =================================================================
   // SNAPSHOT: frame → capture (DOM-first), flash, upload
   // =================================================================
-  let snapArmed = false;
-  let snapEls = null; // {overlay, helper, frame, flash, toast}
-
   function ensureSnapshotUi(){
     if (snapEls) return;
+
     const overlay = document.createElement('div');
     overlay.className = 'snap-overlay'; overlay.style.display='none';
     overlay.innerHTML = `
@@ -384,8 +384,6 @@
     const toast = document.createElement('div'); toast.className='snap-toast'; document.body.appendChild(toast);
 
     snapEls = { overlay, helper: overlay.querySelector('.helper'), frame: overlay.querySelector('.frame'), flash, toast };
-
-    // Drag & resize
     bindFramingGestures(snapEls.frame);
   }
 
@@ -395,32 +393,34 @@
     const l = Math.round((vw - w)/2), t = Math.round((vh - h)/2);
     setFrameRect(l,t,w,h);
   }
-
   function setFrameRect(l,t,w,h){
     const f = snapEls.frame;
     Object.assign(f.style, { left: `${clamp(l,0,window.innerWidth-20)}px`, top: `${clamp(t,0,window.innerHeight-20)}px`,
       width: `${Math.max(40, Math.min(w, window.innerWidth))}px`, height: `${Math.max(40, Math.min(h, window.innerHeight))}px` });
   }
-
   function getFrameRect(){
     const f = snapEls.frame.getBoundingClientRect();
     return { left: Math.round(f.left), top: Math.round(f.top), width: Math.round(f.width), height: Math.round(f.height) };
   }
 
-  function onSnapClick(){
+  async function onSnapClick(){
     if (!batchItems.length || currentIndex < 0) return;
     const btn = document.getElementById('btnSnap');
     if (!snapArmed){
-      // Enter framing
       ensureSnapshotUi(); defaultFrame();
       snapEls.overlay.style.display='block';
       snapEls.helper.style.display='block';
       btn.classList.add('armed'); btn.setAttribute('aria-label','Capture framed snapshot');
       snapArmed = true;
     } else {
-      // Capture
-      performCapture().catch(e=>showToast(`Capture failed — ${String(e&&e.message||e)}`))
-        .finally(()=>{ exitFraming(); });
+      try{
+        await ensureLibs(); // make sure html2canvas / leaflet-image exist
+        await performCapture();
+      } catch (e) {
+        showToast(`Capture failed — ${String(e && e.message || e)}`);
+      } finally {
+        exitFraming();
+      }
     }
   }
 
@@ -429,7 +429,6 @@
     exitFraming();
     showToast('Framing cancelled.');
   }
-
   function exitFraming(){
     const btn = document.getElementById('btnSnap');
     if (btn) { btn.classList.remove('armed'); btn.setAttribute('aria-label','Frame & capture snapshot'); }
@@ -439,7 +438,6 @@
 
   function bindFramingGestures(frameEl){
     let mode=null, start={x:0,y:0,l:0,t:0,w:0,h:0}, dir=null;
-
     const onDown = (e, d) => {
       e.preventDefault();
       mode = d ? 'resize' : 'move';
@@ -449,16 +447,12 @@
       window.addEventListener('pointermove', onMove, {passive:false});
       window.addEventListener('pointerup', onUp, {once:true});
     };
-
     const onMove = (e) => {
       e.preventDefault();
       const dx = e.clientX - start.x, dy = e.clientY - start.y;
       let l=start.l, t=start.t, w=start.w, h=start.h;
-      if (mode==='move'){
-        l = clamp(start.l + dx, 0, window.innerWidth  - w);
-        t = clamp(start.t + dy, 0, window.innerHeight - h);
-      } else {
-        // resize by dir
+      if (mode==='move'){ l = clamp(start.l + dx, 0, window.innerWidth  - w); t = clamp(start.t + dy, 0, window.innerHeight - h); }
+      else {
         if (dir.includes('e')) w = clamp(start.w + dx, 40, window.innerWidth);
         if (dir.includes('s')) h = clamp(start.h + dy, 40, window.innerHeight);
         if (dir.includes('w')) { l = clamp(start.l + dx, 0, start.l + start.w - 40); w = clamp(start.w - dx, 40, window.innerWidth); }
@@ -466,22 +460,9 @@
       }
       setFrameRect(l,t,w,h);
     };
-
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove, {passive:false});
-    };
-
-    // Move
-    frameEl.addEventListener('pointerdown', (e)=>{
-      const target = e.target;
-      if (target.classList.contains('handle')) return; // handled below
-      onDown(e, null);
-    });
-
-    // Handles
-    frameEl.querySelectorAll('.handle').forEach(h => {
-      h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir')));
-    });
+    const onUp = () => { window.removeEventListener('pointermove', onMove, {passive:false}); };
+    frameEl.addEventListener('pointerdown', (e)=>{ if (!e.target.classList.contains('handle')) onDown(e, null); });
+    frameEl.querySelectorAll('.handle').forEach(h => h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir'))));
   }
 
   async function performCapture(){
@@ -489,25 +470,22 @@
     if (!it) throw new Error('No focused route to capture.');
     const r = getFrameRect();
 
-    // Try DOM-first capture (html2canvas must be loaded and CORS-safe)
+    // DOM-first capture
     let canvas = null;
     if (window.html2canvas) {
       try{
         canvas = await html2canvas(document.body, {
-          useCORS: true,
-          backgroundColor: null,
+          useCORS: true, backgroundColor: null,
           x: r.left, y: r.top, width: r.width, height: r.height,
           windowWidth: document.documentElement.clientWidth,
           windowHeight: document.documentElement.clientHeight,
           scrollX: 0, scrollY: 0
         });
-      } catch (e) {
-        console.warn('html2canvas failed, will try leaflet-image fallback:', e);
-      }
+      } catch (e) { console.warn('html2canvas failed; falling back to leaflet-image:', e); }
     }
 
+    // Fallback: map-only + banner draw
     if (!canvas) {
-      // Fallback: map-only render then crop to intersecting area; draw banner ourselves.
       if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
       const mapRect = document.getElementById('map').getBoundingClientRect();
       const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
@@ -521,21 +499,13 @@
       const out = document.createElement('canvas'); out.width = sw; out.height = sh;
       out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
-      // If banner visible, draw it into the cropped canvas
       if (statsVisible) drawBannerOntoCanvas(out, it);
-
       canvas = out;
-    } else {
-      // DOM path: if banner is toggled off, still mirror behavior by drawing banner when visible only.
-      if (statsVisible) {
-        // The DOM render already includes the banner. Nothing extra to do.
-      }
     }
 
-    // Flash + upload
     flash();
     const png = canvas.toDataURL('image/png');
-    const name = it.outName || `${it.driver}_${it.day}.png`;
+    const name = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
     await uploadOrDownload(png, name, it);
   }
 
@@ -549,19 +519,10 @@
   }
 
   async function uploadOrDownload(pngDataUrl, name, it){
-    if (!cbUrl) {
-      downloadFallback(pngDataUrl, name);
-      showToast(`Saved locally as ${escapeHtml(name)}.`);
-      return;
-    }
+    if (!cbUrl) { downloadFallback(pngDataUrl, name); showToast(`Saved locally as ${escapeHtml(name)}.`); return; }
     try{
       const body = JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: pngDataUrl });
-      const res = await fetch(cbUrl, {
-        method: 'POST',
-        mode: cbAck ? 'cors' : 'no-cors',
-        headers: cbAck ? {'Content-Type':'application/json'} : undefined,
-        body
-      });
+      const res = await fetch(cbUrl, { method:'POST', mode: cbAck?'cors':'no-cors', headers: cbAck?{'Content-Type':'application/json'}:undefined, body });
       if (cbAck) {
         const j = await res.json().catch(()=>null);
         if (j && j.ok) {
@@ -578,28 +539,25 @@
     }
   }
 
-  function flash(){
-    if (!snapEls) return;
-    snapEls.flash.classList.add('active');
-    setTimeout(()=>snapEls.flash.classList.remove('active'), 200);
-  }
-
-  function showToast(html){
-    if (!snapEls) return;
-    const t = snapEls.toast;
-    t.innerHTML = html;
-    t.style.display='block';
-    clearTimeout(t._tmr);
-    t._tmr = setTimeout(()=>{ t.style.display='none'; }, 4200);
-  }
-
+  function flash(){ if (!snapEls) return; snapEls.flash.classList.add('active'); setTimeout(()=>snapEls.flash.classList.remove('active'), 200); }
+  function showToast(html){ if (!snapEls) return; const t = snapEls.toast; t.innerHTML = html; t.style.display='block'; clearTimeout(t._tmr); t._tmr = setTimeout(()=>{ t.style.display='none'; }, 4200); }
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+  const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
+
+  // Load libs on demand if missing (DOM-first capture prefers html2canvas)
+  async function ensureLibs(){
+    const loadScript = (src) => new Promise((resolve, reject) => {
+      if ([...document.scripts].some(s => s.src && s.src.includes(src))) return resolve();
+      const el = document.createElement('script'); el.src = src; el.onload = resolve; el.onerror = reject; document.head.appendChild(el);
+    });
+    if (!window.html2canvas) await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
+    if (!window.leafletImage) await loadScript('https://unpkg.com/leaflet-image/leaflet-image.js');
+  }
 
   // =================================================================
   // Optional: legacy auto-export (only if auto=1 in URL)
   // =================================================================
   async function runAutoExport(items){
-    // hide side panels for clean snapshots
     const ids=['legend','drivers','status','error'];
     ids.forEach(id=>{ const n=document.getElementById(id); if(n) n.style.display='none'; });
 
@@ -613,12 +571,12 @@
         if (selectionBounds) fitWithHints(selectionBounds, (it && it.view) || null);
         await sleep(350);
 
+        if (!window.leafletImage) await ensureLibs();
         const canvas = await new Promise((resolve, reject) =>
-          window.leafletImage ? leafletImage(map, (err, c) => (err ? reject(err) : resolve(c)))
-                              : reject(new Error('leaflet-image not loaded')));
-        if (statsVisible) drawBannerOntoCanvas(canvas, it); // auto mode: include if visible
+          leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
+        if (statsVisible) drawBannerOntoCanvas(canvas, it);
         const png = canvas.toDataURL('image/png');
-        const name = it.outName || `${it.driver}_${it.day}.png`;
+        const name = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
         if (cbUrl) {
           await fetch(cbUrl, { method:'POST', mode: cbAck?'cors':'no-cors', headers: cbAck?{'Content-Type':'application/json'}:undefined,
             body: JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png }) });
@@ -628,7 +586,7 @@
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — (unchanged behavior)
+  // LOADERS / SELECTION / CUSTOMERS — (kept, with minor hardening)
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
@@ -869,12 +827,8 @@
     const turfOn = (typeof turf !== 'undefined');
     const cst = cfg.style?.customers || {};
     const outStyle = {
-      radius: cst.radius || 9,
-      color:  '#7a7a7a',
-      weight: cst.weightPx || 2,
-      opacity: 0.8,
-      fillColor: '#c7c7c7',
-      fillOpacity: 0.6
+      radius: cst.radius || 9, color:  '#7a7a7a', weight: cst.weightPx || 2, opacity: 0.8,
+      fillColor: '#c7c7c7', fillOpacity: 0.6
     };
 
     const onlySelectedCustomers = manualMode && (currentIndex >= 0);
@@ -918,12 +872,8 @@
 
       if (onlySelectedCustomers && !insideSel) show = false;
 
-      if (insideSel) {
-        inSel++;
-        if (selDay && custByDayInSel[selDay] != null) custByDayInSel[selDay] += 1;
-      } else {
-        outSel++;
-      }
+      if (insideSel) { inSel++; if (selDay && custByDayInSel[selDay] != null) custByDayInSel[selDay] += 1; }
+      else { outSel++; }
 
       if (show && !rec.visible) { customerLayer.addLayer(rec.marker); rec.visible = true; }
       else if (!show && rec.visible) { customerLayer.removeLayer(rec.marker); rec.visible = false; }
@@ -955,18 +905,12 @@
 
     const byDriver = new Map();
     coveragePolysSelected.forEach(rec => {
-      const key = rec.layerRef && rec.layerRef._routeKey;
-      if (!key) return;
-      const drv = lookupDriverForKey(key);
-      if (!drv) return;
-      if (!byDriver.has(drv)) byDriver.set(drv, []);
-      byDriver.get(drv).push(rec.layerRef._turfFeat);
+      const key = rec.layerRef && rec.layerRef._routeKey; if (!key) return;
+      const drv = lookupDriverForKey(key); if (!drv) return;
+      if (!byDriver.has(drv)) byDriver.set(drv, []); byDriver.get(drv).push(rec.layerRef._turfFeat);
     });
 
-    if (byDriver.size === 0) {
-      renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel);
-      return;
-    }
+    if (byDriver.size === 0) { renderDriversPanel(driverMeta, {}, false, driverSelectedCounts, custWithinSel); return; }
 
     byDriver.forEach((features, name) => {
       const meta = (driverMeta.find(d => (d.name || '').toLowerCase() === (name || '').toLowerCase())
@@ -986,8 +930,7 @@
       const group = L.featureGroup([halo, outline]).addTo(map);
       let labelMarker = null;
       try {
-        const b = outline.getBounds();
-        const center = b && b.getCenter ? b.getCenter() : null;
+        const b = outline.getBounds(); const center = b && b.getCenter ? b.getCenter() : null;
         if (center) {
           labelMarker = L.marker(center, { opacity: 0 })
             .bindTooltip(name, { permanent:true, direction:'center', className: (cfg.drivers?.labelClass || 'lbl dim') });
@@ -1100,21 +1043,20 @@
     const rows = allDriverNames.map(name => {
       const meta = metaByName.get(name.toLowerCase()) || { name, color: colorFromName(name) };
       const col = meta.color || '#888';
-      const safeName = escapeHtml(name || '');
+      const safe = escapeHtml(name || '');
       const isPresent = !!overlays?.[name];
       const onAttr = isPresent && defaultOn ? 'checked' : '';
       const count = typeof countsMap[name] === 'number' ? countsMap[name] : 0;
       const frac = `${count}/${totalSelected || 0}`;
       return `<div class="row">
-        <input type="checkbox" data-driver="${safeName}" aria-label="Toggle ${safeName}" ${onAttr} ${isPresent ? '' : 'disabled'}>
+        <input type="checkbox" data-driver="${safe}" aria-label="Toggle ${safe}" ${onAttr} ${isPresent ? '' : 'disabled'}>
         <span class="swatch" style="background:${col}; border-color:${col}"></span>
-        <div>${safeName}</div>
+        <div>${safe}</div>
         <div class="counts" style="margin-left:auto">${frac}</div>
       </div>`;
     }).join('');
 
     el.innerHTML = `<h4>Drivers</h4>${rows}`;
-
     el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
       const name = cb.getAttribute('data-driver');
       if (!overlays?.[name]) return;
@@ -1122,21 +1064,10 @@
       cb.addEventListener('change', (e) => toggleDriverOverlay(name, e.target.checked));
     });
   }
-
-  function toggleDriverOverlay(name, on) {
-    const rec = driverOverlays[name];
-    if (!rec) return;
-    if (on) {
-      rec.group.addTo(map);
-      try { if (rec.labelMarker) rec.labelMarker.openTooltip(); } catch{}
-    } else {
-      map.removeLayer(rec.group);
-    }
-  }
+  function toggleDriverOverlay(name, on) { const rec = driverOverlays[name]; if (!rec) return; if (on) { rec.group.addTo(map); try { if (rec.labelMarker) rec.labelMarker.openTooltip(); } catch{} } else { map.removeLayer(rec.group); } }
 
   function renderLegend(cfg, legendCounts, custIn, custOut, outsideToggle) {
     const el = document.getElementById('legend'); if (!el) return;
-
     const rowsHtml = (cfg.layers || []).map(Lcfg => {
       const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
       const c  = (legendCounts && legendCounts[Lcfg.day]) ? legendCounts[Lcfg.day] : { selected: 0, total: 0 };
@@ -1147,20 +1078,42 @@
         <div class="counts">${frac}</div>
       </div>`;
     }).join('');
-
     const custBlock = `<div class="row" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px">
         <div>Customers within selection:</div><div class="counts">${custIn ?? 0}</div>
       </div>
       <div class="row">
         <div>Customers outside selection:</div><div class="counts">${custOut ?? 0}</div>
       </div>`;
-
     const toggle = `<div class="row" style="margin-top:4px">
         <input type="checkbox" id="toggleOutside" ${outsideToggle ? 'checked' : ''} aria-label="Highlight outside customers">
         <div>Highlight outside customers</div>
       </div>`;
-
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}${toggle}`;
+  }
+
+  // ---------- banner drag helpers ----------
+  function makeBannerDraggable(el){
+    let dragging=false, start={x:0,y:0, left:0, top:0};
+    const onDown=(e)=>{ dragging=true; el.classList.add('dragging'); const r=el.getBoundingClientRect(); start={x:e.clientX,y:e.clientY,left:r.left,top:r.top}; window.addEventListener('pointermove',onMove,{passive:false}); window.addEventListener('pointerup',onUp,{once:true}); };
+    const onMove=(e)=>{ if(!dragging) return; e.preventDefault(); const dx=e.clientX-start.x, dy=e.clientY-start.y; let L = clamp(start.left+dx, 0, window.innerWidth - el.offsetWidth); let T = clamp(start.top +dy, 0, window.innerHeight- el.offsetHeight); el.style.left = `${L}px`; el.style.top = `${T}px`; el.style.transform=''; el.style.right='auto'; el.style.bottom='auto'; };
+    const onUp=()=>{ dragging=false; el.classList.remove('dragging'); saveBannerPos(el); window.removeEventListener('pointermove',onMove,{passive:false}); };
+    el.addEventListener('pointerdown', onDown);
+  }
+  function saveBannerPos(el){
+    const r = el.getBoundingClientRect();
+    sessionStorage.setItem('dispatchBannerPos', JSON.stringify({ left:r.left, top:r.top }));
+  }
+  function restoreBannerPos(el){
+    try{
+      const raw = sessionStorage.getItem('dispatchBannerPos');
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (typeof p.left === 'number' && typeof p.top === 'number') {
+        el.style.left = `${clamp(p.left,0,window.innerWidth - el.offsetWidth)}px`;
+        el.style.top  = `${clamp(p.top, 0,window.innerHeight- el.offsetHeight)}px`;
+        el.style.transform = '';
+      }
+    }catch{}
   }
 
   // ---------- helpers ----------
@@ -1228,13 +1181,7 @@
   }
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
-
-  // Collect a de-duplicated list of all zone keys across batch items
-  function unionAllKeys(items){
-    const set = new Set();
-    (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k))));
-    return Array.from(set);
-  }
+  function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
 
   function normalizeKey(s) {
     s = String(s || '').trim().toUpperCase();
@@ -1243,10 +1190,7 @@
     return s;
   }
   function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
-  function quadParts(key) {
-    const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/);
-    return m ? { quad: m[1], sub: m[2] || null } : null;
-  }
+  function quadParts(key) { const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/); return m ? { quad: m[1], sub: m[2] || null } : null; }
   function basePlusQuad(key) { const p = quadParts(key); return p ? (baseKeyFrom(key) + '_' + p.quad) : null; }
   function isSubquadrantKey(k) { const p = quadParts(k); return !!(p && p.sub); }
   function isQuadrantKey(k)    { const p = quadParts(k); return !!(p && !p.sub); }
@@ -1269,12 +1213,7 @@
   function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
   function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
 
-  function escapeHtml(s) {
-    return String(s || '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
+  function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 
   function smartTitleCase(s) {
     if (!s) return '';
@@ -1297,12 +1236,7 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
-  function showTopError(title, msg) {
-    const el = document.getElementById('error');
-    if (!el) return;
-    el.style.display = 'block';
-    el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`;
-  }
+  function showTopError(title, msg) { const el = document.getElementById('error'); if (!el) return; el.style.display = 'block'; el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`; }
   function renderError(msg) { showTopError('Load error', msg); }
   function phase(msg){ setStatus(`⏳ ${msg}`); }
   function info(msg){ setStatus(`ℹ️ ${msg}`); }
@@ -1311,9 +1245,7 @@
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
   function makeStatusLine(selMunis, inCount, outCount, activeKeysLowerArray) {
     const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
-    const keysTxt = (Array.isArray(activeKeysLowerArray) && activeKeysLowerArray.length)
-      ? activeKeysLowerArray.join(', ')
-      : '—';
+    const keysTxt = (Array.isArray(activeKeysLowerArray) && activeKeysLowerArray.length) ? activeKeysLowerArray.join(', ') : '—';
     return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList} • active zone keys: ${keysTxt}`;
   }
 
@@ -1335,8 +1267,9 @@
       const row = rows[i] || [];
       let d=-1, k=-1;
       for (let c=0;c<row.length;c++) {
-        if (d === -1 && isDriverHeader(row[c])) d = c;
-        if (k === -1 && isKeysHeader(row[c]))   k = c;
+        const cell=(row[c]||'');
+        if (d === -1 && isDriverHeader(cell)) d = c;
+        if (k === -1 && isKeysHeader(cell))   k = c;
       }
       if (d !== -1 && k !== -1) { headerIndex = i; driverCol = d; keysCol = k; break; }
     }
@@ -1386,32 +1319,15 @@
     }
     return out;
   }
+  function colorFromName(name) { let h=0; const s=65, l=50; const str = String(name||''); for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360; return `hsl(${h}, ${s}%, ${l}%)`; }
 
-  function colorFromName(name) {
-    let h=0; const s=65, l=50; const str = String(name||'');
-    for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
-    return `hsl(${h}, ${s}%, ${l}%)`;
-  }
-
-  // Download fallback for local save when no cbUrl or upload fails
   function downloadFallback(dataUrl, name){
-    try{
-      const a = document.createElement('a');
-      a.href = dataUrl;
-      a.download = name || 'snapshot.png';
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(()=>a.remove(), 0);
-    }catch(e){
-      console.warn('downloadFallback failed:', e);
-    }
+    try{ const a = document.createElement('a'); a.href = dataUrl; a.download = name || 'snapshot.png'; document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(), 0); }
+    catch(e){ console.warn('downloadFallback failed:', e); }
   }
 
 })().catch(e => {
   const el = document.getElementById('error');
-  if (el) {
-    el.style.display = 'block';
-    el.innerHTML = `<strong>Load error</strong><br>${String(e && e.message ? e.message : e)}`;
-  }
+  if (el) { el.style.display = 'block'; el.innerHTML = `<strong>Load error</strong><br>${String(e && e.message ? e.message : e)}`; }
   console.error(e);
 });
