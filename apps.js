@@ -27,11 +27,12 @@
   const cbUrl           = qs.get('cb') || '';
   const batchParam      = qs.get('batch'); // websafe b64 JSON
 
-  // Manual is the default when batch exists; pass &auto=1 to re-enable auto-export loop
-  const manualMode = !!batchParam && qs.get('auto') !== '1';
+  // Manual is the default when batch exists; pass &auto=1 to re-enable auto-export loop.
+  // Also honor explicit &manual=1.
+  const manualMode = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
 
   // Runtime state for manual controller
-  let batchItems = parseBatchItems(batchParam); // [{name, day, driver, keys[], stats, outName}]
+  let batchItems = parseBatchItems(batchParam); // [{name, day, driver, keys[], stats, outName, view?}]
   let currentIndex = -1;         // -1 = overview (all routes at once)
   let statsVisible = false;      // UI toggle
   let manualSelectedKeys = null; // overrides selection when set
@@ -110,8 +111,7 @@
   // ---- MANUAL CONTROLS (default when batch present) ----
   if (manualMode && batchItems.length) {
     injectManualUI();
-    // Overview view (index -1)
-    await zoomToOverview();
+    await zoomToOverview(); // index -1
   } else if (!manualMode && batchItems.length) {
     // optional: auto-export loop remains available by passing auto=1
     await runAutoExport(batchItems);
@@ -199,12 +199,25 @@
     if (statsVisible) card.classList.add('visible'); else card.classList.remove('visible');
   }
 
+  // Fit + clamp using optional per-item view hints {padPct, minZoom, maxZoom}
+  function fitWithHints(bounds, hints){
+    try{
+      const padPct = Math.max(0, Math.min(0.25, (hints && hints.padPct) || 0.10));
+      map.fitBounds(bounds.pad(padPct));
+      const minZ = (hints && Number(hints.minZoom)) || 7;
+      const maxZ = (hints && Number(hints.maxZoom)) || 11;
+      const z = map.getZoom();
+      if (z > maxZ) map.setZoom(maxZ);
+      if (z < minZ) map.setZoom(minZ);
+    }catch(e){}
+  }
+
   async function stepRoute(delta){
     if (!batchItems.length) return;
 
-    // From overview (-1), Next focuses index 0
+    // From overview (-1), Next focuses index 0; Prev from overview wraps to last
     if (currentIndex === -1 && delta > 0) currentIndex = 0;
-    else if (currentIndex === -1 && delta < 0) currentIndex = batchItems.length - 1; // wrap to last
+    else if (currentIndex === -1 && delta < 0) currentIndex = batchItems.length - 1;
     else currentIndex = (currentIndex + delta + batchItems.length) % batchItems.length;
 
     const it = batchItems[currentIndex];
@@ -213,8 +226,8 @@
     await applySelection();
     await loadCustomersIfAny();
 
-    // Zoom to focused route
-    if (selectionBounds) map.fitBounds(selectionBounds.pad(0.08));
+    // Zoom to focused route with hints
+    if (selectionBounds) fitWithHints(selectionBounds, (it && it.view) || null);
 
     renderStatsCard(it);
     updateButtons();
@@ -229,7 +242,7 @@
     await applySelection();
     await loadCustomersIfAny();
 
-    if (selectionBounds) map.fitBounds(selectionBounds.pad(0.08));
+    if (selectionBounds) fitWithHints(selectionBounds, null); // overview default clamp
     updateButtons();
   }
 
@@ -333,7 +346,7 @@
         runtimeCustEnabled = true;
         await applySelection();
         await loadCustomersIfAny();
-        if (selectionBounds) map.fitBounds(selectionBounds.pad(0.08));
+        if (selectionBounds) fitWithHints(selectionBounds, (it && it.view) || null);
         await sleep(350);
 
         const canvas = await new Promise((resolve, reject) =>
