@@ -1,23 +1,27 @@
-/* apps.js — viewer + manual-first route stepper + PNG snapshots
-   --------------------------------------------------------------
-   Defaults to **manual** user-driven controls when a batch is provided.
-   Buttons: Prev · Next · Stats · Snap
-   Flow:
-     • Start: shows ALL selected routes at once (no customers)
-     • Next/Prev: zoom to one route and show **only that route’s customers**
-     • Stats toggle: show/hide 5-line dispatch card overlay (also drawn into PNG)
-     • Snap: capture Leaflet map via leaflet-image, draw the stats card onto the canvas,
-             POST to Apps Script doPost (cb=...) or download fallback
+/* apps.js — manual route viewer + bottom banner + framed snapshots
+   ----------------------------------------------------------------
+   What’s new:
+   • Bottom-center dispatch banner (3 rows, bold labels). Accepts rich text:
+       stats.baseBoxesText, stats.customsText, stats.addOnsText
+     Falls back to stats.baseBoxes / stats.customs / stats.addOns (numbers).
+   • Two-step “Snap”:
+       1) Click once → shows resizable frame, Snap button turns red, helper text appears.
+       2) Click Snap again → captures exactly the framed area (DOM-first via html2canvas;
+          auto-fallback to leaflet-image for map), flashes, uploads to Apps Script (or downloads).
+   • Keeps your existing map, layers, CSV selection, driver overlays, manual flow.
 
-   Keeps all existing features (3-tier layers, CSV selection/assignments, customers, overlays).
-   Snapshot images are map-only + drawn stats (no UI buttons).
+   URL flags:
+   • manual=1  → force toolbar/manual controls (default if batch present)
+   • auto=1    → run legacy auto-export loop
+   • cbAck=1   → expect JSON ack ({ok, webViewLink, fileId, folder}) from Apps Script
 */
+
 (async function () {
-  // ---- error surfacing ----
+  // ---------- error surfacing ----------
   window.addEventListener('error', (e) => showTopError('Script error', (e && e.message) ? e.message : String(e)));
   window.addEventListener('unhandledrejection', (e) => showTopError('Promise error', (e?.reason?.message) || String(e?.reason || e)));
 
-  // ---- URL / config ----
+  // ---------- URL / config ----------
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
   const parseJSON = (s, fb=null) => { try { return JSON.parse(s); } catch { return fb; } };
@@ -25,24 +29,23 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});
   const cbUrl           = qs.get('cb') || '';
+  const cbAck           = qs.get('cbAck') === '1';
   const batchParam      = qs.get('batch'); // websafe b64 JSON
 
-  // Manual is the default when batch exists; pass &auto=1 to re-enable auto-export loop.
-  // Also honor explicit &manual=1.
+  // Manual by default when batch exists; explicit manual=1 also honored. Use auto=1 to re-enable auto loop.
   const manualMode = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
 
-  // Runtime state for manual controller
+  // ---------- runtime state ----------
   let batchItems = parseBatchItems(batchParam); // [{name, day, driver, keys[], stats, outName, view?}]
-  let currentIndex = -1;         // -1 = overview (all routes at once)
-  let statsVisible = false;      // UI toggle
+  let currentIndex = -1;         // -1 = overview (all routes)
+  let statsVisible = false;      // banner toggle
   let manualSelectedKeys = null; // overrides selection when set
-  let runtimeCustEnabled = null; // null=default pipeline, true=force on (loaded), false=force off (none loaded)
+  let runtimeCustEnabled = null; // null=open cfg; true=force on; false=force off
 
-  // Driver assignment + palette
   let activeAssignMap = { ...assignMapParam };
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
 
-  // ---- map init ----
+  // ---------- map init ----------
   phase('Loading config…');
   const cfg = await fetchJson(cfgUrl);
 
@@ -57,7 +60,7 @@
   const base = L.tileLayer(osmTiles, { attribution: '&copy; OpenStreetMap contributors', crossOrigin: true }).addTo(map);
   try { const el = base.getContainer?.(); if (el) el.style.filter = 'grayscale(1)'; } catch {}
 
-  // ---- collections / state ----
+  // ---------- collections / state ----------
   const baseDayLayers = [], quadDayLayers = [], subqDayLayers = [], allDaySets=[baseDayLayers,quadDayLayers,subqDayLayers];
   let allBounds=null, selectionBounds=null, hasSelection=false;
 
@@ -79,7 +82,7 @@
   renderLegend(cfg, null, custWithinSel, custOutsideSel, false);
   renderDriversPanel([], {}, false, {}, 0);
 
-  // ---- load polygon layers (base → quads → subquads) ----
+  // ---------- layers ----------
   phase('Loading polygon layers…');
   await loadLayerSet(cfg.layers, baseDayLayers, true);
   if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
@@ -98,108 +101,210 @@
   map.on('movestart', () => { clearFocus(false); map.closePopup(); });
   map.on('zoomstart',  () => { map.closePopup(); });
 
-  // ---- initial selection + customers ----
-  // Manual/overview start: union of all route keys, and customers OFF
+  // ---------- initial selection + customers ----------
   if (manualMode && batchItems.length) {
     manualSelectedKeys = unionAllKeys(batchItems);
-    runtimeCustEnabled = false; // start with no customers
+    runtimeCustEnabled = false; // overview: customers off
   }
-
   await applySelection();
   await loadCustomersIfAny();
 
-  // ---- MANUAL CONTROLS (default when batch present) ----
+  // ---------- UI controls ----------
   if (manualMode && batchItems.length) {
     injectManualUI();
-    await zoomToOverview(); // index -1
+    ensureSnapshotUi();
+    await zoomToOverview();
   } else if (!manualMode && batchItems.length) {
-    // optional: auto-export loop remains available by passing auto=1
     await runAutoExport(batchItems);
   }
 
   // =================================================================
-  // UI: Manual controller
+  // UI: Manual controller + Banner + Snapshot frame
   // =================================================================
   function injectManualUI(){
-    // CSS
     const css = document.createElement('style');
     css.textContent = `
       .route-toolbar{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:9000;display:flex;gap:8px}
-      .route-toolbar button{background:#111;color:#fff;border:none;border-radius:6px;padding:8px 12px;font:600 14px system-ui;cursor:pointer;opacity:.9}
+      .route-toolbar button{background:#111;color:#fff;border:none;border-radius:6px;padding:8px 12px;font:600 14px system-ui;cursor:pointer;opacity:.95;transition:background .15s ease}
       .route-toolbar button:hover{opacity:1}
-      .stats-card{position:absolute;top:12px;right:12px;z-index:8500;background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.12);padding:10px 12px;max-width:min(52vw,640px);display:none}
-      .stats-card.visible{display:block}
-      .stats-card h4{margin:0 0 4px 0;font:700 16px system-ui}
-      .stats-card .sub{font:500 13px system-ui;color:#333;margin:0 0 8px 0}
-      .stats-card ul{margin:0;padding:0;list-style:none}
-      .stats-card li{font:500 14px system-ui;margin:2px 0}
+      .route-toolbar button.armed{background:#c62828}
+
+      /* bottom-center banner */
+      .dispatch-banner{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);z-index:8500;
+        background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);
+        border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);
+        padding:10px 14px;max-width:min(80vw,1100px);display:none}
+      .dispatch-banner.visible{display:block}
+      .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word}
+      .dispatch-banner .row strong{font-weight:700}
+
+      /* snapshot framing UI */
+      .snap-overlay{position:fixed;inset:0;z-index:9500;pointer-events:none}
+      .snap-overlay .helper{position:absolute;top:10px;right:12px;pointer-events:auto;
+        background:rgba(255,255,255,.95);border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.12);
+        padding:8px 10px;font:600 13px system-ui;color:#111;display:none}
+      .snap-overlay .frame{position:absolute;border:2px dashed #111;background:rgba(0,0,0,.03);
+        pointer-events:auto;border-radius:8px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.06)}
+      .snap-overlay .handle{position:absolute;width:14px;height:14px;background:#111;border-radius:3px}
+      .snap-overlay .handle::after{content:'';position:absolute;inset:2px;border:2px solid #fff;border-radius:2px;opacity:.75}
+      .snap-overlay .handle.nw{left:-7px;top:-7px} .snap-overlay .handle.ne{right:-7px;top:-7px}
+      .snap-overlay .handle.sw{left:-7px;bottom:-7px} .snap-overlay .handle.se{right:-7px;bottom:-7px}
+      .snap-overlay .handle.n{top:-7px;left:calc(50% - 7px)} .snap-overlay .handle.s{bottom:-7px;left:calc(50% - 7px)}
+      .snap-overlay .handle.w{left:-7px;top:calc(50% - 7px)} .snap-overlay .handle.e{right:-7px;top:calc(50% - 7px)}
+
+      /* flash + toast */
+      .snap-flash{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;z-index:9600;transition:opacity .18s ease}
+      .snap-flash.active{opacity:.65}
+      .snap-toast{position:fixed;left:12px;bottom:12px;z-index:9605;background:rgba(17,17,17,.95);color:#fff;
+        border-radius:10px;padding:10px 12px;font:600 13px system-ui;display:none;max-width:min(72vw,520px)}
+      .snap-toast a{color:#a5d6ff;text-decoration:underline}
     `;
     document.head.appendChild(css);
 
-    // Toolbar
     const bar = document.createElement('div');
     bar.className = 'route-toolbar';
     bar.innerHTML = `
-      <button id="btnPrev" title="Previous route">◀ Prev</button>
-      <button id="btnNext" title="Next route">Next ▶</button>
-      <button id="btnStats" title="Toggle stats card">Stats</button>
-      <button id="btnSnap"  title="Snapshot to Drive">📸 Snap</button>
+      <button id="btnPrev" title="Previous route" aria-label="Previous route">◀ Prev</button>
+      <button id="btnNext" title="Next route" aria-label="Next route">Next ▶</button>
+      <button id="btnStats" title="Toggle dispatch banner" aria-label="Toggle stats">Stats</button>
+      <button id="btnSnap"  title="Frame & capture snapshot" aria-label="Snapshot">📸 Snap</button>
     `;
     document.body.appendChild(bar);
 
-    // Stats card (DOM preview; snapshot draws separately onto canvas)
-    const card = document.createElement('div');
-    card.id = 'statsCard';
-    card.className = 'stats-card';
-    card.innerHTML = `<h4></h4><div class="sub"></div><ul></ul>`;
-    document.body.appendChild(card);
+    // Bottom banner (DOM preview; snapshot draws a matching banner on canvas)
+    const banner = document.createElement('div');
+    banner.id = 'dispatchBanner';
+    banner.className = 'dispatch-banner';
+    banner.innerHTML = `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
+    document.body.appendChild(banner);
 
     // Wire buttons
     document.getElementById('btnPrev').addEventListener('click', async () => { await stepRoute(-1); });
     document.getElementById('btnNext').addEventListener('click', async () => { await stepRoute(+1); });
     document.getElementById('btnStats').addEventListener('click', () => toggleStats());
-    document.getElementById('btnSnap').addEventListener('click', async () => { await snapshotCurrent(); });
+    document.getElementById('btnSnap').addEventListener('click', onSnapClick);
+
+    // keyboard niceties
+    window.addEventListener('keydown', async (e)=>{
+      if (!batchItems.length) return;
+      if (e.key === 'ArrowRight') { e.preventDefault(); await stepRoute(+1); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); await stepRoute(-1); }
+      else if (e.key.toLowerCase() === 's') { e.preventDefault(); toggleStats(); }
+      else if (e.key === 'Escape') { cancelFraming(); }
+    });
 
     updateButtons();
   }
 
-  function updateButtons(){
-    const haveFocus = currentIndex >= 0 && currentIndex < batchItems.length;
-    const prev = document.getElementById('btnPrev');
-    const next = document.getElementById('btnNext');
-    const stat = document.getElementById('btnStats');
-    const snap = document.getElementById('btnSnap');
-    if (prev) prev.disabled = batchItems.length === 0;
-    if (next) next.disabled = batchItems.length === 0;
-    if (stat) stat.disabled = !haveFocus;
-    if (snap) snap.disabled = !haveFocus;
-  }
-
   function toggleStats(){
     statsVisible = !statsVisible;
-    const card = document.getElementById('statsCard');
-    if (!card) return;
-    if (statsVisible) card.classList.add('visible'); else card.classList.remove('visible');
+    const banner = document.getElementById('dispatchBanner');
+    if (!banner) return;
+    if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
   }
 
-  function renderStatsCard(it){
-    const card = document.getElementById('statsCard'); if (!card) return;
-    if (!it) { card.classList.remove('visible'); return; }
+  function renderDispatchBanner(it){
+    const banner = document.getElementById('dispatchBanner'); if (!banner) return;
+    if (!it) { banner.classList.remove('visible'); return; }
     const s = it?.stats || {};
-    card.querySelector('h4').textContent = `${it.day} — ${it.driver}`;
-    card.querySelector('.sub').textContent = String(it.name || '');
-    const lines = [
-      `Deliveries: ${s.deliveries || 0}`,
-      `Base boxes: ${s.baseBoxes || 0}`,
-      `Customs: ${s.customs || 0}`,
-      `Add-ons: ${s.addOns || 0}`,
-      `Apts: ${s.apartments || 0}`
-    ];
-    card.querySelector('ul').innerHTML = lines.map(t => `<li>${escapeHtml(t)}</li>`).join('');
-    if (statsVisible) card.classList.add('visible'); else card.classList.remove('visible');
+    const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
+                  : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
+    const custTxt = (s.customsText   != null) ? String(s.customsText)
+                  : (s.customs   != null)     ? String(s.customs)   : '0';
+    const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
+                  : (s.addOns    != null)     ? String(s.addOns)    : '0';
+
+    const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
+    const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
+    const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
+
+    banner.querySelector('.r1').innerHTML = row1;
+    banner.querySelector('.r2').innerHTML = row2;
+    banner.querySelector('.r3').innerHTML = row3;
+
+    if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
   }
 
-  // Fit + clamp using optional per-item view hints {padPct, minZoom, maxZoom}
+  // Canvas banner (for saved PNG)
+  function drawBannerOntoCanvas(canvas, it){
+    if (!it) return;
+    const s = it?.stats || {};
+    const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
+                  : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
+    const custTxt = (s.customsText   != null) ? String(s.customsText)
+                  : (s.customs   != null)     ? String(s.customs)   : '0';
+    const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
+                  : (s.addOns    != null)     ? String(s.addOns)    : '0';
+
+    const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
+    const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
+    const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
+
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const pad = Math.round(Math.min(W,H)*0.018);
+    const maxW = Math.min(Math.round(W*0.8), 1100); // pixels
+    const lineH = Math.max(16, Math.round(Math.min(W,H)*0.027));
+
+    const lines = [row1,row2,row3];
+    ctx.font = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    ctx.fillStyle='#111';
+
+    // measure wrapped lines to compute banner height
+    let wrapped = [];
+    const wrap = (text, font) => {
+      ctx.font = font;
+      const words = text.split(/\s+/);
+      let cur='', out=[];
+      for (let w of words){
+        const test = cur ? cur + ' ' + w : w;
+        if (ctx.measureText(test).width <= maxW - pad*2) cur = test;
+        else { if (cur) out.push(cur); cur = w; }
+      }
+      if (cur) out.push(cur);
+      return out;
+    };
+
+    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    wrapped = [
+      ...wrap(lines[0], fBold),
+      ...wrap(lines[1], fNorm),
+      ...wrap(lines[2], fNorm)
+    ];
+    const totalLines = wrapped.length;
+    const boxW = maxW;
+    const boxH = pad*2 + totalLines*lineH + Math.round(lineH*0.2);
+    const x = Math.round((W - boxW)/2);
+    const y = H - boxH - pad;
+
+    // background
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    roundRect(ctx, x, y, boxW, boxH, 12).fill();
+
+    // text
+    let yy = y + pad + lineH;
+    ctx.fillStyle='#111';
+    let cursor = 0;
+    const L0 = wrap(lines[0], fBold).length;
+    ctx.font = fBold;
+    for (let i=0;i<L0;i++) { ctx.fillText(wrapped[cursor++], x+pad, yy); yy += lineH; }
+    ctx.font = fNorm;
+    for (;cursor<wrapped.length;cursor++){ ctx.fillText(wrapped[cursor], x+pad, yy); yy += lineH; }
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y,   x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x,   y + h, r);
+    ctx.arcTo(x,   y + h, x,   y,   r);
+    ctx.arcTo(x,   y,   x + w, y,   r);
+    ctx.closePath();
+    return ctx;
+  }
+
+  // ---------- Zoom helper with hints ----------
   function fitWithHints(bounds, hints){
     try{
       const padPct = Math.max(0, Math.min(0.25, (hints && hints.padPct) || 0.10));
@@ -215,21 +320,19 @@
   async function stepRoute(delta){
     if (!batchItems.length) return;
 
-    // From overview (-1), Next focuses index 0; Prev from overview wraps to last
     if (currentIndex === -1 && delta > 0) currentIndex = 0;
     else if (currentIndex === -1 && delta < 0) currentIndex = batchItems.length - 1;
     else currentIndex = (currentIndex + delta + batchItems.length) % batchItems.length;
 
     const it = batchItems[currentIndex];
     manualSelectedKeys = (it.keys || []).map(normalizeKey);
-    runtimeCustEnabled = true; // on focus: load customers and show only this route's
+    runtimeCustEnabled = true; // focused: show only this route’s customers
     await applySelection();
     await loadCustomersIfAny();
 
-    // Zoom to focused route with hints
     if (selectionBounds) fitWithHints(selectionBounds, (it && it.view) || null);
 
-    renderStatsCard(it);
+    renderDispatchBanner(it);
     updateButtons();
   }
 
@@ -237,107 +340,268 @@
     currentIndex = -1;
     manualSelectedKeys = unionAllKeys(batchItems);
     runtimeCustEnabled = false; // hide customers
-    statsVisible = false; renderStatsCard(null);
+    statsVisible = false; renderDispatchBanner(null);
 
     await applySelection();
     await loadCustomersIfAny();
-
-    if (selectionBounds) fitWithHints(selectionBounds, null); // overview default clamp
+    if (selectionBounds) fitWithHints(selectionBounds, null);
     updateButtons();
   }
 
-  async function snapshotCurrent(){
-    const it = (currentIndex >=0 && currentIndex < batchItems.length) ? batchItems[currentIndex] : null;
-    if (!it) return; // no-op on overview
+  function updateButtons(){
+    const haveFocus = currentIndex >= 0 && currentIndex < batchItems.length;
+    const prev = document.getElementById('btnPrev');
+    const next = document.getElementById('btnNext');
+    const stat = document.getElementById('btnStats');
+    const snap = document.getElementById('btnSnap');
+    if (prev) prev.disabled = batchItems.length === 0;
+    if (next) next.disabled = batchItems.length === 0;
+    if (stat) stat.disabled = !haveFocus;
+    if (snap) snap.disabled = !haveFocus;
+  }
 
-    // Render Leaflet canvas
-    const canvas = await new Promise((resolve, reject) =>
-      window.leafletImage ? leafletImage(map, (err, c) => (err ? reject(err) : resolve(c)))
-                          : reject(new Error('leaflet-image not loaded')));
+  // =================================================================
+  // SNAPSHOT: frame → capture (DOM-first), flash, upload
+  // =================================================================
+  let snapArmed = false;
+  let snapEls = null; // {overlay, helper, frame, flash, toast}
 
-    // Draw stats card onto canvas if visible
-    if (statsVisible) drawStatsOntoCanvas(canvas, it);
+  function ensureSnapshotUi(){
+    if (snapEls) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'snap-overlay'; overlay.style.display='none';
+    overlay.innerHTML = `
+      <div class="helper">Drag to frame your capture. Click the <b>red Snap</b> to take it. &nbsp;•&nbsp; Press <b>Esc</b> to cancel.</div>
+      <div class="frame" style="left:15vw;top:20vh;width:70vw;height:60vh">
+        <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+        <div class="handle w" data-dir="w"></div> <div class="handle e" data-dir="e"></div>
+        <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
 
-    // Post PNG to Apps Script receiver (no-cors to avoid preflight)
-    const png = canvas.toDataURL('image/png');
-    const name = it.outName || `${it.driver}_${it.day}.png`;
-    if (cbUrl) {
-      try {
-        await fetch(cbUrl, {
-          method: 'POST',
-          mode: 'no-cors',
-          body: JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png })
-        });
-      } catch (e) {
-        console.warn('POST failed, falling back to download:', e);
-        downloadFallback(png, name);
-      }
+    const flash = document.createElement('div'); flash.className='snap-flash'; document.body.appendChild(flash);
+    const toast = document.createElement('div'); toast.className='snap-toast'; document.body.appendChild(toast);
+
+    snapEls = { overlay, helper: overlay.querySelector('.helper'), frame: overlay.querySelector('.frame'), flash, toast };
+
+    // Drag & resize
+    bindFramingGestures(snapEls.frame);
+  }
+
+  function defaultFrame(){
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const w = Math.round(vw*0.7), h = Math.round(vh*0.6);
+    const l = Math.round((vw - w)/2), t = Math.round((vh - h)/2);
+    setFrameRect(l,t,w,h);
+  }
+
+  function setFrameRect(l,t,w,h){
+    const f = snapEls.frame;
+    Object.assign(f.style, { left: `${clamp(l,0,window.innerWidth-20)}px`, top: `${clamp(t,0,window.innerHeight-20)}px`,
+      width: `${Math.max(40, Math.min(w, window.innerWidth))}px`, height: `${Math.max(40, Math.min(h, window.innerHeight))}px` });
+  }
+
+  function getFrameRect(){
+    const f = snapEls.frame.getBoundingClientRect();
+    return { left: Math.round(f.left), top: Math.round(f.top), width: Math.round(f.width), height: Math.round(f.height) };
+  }
+
+  function onSnapClick(){
+    if (!batchItems.length || currentIndex < 0) return;
+    const btn = document.getElementById('btnSnap');
+    if (!snapArmed){
+      // Enter framing
+      ensureSnapshotUi(); defaultFrame();
+      snapEls.overlay.style.display='block';
+      snapEls.helper.style.display='block';
+      btn.classList.add('armed'); btn.setAttribute('aria-label','Capture framed snapshot');
+      snapArmed = true;
     } else {
-      downloadFallback(png, name);
+      // Capture
+      performCapture().catch(e=>showToast(`Capture failed — ${String(e&&e.message||e)}`))
+        .finally(()=>{ exitFraming(); });
     }
   }
 
-  function drawStatsOntoCanvas(canvas, it){
-    const ctx = canvas.getContext('2d');
-    const w = canvas.width, h = canvas.height;
-    const pad = Math.round(Math.min(w, h) * 0.02);
-    const lineH = Math.round(Math.min(w, h) * 0.03);
-    const boxW = Math.min(Math.round(w * 0.5), 620);
-    const boxH = lineH * 6 + pad * 2;
-
-    ctx.fillStyle = 'rgba(255,255,255,0.92)';
-    roundRect(ctx, w - boxW - pad, pad, boxW, boxH, 10).fill();
-
-    ctx.fillStyle = '#111';
-    ctx.font = 'bold ' + (lineH * 0.9) + 'px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-    const x = w - boxW - pad + pad;
-    let y = pad + lineH;
-
-    ctx.fillText(`${it.day} — ${it.driver}`, x, y); y += Math.round(lineH * 1.1);
-    ctx.font = 'normal ' + (lineH * 0.85) + 'px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillText(String(it.name || ''), x, y); y += Math.round(lineH * 1.05);
-
-    const s = it.stats || {};
-    [
-      `Deliveries: ${s.deliveries || 0}`,
-      `Base boxes: ${s.baseBoxes || 0}`,
-      `Customs: ${s.customs || 0}`,
-      `Add-ons: ${s.addOns || 0}`,
-      `Apts: ${s.apartments || 0}`
-    ].forEach(t => { ctx.fillText(t, x, y); y += Math.round(lineH * 1.0); });
+  function cancelFraming(){
+    if (!snapArmed) return;
+    exitFraming();
+    showToast('Framing cancelled.');
   }
 
-  function roundRect(ctx, x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y,   x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x,   y + h, r);
-    ctx.arcTo(x,   y + h, x,   y,   r);
-    ctx.arcTo(x,   y,   x + w, y,   r);
-    ctx.closePath();
-    return ctx;
+  function exitFraming(){
+    const btn = document.getElementById('btnSnap');
+    if (btn) { btn.classList.remove('armed'); btn.setAttribute('aria-label','Frame & capture snapshot'); }
+    if (snapEls) { snapEls.overlay.style.display='none'; snapEls.helper.style.display='none'; }
+    snapArmed = false;
   }
 
-  function downloadFallback(uri, name){
-    const a = document.createElement('a'); a.href = uri; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  function bindFramingGestures(frameEl){
+    let mode=null, start={x:0,y:0,l:0,t:0,w:0,h:0}, dir=null;
+
+    const onDown = (e, d) => {
+      e.preventDefault();
+      mode = d ? 'resize' : 'move';
+      dir = d || null;
+      const r = frameEl.getBoundingClientRect();
+      start = { x:e.clientX, y:e.clientY, l:r.left, t:r.top, w:r.width, h:r.height };
+      window.addEventListener('pointermove', onMove, {passive:false});
+      window.addEventListener('pointerup', onUp, {once:true});
+    };
+
+    const onMove = (e) => {
+      e.preventDefault();
+      const dx = e.clientX - start.x, dy = e.clientY - start.y;
+      let l=start.l, t=start.t, w=start.w, h=start.h;
+      if (mode==='move'){
+        l = clamp(start.l + dx, 0, window.innerWidth  - w);
+        t = clamp(start.t + dy, 0, window.innerHeight - h);
+      } else {
+        // resize by dir
+        if (dir.includes('e')) w = clamp(start.w + dx, 40, window.innerWidth);
+        if (dir.includes('s')) h = clamp(start.h + dy, 40, window.innerHeight);
+        if (dir.includes('w')) { l = clamp(start.l + dx, 0, start.l + start.w - 40); w = clamp(start.w - dx, 40, window.innerWidth); }
+        if (dir.includes('n')) { t = clamp(start.t + dy, 0, start.t + start.h - 40); h = clamp(start.h - dy, 40, window.innerHeight); }
+      }
+      setFrameRect(l,t,w,h);
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove, {passive:false});
+    };
+
+    // Move
+    frameEl.addEventListener('pointerdown', (e)=>{
+      const target = e.target;
+      if (target.classList.contains('handle')) return; // handled below
+      onDown(e, null);
+    });
+
+    // Handles
+    frameEl.querySelectorAll('.handle').forEach(h => {
+      h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir')));
+    });
   }
 
-  function unionAllKeys(items){
-    const set = new Set();
-    (items||[]).forEach(it => (it.keys||[]).forEach(k => set.add(normalizeKey(k))));
-    return Array.from(set);
+  async function performCapture(){
+    const it = (currentIndex>=0 && currentIndex<batchItems.length) ? batchItems[currentIndex] : null;
+    if (!it) throw new Error('No focused route to capture.');
+    const r = getFrameRect();
+
+    // Try DOM-first capture (html2canvas must be loaded and CORS-safe)
+    let canvas = null;
+    if (window.html2canvas) {
+      try{
+        canvas = await html2canvas(document.body, {
+          useCORS: true,
+          backgroundColor: null,
+          x: r.left, y: r.top, width: r.width, height: r.height,
+          windowWidth: document.documentElement.clientWidth,
+          windowHeight: document.documentElement.clientHeight,
+          scrollX: 0, scrollY: 0
+        });
+      } catch (e) {
+        console.warn('html2canvas failed, will try leaflet-image fallback:', e);
+      }
+    }
+
+    if (!canvas) {
+      // Fallback: map-only render then crop to intersecting area; draw banner ourselves.
+      if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
+      const mapRect = document.getElementById('map').getBoundingClientRect();
+      const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
+      if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap the map; fallback capture cannot proceed.');
+
+      canvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
+      // Crop to intersection (relative to map origin)
+      const sx = Math.max(0, Math.round(ix.left - mapRect.left));
+      const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
+      const sw = Math.round(ix.width), sh = Math.round(ix.height);
+      const out = document.createElement('canvas'); out.width = sw; out.height = sh;
+      out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+
+      // If banner visible, draw it into the cropped canvas
+      if (statsVisible) drawBannerOntoCanvas(out, it);
+
+      canvas = out;
+    } else {
+      // DOM path: if banner is toggled off, still mirror behavior by drawing banner when visible only.
+      if (statsVisible) {
+        // The DOM render already includes the banner. Nothing extra to do.
+      }
+    }
+
+    // Flash + upload
+    flash();
+    const png = canvas.toDataURL('image/png');
+    const name = it.outName || `${it.driver}_${it.day}.png`;
+    await uploadOrDownload(png, name, it);
   }
+
+  function intersectRects(a,b){
+    const x1 = Math.max(a.left, b.left);
+    const y1 = Math.max(a.top,  b.top);
+    const x2 = Math.min(a.left+a.width,  b.left+b.width);
+    const y2 = Math.min(a.top +a.height, b.top +b.height);
+    if (x2<=x1 || y2<=y1) return null;
+    return { left:x1, top:y1, width:x2-x1, height:y2-y1 };
+  }
+
+  async function uploadOrDownload(pngDataUrl, name, it){
+    if (!cbUrl) {
+      downloadFallback(pngDataUrl, name);
+      showToast(`Saved locally as ${escapeHtml(name)}.`);
+      return;
+    }
+    try{
+      const body = JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: pngDataUrl });
+      const res = await fetch(cbUrl, {
+        method: 'POST',
+        mode: cbAck ? 'cors' : 'no-cors',
+        headers: cbAck ? {'Content-Type':'application/json'} : undefined,
+        body
+      });
+      if (cbAck) {
+        const j = await res.json().catch(()=>null);
+        if (j && j.ok) {
+          const link = j.webViewLink || j.alternateLink;
+          showToast(`Saved to <b>${escapeHtml(j.folder || 'Snapshots')}</b> as ${escapeHtml(name)}.` + (link ? ` <a href="${link}" target="_blank" rel="noopener">Open</a>` : ''));
+          return;
+        }
+      }
+      showToast(`Saved to Drive (Snapshots) as ${escapeHtml(name)}.`);
+    } catch (e) {
+      console.warn('Upload failed, falling back to download:', e);
+      downloadFallback(pngDataUrl, name);
+      showToast(`Upload failed — downloaded locally as ${escapeHtml(name)}.`);
+    }
+  }
+
+  function flash(){
+    if (!snapEls) return;
+    snapEls.flash.classList.add('active');
+    setTimeout(()=>snapEls.flash.classList.remove('active'), 200);
+  }
+
+  function showToast(html){
+    if (!snapEls) return;
+    const t = snapEls.toast;
+    t.innerHTML = html;
+    t.style.display='block';
+    clearTimeout(t._tmr);
+    t._tmr = setTimeout(()=>{ t.style.display='none'; }, 4200);
+  }
+
+  function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
 
   // =================================================================
   // Optional: legacy auto-export (only if auto=1 in URL)
   // =================================================================
   async function runAutoExport(items){
     // hide side panels for clean snapshots
-    const legend = document.getElementById('legend');
-    const drivers= document.getElementById('drivers');
-    const status = document.getElementById('status');
-    const err    = document.getElementById('error');
-    [legend,drivers,status,err].forEach(n => { if(n) n.style.display='none'; });
+    const ids=['legend','drivers','status','error'];
+    ids.forEach(id=>{ const n=document.getElementById(id); if(n) n.style.display='none'; });
 
     for (let i=0;i<items.length;i++){
       const it = items[i];
@@ -352,18 +616,19 @@
         const canvas = await new Promise((resolve, reject) =>
           window.leafletImage ? leafletImage(map, (err, c) => (err ? reject(err) : resolve(c)))
                               : reject(new Error('leaflet-image not loaded')));
-        drawStatsOntoCanvas(canvas, it);
+        if (statsVisible) drawBannerOntoCanvas(canvas, it); // auto mode: include if visible
         const png = canvas.toDataURL('image/png');
         const name = it.outName || `${it.driver}_${it.day}.png`;
         if (cbUrl) {
-          await fetch(cbUrl, { method:'POST', mode:'no-cors', body: JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png }) });
+          await fetch(cbUrl, { method:'POST', mode: cbAck?'cors':'no-cors', headers: cbAck?{'Content-Type':'application/json'}:undefined,
+            body: JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png }) });
         } else { downloadFallback(png, name); }
       }catch(e){ console.error('auto export item failed', e); }
     }
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — core viewer behavior
+  // LOADERS / SELECTION / CUSTOMERS — (unchanged behavior)
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
@@ -542,16 +807,12 @@
   }
 
   async function loadCustomersIfAny() {
-    // runtimeCustEnabled === false → no customers at all (overview)
-    // runtimeCustEnabled === true  → load customers, and we'll hide/show per-route in recolor step
-    // runtimeCustEnabled === null  → follow normal cfg behavior
     customerLayer.clearLayers();
     customerMarkers.length = 0;
     customerCount = 0;
 
     const custCfg = cfg.customers || {};
     const forceOff = (runtimeCustEnabled === false);
-    const forceOn  = (runtimeCustEnabled === true);
 
     if (forceOff || !custCfg.enabled || !custCfg.url) {
       custWithinSel = custOutsideSel = 0; resetDayCounts();
@@ -616,7 +877,6 @@
       fillOpacity: 0.6
     };
 
-    // In manual focused mode: hide non-route customers entirely
     const onlySelectedCustomers = manualMode && (currentIndex >= 0);
 
     for (const rec of customerMarkers) {
@@ -628,7 +888,6 @@
       if (turfOn) {
         const pt = turf.point([rec.lng, rec.lat]);
 
-        // any visible polygon (for totalAny)
         for (let j = 0; j < coveragePolysAll.length; j++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
             const lyr = coveragePolysAll[j].layerRef;
@@ -637,7 +896,6 @@
           }
         }
 
-        // in current selection?
         for (let k = 0; k < coveragePolysSelected.length; k++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
             insideSel = true;
@@ -658,10 +916,7 @@
         }
       }
 
-      // In focused (per-route) mode: hide customers outside selection entirely
-      if (onlySelectedCustomers && !insideSel) {
-        show = false;
-      }
+      if (onlySelectedCustomers && !insideSel) show = false;
 
       if (insideSel) {
         inSel++;
@@ -670,7 +925,6 @@
         outSel++;
       }
 
-      // add/remove marker from map based on "show"
       if (show && !rec.visible) { customerLayer.addLayer(rec.marker); rec.visible = true; }
       else if (!show && rec.visible) { customerLayer.removeLayer(rec.marker); rec.visible = false; }
 
@@ -696,12 +950,10 @@
   }
 
   async function rebuildDriverOverlays() {
-    // remove existing
     Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch {} });
     for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
-    // group selected features by driver
-    const byDriver = new Map(); // name -> [geoJSON Feature]
+    const byDriver = new Map();
     coveragePolysSelected.forEach(rec => {
       const key = rec.layerRef && rec.layerRef._routeKey;
       if (!key) return;
@@ -721,7 +973,6 @@
                    || { name, color: colorFromName(name) });
       const color = meta.color || '#888';
 
-      // halo under colored outline
       const halo = L.geoJSON({ type:'FeatureCollection', features }, {
         interactive:false,
         style:()=>({ color:'#ffffff', weight:(cfg.drivers?.outlineHaloWeightPx ?? 10), opacity:0.95, lineJoin:'round', lineCap:'round', fill:false })
@@ -751,7 +1002,6 @@
     renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
 
-  // exact key, then base key
   function lookupDriverForKey(key) {
     if (!key) return null;
     if (activeAssignMap[key]) return activeAssignMap[key];
@@ -760,9 +1010,7 @@
     return null;
   }
 
-  // =================================================================
-  // POPUP / FOCUS / STYLES
-  // =================================================================
+  // ---------- POPUP / focus ----------
   function openPolygonPopup(lyr) {
     const muni = lyr._labelTxt || 'Municipality';
     const totalAny = Number(lyr._custAny || 0);
@@ -829,9 +1077,7 @@
     });
   }
 
-  // =================================================================
-  // UI PANELS (kept)
-  // =================================================================
+  // ---------- UI PANELS (kept) ----------
   function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
     const el = document.getElementById('drivers'); if (!el) return;
 
@@ -871,12 +1117,9 @@
 
     el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
       const name = cb.getAttribute('data-driver');
-      if (!overlays?.[name]) return; // disabled
+      if (!overlays?.[name]) return;
       toggleDriverOverlay(name, !!cb.checked);
-      cb.addEventListener('change', (e) => {
-        const name = e.target.getAttribute('data-driver');
-        toggleDriverOverlay(name, e.target.checked);
-      });
+      cb.addEventListener('change', (e) => toggleDriverOverlay(name, e.target.checked));
     });
   }
 
@@ -918,19 +1161,9 @@
       </div>`;
 
     el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}${toggle}`;
-
-    const cb = document.getElementById('toggleOutside');
-    if (cb) {
-      cb.addEventListener('change', () => {
-        // left as-is; snapshot ignores this DOM-only option
-        // (customers outside selection are hidden in focused mode anyway)
-      });
-    }
   }
 
-  // =================================================================
-  // HELPERS / PARSERS / UTILS
-  // =================================================================
+  // ---------- helpers ----------
   function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
   async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
@@ -1067,7 +1300,6 @@
   function info(msg){ setStatus(`ℹ️ ${msg}`); }
   function warn(msg){ showTopError('Warning', msg); }
 
-  // Status line now includes "active zone keys"
   function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
   function makeStatusLine(selMunis, inCount, outCount, activeKeysLowerArray) {
     const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
@@ -1090,7 +1322,6 @@
     const isKeysHeader = (s) => { const v = like(s); return v.includes('key') || v.includes('zone') || v.includes('route'); };
     const isDriverHeader = (s) => { const v = like(s); return v.includes('driver') || v === 'name' || v.includes('assigned'); };
 
-    // Try header-based table
     let headerIndex=-1, driverCol=-1, keysCol=-1;
     for (let i=0; i<Math.min(rows.length, 50); i++) {
       const row = rows[i] || [];
@@ -1109,17 +1340,15 @@
         const dn = (row[driverCol] || '').trim();
         const ks = (row[keysCol]   || '').trim();
         if (!dn || !ks) continue;
-        if (!looksLikeName(dn)) continue; // reject “Sat”
+        if (!looksLikeName(dn)) continue;
         splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
       }
       return out;
     }
 
-    // Fallback: scan first 40 rows; only accept KNOWN names
     for (let r = 0; r < Math.min(rows.length, 40); r++) {
       const row = rows[r] || [];
       if (!row.length) continue;
-
       let dn = '';
       for (let c=0;c<row.length;c++) {
         const cell = (row[c]||'').trim();
@@ -1127,8 +1356,6 @@
         if (looksLikeName(cell)) { dn = cell; break; }
       }
       if (!dn) continue;
-
-      // find any cell(s) with keys and merge
       let allKeys = [];
       for (let c=0;c<row.length;c++) {
         const cell = (row[c]||'').trim();
