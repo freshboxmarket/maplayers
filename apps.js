@@ -1,20 +1,5 @@
-/* apps.js — manual route viewer + draggable banner + persistent frame + snapshot panel (vNext, fixed)
-   ----------------------------------------------------------------------------------------------------------------
-   What’s new in this build
-   • Drive upload flow:
-       - Webhook-first: tries CORS JSON (expects { ok:true, webViewLink, folder, fileId? }) and falls back to no-CORS.
-       - Include Drive folder: pass ?driveFolder=<ID or full folder URL>. Defaults to your “Snapshots” folder below.
-       - On success, shows a clickable Drive link in the dock.
-       - Optional direct-to-Drive (no server): ?driveDirect=1&gClientId=<OAuthClientId> (kept off by default).
-   • Snapshot correctness:
-       - Excludes DOM banner + framing UI from html2canvas; draws 1 programmatic banner (no duplicates).
-       - Excludes dock from capture too.
-   • Stats resiliency:
-       - Fuzzy, case-insensitive key scan; supports nested objects/arrays/strings like “12 + 1”.
-       - Shows “—” if unavailable instead of 0; deliveries/apartments still default to 0.
-   • Minor: safer filenames, guaranteed .png, clearer status notes.
-*/
-
+<!-- apps.js (vNext, banner-pos accurate + robust stats + save UX) -->
+<script>
 (async function () {
   // ---------- error surfacing ----------
   window.addEventListener('error', (e) => showTopError('Script error', (e && e.message) ? e.message : String(e)));
@@ -28,15 +13,12 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});
   const cbUrl           = qs.get('cb') || '';
-  const cbAckParam      = qs.get('cbAck'); // keep raw, we try CORS regardless now
   const batchParam      = qs.get('batch'); // websafe b64 JSON
   const manualMode      = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
 
   // Upload params
-  const driveFolderRaw  = qs.get('driveFolder') || qs.get('driveFolderId') || qs.get('driveFolderUrl')
-                        || (window.appUpload?.driveFolder) || ''; // optional external global
-  // Default to the folder you gave (“Snapshots”)
-  const DRIVE_FOLDER_FALLBACK = '1ZzGt5_Kmgf1IUdiUdf_kN88lOscL792a';
+  const driveFolderRaw  = qs.get('driveFolder') || qs.get('driveFolderId') || qs.get('driveFolderUrl') || (window.appUpload?.driveFolder) || '';
+  const DRIVE_FOLDER_FALLBACK = '1ZzGt5_Kmgf1IUdiUdf_kN88lOscL792a';  // "Snapshots"
   const driveFolderId   = extractDriveFolderId(driveFolderRaw) || DRIVE_FOLDER_FALLBACK;
   const driveDirect     = qs.get('driveDirect') === '1';
   const gClientId       = qs.get('gClientId') || '';
@@ -165,7 +147,7 @@
       .snap-overlay .handle.n{top:-7px;left:calc(50% - 7px)} .snap-overlay .handle.s{bottom:-7px;left:calc(50% - 7px)}
       .snap-overlay .handle.w{left:-7px;top:calc(50% - 7px)} .snap-overlay .handle.e{right:-7px;top:calc(50% - 7px)}
 
-      /* cropped flash (only over frame), total ~0.25s */
+      /* cropped flash */
       .snap-flash-crop{position:fixed;background:#000;opacity:0;pointer-events:none;z-index:9600;transition:opacity .125s ease;border-radius:8px}
 
       /* persistent snapshot panel */
@@ -231,67 +213,75 @@
     banner.classList.toggle('visible', statsVisible);
   }
 
-  // ---------- Stats text (robust) ----------
+  // ---------- Stats text (robust + interprets sums) ----------
   function stringifyStat(val){
     if (val == null) return '';
     if (typeof val === 'number') return String(val);
     if (typeof val === 'string') return val.trim();
     if (Array.isArray(val)) return val.map(v => stringifyStat(v)).filter(Boolean).join(' | ');
     if (typeof val === 'object') {
-      // Prefer compact "a:1 | b:2" when keys are short; fallback to just values
       const entries = Object.entries(val).filter(([k,v]) => v != null && String(v).trim?.() !== '');
       if (!entries.length) return '';
       const pretty = entries.map(([k,v]) => `${k}: ${stringifyStat(v)}`).join(' | ');
       const valuesOnly = entries.map(([,v]) => stringifyStat(v)).join(' | ');
-      const pick = (pretty.length <= 64) ? pretty : valuesOnly;
-      return pick.trim();
+      return (pretty.length <= 64 ? pretty : valuesOnly).trim();
     }
     return String(val);
+  }
+  function trySumExpression(s){
+    if (!s) return null;
+    const t = String(s).trim();
+    // support "12+1", "12 + 1", "12.5+1.25", ignore stray text
+    if (!/[+\d]/.test(t)) return null;
+    const parts = t.replace(/[^0-9.+-]/g,'').split('+').map(x=>x.trim()).filter(Boolean);
+    if (parts.length < 2) return null;
+    let sum = 0, any=false;
+    for (const p of parts){
+      const n = Number(p);
+      if (Number.isFinite(n)) { sum += n; any = true; }
+      else return null;
+    }
+    return any ? (Number.isInteger(sum) ? String(sum) : String(sum)) : null;
+  }
+  function normalizeQty(s){
+    const str = stringifyStat(s);
+    const summed = trySumExpression(str);
+    return summed || (str || '—');
   }
   function findByKeywords(obj, ...words){
     if (!obj) return '';
     const want = words.map(w => String(w).toLowerCase());
-    // 1) direct keys
-    for (const [k,v] of Object.entries(obj)){
-      const lk = k.toLowerCase();
-      if (want.every(w => lk.includes(w))) {
-        const s = stringifyStat(v);
-        if (s) return s;
-      }
-    }
-    // 2) nested one level
-    for (const [,v] of Object.entries(obj)){
-      if (v && typeof v === 'object' && !Array.isArray(v)){
-        for (const [k2,v2] of Object.entries(v)){
-          const lk = k2.toLowerCase();
-          if (want.every(w => lk.includes(w))) {
-            const s = stringifyStat(v2);
-            if (s) return s;
-          }
-        }
-      }
-    }
-    // 3) known aliases
+    const direct = scanObject(obj, (k,v)=> want.every(w => k.includes(w)));
+    if (direct) return direct;
+    // loose aliases
     const aliases = {
       base: ['basebox','baseboxes','base','regular'],
-      custom: ['custom','customs','special'],
-      addon: ['add','addon','addons','add-ons','add_ons','extra','extras']
+      custom: ['custom','customs','special','custom_boxes','customBoxes','customsText'],
+      addon: ['add','addon','addons','add-ons','add_ons','extra','extras','addonsText']
     };
     const pool = new Set(aliases[words[0]] || []);
-    for (const [k,v] of Object.entries(obj)){
+    const aliased = scanObject(obj, (k,v)=> [...pool].some(a => k.includes(a)));
+    return aliased || '';
+  }
+  function scanObject(obj, pred){
+    // depth-2 scan
+    for (const [k,v] of Object.entries(obj||{})){
       const lk = k.toLowerCase();
-      if ([...pool].some(a => lk.includes(a))) {
-        const s = stringifyStat(v);
-        if (s) return s;
+      if (pred(lk, v)) { const s = normalizeQty(v); if (s) return s; }
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        for (const [k2,v2] of Object.entries(v)){
+          const lk2 = k2.toLowerCase();
+          if (pred(lk2, v2)) { const s = normalizeQty(v2); if (s) return s; }
+        }
       }
     }
     return '';
   }
   function getStatsTexts(statsObj) {
     const s = statsObj || {};
-    const baseTxt = findByKeywords(s, 'base', 'box') || stringifyStat(s.baseBoxesText) || stringifyStat(s.base) || stringifyStat(s.baseBoxes) || '—';
-    const custTxt = findByKeywords(s, 'custom') || stringifyStat(s.customsText) || stringifyStat(s.customs) || '—';
-    const addTxt  = findByKeywords(s, 'add')    || stringifyStat(s.addOnsText) || stringifyStat(s.addOns) || stringifyStat(s.add_ons) || '—';
+    const baseTxt = normalizeQty(findByKeywords(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes);
+    const custTxt = normalizeQty(findByKeywords(s, 'custom')      || s.customsText || s.customs);
+    const addTxt  = normalizeQty(findByKeywords(s, 'addon')       || s.addOnsText  || s.addOns || s.add_ons);
     return { baseTxt, custTxt, addTxt };
   }
 
@@ -309,9 +299,12 @@
     if (statsVisible) banner.classList.add('visible');
   }
 
-  // Canvas banner (for saved PNG) — single source of truth
-  function drawBannerOntoCanvas(canvas, it){
+  // Canvas banner (for saved PNG) — mirrors the DOM banner position & width
+  function drawBannerOntoCanvas(canvas, it, frameRect){
     if (!it || !statsVisible) return;
+    const domBanner = document.getElementById('dispatchBanner');
+    if (!domBanner || !domBanner.classList.contains('visible')) return;
+
     const s = it?.stats || {};
     const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
 
@@ -319,34 +312,49 @@
     const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
     const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
 
+    const bRect = domBanner.getBoundingClientRect();
+    // position inside the cropped canvas
+    let x = Math.round(bRect.left - frameRect.left);
+    let y = Math.round(bRect.top  - frameRect.top);
+    let boxW = Math.max(120, Math.min(canvas.width, Math.round(bRect.width)));
+
+    // clamp within canvas
+    if (x > canvas.width || y > canvas.height || (x + 10) < 0 || (y + 10) < 0) return;
+    x = Math.max(0, Math.min(x, canvas.width - 10));
+    y = Math.max(0, Math.min(y, canvas.height - 10));
+
     const ctx = canvas.getContext('2d');
-    const W = canvas.width, H = canvas.height;
-    const pad = Math.round(Math.min(W,H)*0.018);
-    const maxW = Math.min(Math.round(W*0.8), 1100);
-    const lineH = Math.max(16, Math.round(Math.min(W,H)*0.027));
+    const pad = Math.max(8, Math.round(boxW * 0.04));
+    const lineH = Math.max(16, Math.round(Math.min(canvas.width, canvas.height) * 0.027));
 
     const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
     const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+
     const wrap = (text, font) => {
       ctx.font = font;
-      const words = text.split(/\s+/); let cur='', out=[];
-      for (const w of words){ const test = cur ? cur + ' ' + w : w; if (ctx.measureText(test).width <= maxW - pad*2) cur = test; else { if (cur) out.push(cur); cur = w; } }
-      if (cur) out.push(cur); return out;
+      const words = String(text||'').split(/\s+/);
+      let cur='', out=[];
+      for (const w of words){
+        const test = cur ? cur + ' ' + w : w;
+        if (ctx.measureText(test).width <= boxW - pad*2) cur = test;
+        else { if (cur) out.push(cur); cur = w; }
+      }
+      if (cur) out.push(cur);
+      return out;
     };
+
     const w1 = wrap(row1, fBold);
     const w2 = wrap(row2, fNorm);
     const w3 = wrap(row3, fNorm);
-    const wrapped = [...w1, ...w2, ...w3];
-    const boxW = maxW, boxH = pad*2 + wrapped.length*lineH + Math.round(lineH*0.2);
-    const x = Math.round((W - boxW)/2);
-    const y = Math.round(H - boxH - Math.max(pad*2, H*0.12));
+    const lines = [...w1, ...w2, ...w3];
+    const boxH = pad*2 + lines.length * lineH + Math.round(lineH*0.2);
 
     ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12).fill();
 
     let yy = y + pad + lineH; ctx.fillStyle='#111';
-    ctx.font = fBold; for (let i=0;i<w1.length;i++) { ctx.fillText(w1[i], x+pad, yy); yy += lineH; }
-    ctx.font = fNorm; for (let i=0;i<w2.length;i++) { ctx.fillText(w2[i], x+pad, yy); yy += lineH; }
-    for (let i=0;i<w3.length;i++) { ctx.fillText(w3[i], x+pad, yy); yy += lineH; }
+    ctx.font = fBold; for (const ln of w1) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
+    ctx.font = fNorm; for (const ln of w2) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
+    for (const ln of w3) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
   }
   function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); return ctx; }
 
@@ -412,7 +420,7 @@
   }
 
   // =================================================================
-  // SNAPSHOT: frame → capture (DOM-first), cropped flash, preview panel
+  // SNAPSHOT: frame → capture → draw banner at DOM pos → preview panel
   // =================================================================
   function ensureSnapshotUi(){
     if (snapEls) return;
@@ -498,14 +506,14 @@
         const it = (currentIndex>=0 && currentIndex<batchItems.length) ? batchItems[currentIndex] : null;
         if (!it) throw new Error('No focused route to capture.');
         const r = getFrameRect();
-        const canvas = await captureCanvas(r);             // DOM-first with Leaflet fallback
-        drawBannerOntoCanvas(canvas, it);                  // 1 programmatic banner only
-        flashCropped(r);                                   // ~0.25s inside the frame
+        const canvas = await captureCanvas(r);   // DOM-first with Leaflet fallback
+        drawBannerOntoCanvas(canvas, it, r);     // draw exactly where the user positioned it
+        flashCropped(r);
         lastPngDataUrl = canvas.toDataURL('image/png');
         const rawName = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
         lastSuggestedName = ensurePngExt(rawName);
-        showDock(lastPngDataUrl, lastSuggestedName, it);   // persistent panel
-        saveFrameRect();                                   // remember rect
+        showDock(lastPngDataUrl, lastSuggestedName, it);
+        saveFrameRect();
       } catch (e) {
         showDock(null, null, null, `Capture failed — ${escapeHtml(e && e.message || e)}`);
       } finally {
@@ -550,13 +558,13 @@
       }
       setFrameRect(l,t,w,h);
     };
-    const onUp = () => { window.removeEventListener('pointermove', onMove, {passive:false}); saveFrameRect(); };
+    const onUp = () => { window.removeEventListener('pointermove', onMove); saveFrameRect(); };
     frameEl.addEventListener('pointerdown', (e)=>{ if (!e.target.classList.contains('handle')) onDown(e, null); });
     frameEl.querySelectorAll('.handle').forEach(h => h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir'))));
   }
 
   async function captureCanvas(r){
-    // Try DOM-first; exclude banner & snapshot UI to avoid duplicates
+    // DOM-first, exclude banner & dock & overlay
     if (window.html2canvas) {
       try{
         return await html2canvas(document.body, {
@@ -568,7 +576,7 @@
           scrollX: 0, scrollY: 0,
           ignoreElements: (el) => {
             if (!el) return false;
-            if (el.id === 'dispatchBanner') return true;
+            if (el.id === 'dispatchBanner' || el.closest?.('#dispatchBanner')) return true;
             const cls = el.classList || { contains:()=>false };
             return cls.contains('dispatch-banner') || cls.contains('snap-overlay') || cls.contains('snap-dock') || !!el.closest?.('.snap-dock');
           }
@@ -581,7 +589,6 @@
     const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
     if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap the map; fallback capture cannot proceed.');
     const baseCanvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
-    // Crop to intersection
     const sx = Math.max(0, Math.round(ix.left - mapRect.left));
     const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
     const sw = Math.round(ix.width), sh = Math.round(ix.height);
@@ -658,7 +665,7 @@
       try {
         let success = false, reply = null;
 
-        // 1) Optional direct-to-Drive (off unless explicitly enabled)
+        // 1) Optional direct-to-Drive (OAuth client-side)
         if (driveDirect && gClientId) {
           try {
             reply = await uploadToDriveDirect({ dataUrl: lastPngDataUrl, name: outName, folderId: driveFolderId, clientId: gClientId });
@@ -688,12 +695,11 @@
         }
 
         if (!success) {
-          // As a very last resort, tell the user what to configure
           title.textContent = 'Saved (unconfirmed)';
           const folderHref = `https://drive.google.com/drive/folders/${driveFolderId}`;
           note.innerHTML = cbUrl
             ? 'Save completed but no server ACK was readable. If this keeps happening, enable CORS on the webhook to return JSON.'
-            : `No upload endpoint configured. Use Download or add <code>?cb=…</code> (and optionally <code>?driveFolder=…</code>).`;
+            : `No upload endpoint configured. Use Download or add <code>?cb=…</code>.`;
           link.innerHTML = `<a href="${folderHref}" target="_blank" rel="noopener">Open Snapshots folder</a>`;
         }
       } catch (err) {
@@ -719,14 +725,13 @@
     dockEls = { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note, link };
   }
 
-  function showDock(pngDataUrl, suggestedName, _ctx, message){
+  function showDock(pngDataUrl, suggestedName){
     ensureDockUi();
     const { dock, img, name, title, note, link } = dockEls;
-    if (message) { title.textContent = 'Snapshot'; note.textContent = message; }
+    title.textContent = 'Snapshot'; note.textContent = ''; link.textContent='';
     dock.style.display = 'block';
     if (pngDataUrl) img.src = pngDataUrl;
     if (suggestedName) name.value = suggestedName;
-    link.textContent = '';
     saveDockPos(dock);
   }
 
@@ -734,7 +739,7 @@
     let dragging=false, start={x:0,y:0, left:0, top:0};
     const onDown=(e)=>{ dragging=true; const r=el.getBoundingClientRect(); start={x:e.clientX,y:e.clientY,left:r.left,top:r.top}; window.addEventListener('pointermove',onMove,{passive:false}); window.addEventListener('pointerup',onUp,{once:true}); };
     const onMove=(e)=>{ if(!dragging) return; e.preventDefault(); const dx=e.clientX-start.x, dy=e.clientY-start.y; const L = clamp(start.left+dx, 0, window.innerWidth - el.offsetWidth); const T = clamp(start.top +dy, 0, window.innerHeight- el.offsetHeight); el.style.left = `${L}px`; el.style.top = `${T}px`; el.style.right='auto'; el.style.bottom='auto'; };
-    const onUp=()=>{ dragging=false; saveDockPos(el); window.removeEventListener('pointermove',onMove,{passive:false}); };
+    const onUp=()=>{ dragging=false; saveDockPos(el); window.removeEventListener('pointermove',onMove); };
     handle.addEventListener('pointerdown', onDown);
   }
   function saveDockPos(el){ const r = el.getBoundingClientRect(); try{ localStorage.setItem(LS_KEYS.dock, JSON.stringify({ left:r.left, top:r.top })); }catch{} }
@@ -750,7 +755,7 @@
     let dragging=false, start={x:0,y:0, left:0, top:0};
     const onDown=(e)=>{ dragging=true; el.classList.add('dragging'); const r=el.getBoundingClientRect(); start={x:e.clientX,y:e.clientY,left:r.left,top:r.top}; window.addEventListener('pointermove',onMove,{passive:false}); window.addEventListener('pointerup',onUp,{once:true}); };
     const onMove=(e)=>{ if(!dragging) return; e.preventDefault(); const dx=e.clientX-start.x, dy=e.clientY-start.y; const L = clamp(start.left+dx, 0, window.innerWidth - el.offsetWidth); const T = clamp(start.top +dy, 0, window.innerHeight- el.offsetHeight); el.style.left = `${L}px`; el.style.top = `${T}px`; el.style.transform=''; el.style.right='auto'; el.style.bottom='auto'; };
-    const onUp=()=>{ dragging=false; el.classList.remove('dragging'); saveBannerPos(el); window.removeEventListener('pointermove',onMove,{passive:false}); };
+    const onUp=()=>{ dragging=false; el.classList.remove('dragging'); saveBannerPos(el); window.removeEventListener('pointermove',onMove); };
     el.addEventListener('pointerdown', onDown);
   }
   function saveBannerPos(el){
@@ -829,7 +834,7 @@
   }
   function headerIndexMap(hdrRow, schema) {
     const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+    aconst wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
     const idx = (name) => Array.isArray(hdrRow)
       ? hdrRow.findIndex(h => (h||'').toLowerCase() === name)
       : -1;
@@ -877,7 +882,6 @@
     const parts = s.split(/([\/-])/g);
     const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']);
     const fixWord = (w, isFirst) => {
-      if (!w) return w;
       if (!isFirst && small.has(w)) return w;
       if (w === 'st' || w === 'st.') return 'St.';
       if (w === 'mt' || w === 'mt.') return 'Mt.';
@@ -993,7 +997,6 @@
   // Upload helpers
   // -----------------------------------------------------------------
   async function saveViaWebhook(url, payload){
-    // Try CORS JSON first
     try{
       const res = await fetch(url, { method:'POST', mode:'cors', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
       const j = await res.json().catch(()=>null);
@@ -1001,25 +1004,20 @@
     } catch (e) {
       console.warn('CORS JSON upload failed; will try no-cors fallback', e);
     }
-    // Fallback (unreadable response)
     try{
       await fetch(url, { method:'POST', mode:'no-cors', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
       return { ok:false };
-    } catch (e) {
-      throw e;
-    }
+    } catch (e) { throw e; }
   }
-
   function extractDriveFolderId(str){
     if (!str) return '';
-    // Accept raw ID or full URL
     const m = String(str).match(/\/folders\/([A-Za-z0-9_-]{10,})/);
     if (m) return m[1];
     if (/^[A-Za-z0-9_-]{10,}$/.test(str)) return str;
     return '';
   }
 
-  // Optional direct-to-Drive client side (requires OAuth client ID)
+  // Optional direct-to-Drive client side
   async function uploadToDriveDirect({ dataUrl, name, folderId, clientId }){
     await ensureGoogleApis();
     const token = await getDriveToken(clientId);
@@ -1096,7 +1094,7 @@
 
         if (!window.leafletImage) await ensureLibs();
         const canvas = await new Promise((resolve, reject) => leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
-        drawBannerOntoCanvas(canvas, it);
+        drawBannerOntoCanvas(canvas, it, {left:0,top:0}); // entire map canvas
         const png = canvas.toDataURL('image/png');
         const name = ensurePngExt(it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`);
         if (cbUrl) {
@@ -1107,7 +1105,7 @@
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — (kept)
+  // LOADERS / SELECTION / CUSTOMERS — (unchanged)
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
@@ -1604,3 +1602,4 @@ function headerIndexMap(hdrRow, schema) {
     : -1;
   return { coords: idx(wantCoords), note: idx(wantNote) };
 }
+</script>
