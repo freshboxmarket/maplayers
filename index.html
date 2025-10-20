@@ -4,7 +4,10 @@
   <meta charset="utf-8" />
   <title>Selected Zones Viewer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet CSS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
   <style>
     html, body, #map { height: 100%; margin: 0; }
     .panel {
@@ -42,18 +45,23 @@
   <div id="map" role="region" aria-label="Selected Zones Map"></div>
 
   <div id="legend" class="panel" aria-live="polite"></div>
-  <div id="drivers" class="panel" aria-live="polite"></div> <!-- NEW: driver toggles -->
+  <div id="drivers" class="panel" aria-live="polite"></div>
 
   <div id="status" aria-live="polite"></div>
   <div id="error" role="alert"></div>
 
+  <!-- Core libs -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
   <script src="https://unpkg.com/leaflet-boundary-canvas/dist/leaflet-boundary-canvas.min.js"></script>
 
-  <!-- NEW: needed for PNG snapshots -->
+  <!-- NEW: DOM-first capture for framed snapshots -->
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+
+  <!-- Keep map-only PNG fallback -->
   <script src="https://unpkg.com/leaflet-image/leaflet-image.js"></script>
 
+  <!-- App -->
   <script src="./apps.js" defer></script>
 
   <noscript>
