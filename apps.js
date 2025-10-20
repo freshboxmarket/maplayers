@@ -1,10 +1,12 @@
-/* apps.js — manual route viewer + bottom banner + framed snapshots (vNext)
-   -----------------------------------------------------------------------
-   Key upgrades:
-   • Next/Prev cycles: overview → 1 → … → n → overview (Prev reverse)
-   • Draggable dispatch banner, starts ~78% down; accepts rich text fields with smart fallbacks
-   • Two-step Snap (frame → capture): DOM-first via html2canvas with Leaflet fallback
-   • Fixed TDZ errors (“Cannot access 'snapEls' / 'snapArmed' before initialization”)
+/* apps.js — manual route viewer + draggable banner + persistent frame + snapshot panel (vNext)
+   ----------------------------------------------------------------------------------------------------------------
+   Highlights
+   • Next/Prev cycles overview ↔ routes (overview → 1 → … → n → overview).
+   • Draggable dispatch banner (starts ~78% down); remembers position.
+   • Framing rectangle remembers last position/size across uses & reloads.
+   • Snapshot flow: Frame → Capture → Preview Panel (Save / Download / Exit). No auto-dismiss.
+   • Flash anim is 0.25s and limited to the framed rectangle.
+   • Upload hardened: if cbAck=1, shows Drive link on success; never auto-hides status.
 */
 
 (async function () {
@@ -22,14 +24,11 @@
   const cbUrl           = qs.get('cb') || '';
   const cbAck           = qs.get('cbAck') === '1';
   const batchParam      = qs.get('batch'); // websafe b64 JSON
-
-  // Manual by default when batch exists; explicit manual=1 also honored. Use auto=1 to re-enable auto loop.
-  const manualMode = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
+  const manualMode      = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
 
   // ---------- runtime state ----------
   let batchItems = parseBatchItems(batchParam); // [{name, day, driver, keys[], stats, outName, view?}]
-  // cycle index: -1 = overview; [0..n-1] = focused routes
-  let currentIndex = -1;
+  let currentIndex = -1;     // -1 = overview
   let statsVisible = false;
   let manualSelectedKeys = null;
   let runtimeCustEnabled = null;
@@ -37,9 +36,12 @@
   let activeAssignMap = { ...assignMapParam };
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
 
-  // --- SNAPSHOT STATE DECLARED EARLY TO AVOID TDZ ---
+  // --- Snapshot state (declare early to avoid TDZ) ---
   let snapArmed = false;
-  let snapEls = null; // {overlay, helper, frame, flash, toast}
+  let snapEls = null;            // { overlay, helper, frame, flashCrop }
+  let dockEls = null;            // { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title }
+  let lastPngDataUrl = null;     // pending image data (held until Save/Exit)
+  let lastSuggestedName = null;  // default file name for save
 
   // ---------- map init ----------
   phase('Loading config…');
@@ -107,13 +109,14 @@
   if (manualMode && batchItems.length) {
     injectManualUI();
     ensureSnapshotUi();
+    ensureDockUi();
     await zoomToOverview();
   } else if (!manualMode && batchItems.length) {
     await runAutoExport(batchItems);
   }
 
   // =================================================================
-  // UI: Manual controller + Banner + Snapshot frame
+  // UI: Manual toolbar + Banner + Snapshot frame + Snapshot panel
   // =================================================================
   function injectManualUI(){
     const css = document.createElement('style');
@@ -147,12 +150,24 @@
       .snap-overlay .handle.n{top:-7px;left:calc(50% - 7px)} .snap-overlay .handle.s{bottom:-7px;left:calc(50% - 7px)}
       .snap-overlay .handle.w{left:-7px;top:calc(50% - 7px)} .snap-overlay .handle.e{right:-7px;top:calc(50% - 7px)}
 
-      /* flash + toast */
-      .snap-flash{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;z-index:9600;transition:opacity .18s ease}
-      .snap-flash.active{opacity:.65}
-      .snap-toast{position:fixed;left:12px;bottom:12px;z-index:9605;background:rgba(17,17,17,.95);color:#fff;
-        border-radius:10px;padding:10px 12px;font:600 13px system-ui;display:none;max-width:min(72vw,520px)}
-      .snap-toast a{color:#a5d6ff;text-decoration:underline}
+      /* cropped flash (only over frame), total ~0.25s */
+      .snap-flash-crop{position:fixed;background:#000;opacity:0;pointer-events:none;z-index:9600;transition:opacity .125s ease;border-radius:8px}
+
+      /* persistent snapshot panel (no auto-hide) */
+      .snap-dock{position:fixed;left:12px;bottom:12px;z-index:9605;background:rgba(17,17,17,.98);color:#fff;
+        border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.3);width:min(90vw,380px);display:none}
+      .snap-dock .head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.12);cursor:grab}
+      .snap-dock .title{font:600 14px system-ui}
+      .snap-dock .spacer{flex:1}
+      .snap-dock .x{background:transparent;border:0;color:#fff;font:700 16px system-ui;cursor:pointer;opacity:.9}
+      .snap-dock .body{padding:10px 12px;display:grid;gap:8px}
+      .snap-dock .preview{width:100%;max-height:42vh;object-fit:contain;border-radius:8px;background:#111}
+      .snap-dock .row{display:flex;gap:8px;align-items:center}
+      .snap-dock input[name="snapName"]{flex:1;min-width:0;background:#222;border:1px solid #444;color:#fff;border-radius:8px;padding:6px 8px;font:600 13px system-ui}
+      .snap-dock .btn{background:#1e88e5;color:#fff;border:0;border-radius:8px;padding:8px 10px;font:700 13px system-ui;cursor:pointer}
+      .snap-dock .btn.secondary{background:#424242}
+      .snap-dock .btn:disabled{opacity:.5;cursor:not-allowed}
+      .snap-dock .note{font:12px/1.3 system-ui;color:#cfd8dc}
     `;
     document.head.appendChild(css);
 
@@ -205,8 +220,12 @@
     const firstNonEmpty = (...cands) => {
       for (const c of cands) {
         if (c === null || c === undefined) continue;
-        const v = typeof c === 'string' ? c : (typeof c === 'number' ? String(c) : Array.isArray(c) ? c.join(' | ') : (typeof c === 'object' ? Object.values(c).join(' | ') : ''));
-        if (String(v).trim().length) return String(v);
+        const v = typeof c === 'string' ? c
+              : typeof c === 'number' ? String(c)
+              : Array.isArray(c) ? c.join(' | ')
+              : typeof c === 'object' ? Object.values(c).join(' | ')
+              : '';
+        if (String(v).trim()) return String(v);
       }
       return '0';
     };
@@ -235,7 +254,7 @@
 
   // Canvas banner (for saved PNG)
   function drawBannerOntoCanvas(canvas, it){
-    if (!it) return;
+    if (!it || !statsVisible) return; // mirror DOM visibility
     const s = it?.stats || {};
     const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
 
@@ -246,57 +265,30 @@
     const ctx = canvas.getContext('2d');
     const W = canvas.width, H = canvas.height;
     const pad = Math.round(Math.min(W,H)*0.018);
-    const maxW = Math.min(Math.round(W*0.8), 1100); // pixels
+    const maxW = Math.min(Math.round(W*0.8), 1100);
     const lineH = Math.max(16, Math.round(Math.min(W,H)*0.027));
 
-    const lines = [row1,row2,row3];
     const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
     const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
     const wrap = (text, font) => {
       ctx.font = font;
-      const words = text.split(/\s+/);
-      let cur='', out=[];
-      for (let w of words){
-        const test = cur ? cur + ' ' + w : w;
-        if (ctx.measureText(test).width <= maxW - pad*2) cur = test;
-        else { if (cur) out.push(cur); cur = w; }
-      }
-      if (cur) out.push(cur);
-      return out;
+      const words = text.split(/\s+/); let cur='', out=[];
+      for (const w of words){ const test = cur ? cur + ' ' + w : w; if (ctx.measureText(test).width <= maxW - pad*2) cur = test; else { if (cur) out.push(cur); cur = w; } }
+      if (cur) out.push(cur); return out;
     };
-    const wrapped = [...wrap(lines[0], fBold), ...wrap(lines[1], fNorm), ...wrap(lines[2], fNorm)];
-    const totalLines = wrapped.length;
-    const boxW = maxW;
-    const boxH = pad*2 + totalLines*lineH + Math.round(lineH*0.2);
-
-    // Draw near bottom-center (not at the very bottom)
+    const wrapped = [...wrap(row1, fBold), ...wrap(row2, fNorm), ...wrap(row3, fNorm)];
+    const boxW = maxW, boxH = pad*2 + wrapped.length*lineH + Math.round(lineH*0.2);
     const x = Math.round((W - boxW)/2);
     const y = Math.round(H - boxH - Math.max(pad*2, H*0.12));
 
-    // background
-    ctx.fillStyle = 'rgba(255,255,255,0.92)';
-    roundRect(ctx, x, y, boxW, boxH, 12).fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12).fill();
 
-    // text
-    let yy = y + pad + lineH;
-    ctx.fillStyle='#111';
-    ctx.font = fBold;
-    const L0 = wrap(lines[0], fBold).length;
+    let yy = y + pad + lineH; ctx.fillStyle='#111';
+    ctx.font = fBold; const L0 = wrap(row1, fBold).length;
     for (let i=0;i<L0;i++) { ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
-    ctx.font = fNorm;
-    for (let i=L0;i<wrapped.length;i++){ ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
+    ctx.font = fNorm; for (let i=L0;i<wrapped.length;i++) { ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
   }
-
-  function roundRect(ctx, x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y,   x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x,   y + h, r);
-    ctx.arcTo(x,   y + h, x,   y,   r);
-    ctx.arcTo(x,   y,   x + w, y,   r);
-    ctx.closePath();
-    return ctx;
-  }
+  function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); return ctx; }
 
   // ---------- Zoom helpers ----------
   function fitWithHints(bounds, hints){
@@ -312,28 +304,25 @@
   }
 
   async function stepRouteCycle(delta){
-    // delta: +1 next, -1 prev; cycle includes overview as a step
-    const N = batchItems.length;
-    if (!N) return;
+    const N = batchItems.length; if (!N) return;
 
     if (delta > 0) {
-      if (currentIndex === -1) currentIndex = 0;            // overview -> first
-      else if (currentIndex === N - 1) currentIndex = -1;   // last -> overview
-      else currentIndex += 1;                                // otherwise next
+      if (currentIndex === -1) currentIndex = 0;
+      else if (currentIndex === N - 1) currentIndex = -1;
+      else currentIndex += 1;
     } else {
-      if (currentIndex === -1) currentIndex = N - 1;        // overview -> last
-      else if (currentIndex === 0) currentIndex = -1;       // first -> overview
-      else currentIndex -= 1;                                // otherwise prev
+      if (currentIndex === -1) currentIndex = N - 1;
+      else if (currentIndex === 0) currentIndex = -1;
+      else currentIndex -= 1;
     }
 
     if (currentIndex === -1) { await zoomToOverview(); return; }
 
     const it = batchItems[currentIndex];
     manualSelectedKeys = (it.keys || []).map(normalizeKey);
-    runtimeCustEnabled = true; // focused: show only this route’s customers
+    runtimeCustEnabled = true;
     await applySelection();
     await loadCustomersIfAny();
-
     if (selectionBounds) fitWithHints(selectionBounds, (it && it.view) || null);
     renderDispatchBanner(it);
     updateButtons();
@@ -363,7 +352,7 @@
   }
 
   // =================================================================
-  // SNAPSHOT: frame → capture (DOM-first), flash, upload
+  // SNAPSHOT: frame → capture (DOM-first), cropped flash, preview panel
   // =================================================================
   function ensureSnapshotUi(){
     if (snapEls) return;
@@ -372,7 +361,7 @@
     overlay.className = 'snap-overlay'; overlay.style.display='none';
     overlay.innerHTML = `
       <div class="helper">Drag to frame your capture. Click the <b>red Snap</b> to take it. &nbsp;•&nbsp; Press <b>Esc</b> to cancel.</div>
-      <div class="frame" style="left:15vw;top:20vh;width:70vw;height:60vh">
+      <div class="frame">
         <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
         <div class="handle w" data-dir="w"></div> <div class="handle e" data-dir="e"></div>
         <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
@@ -380,44 +369,84 @@
     `;
     document.body.appendChild(overlay);
 
-    const flash = document.createElement('div'); flash.className='snap-flash'; document.body.appendChild(flash);
-    const toast = document.createElement('div'); toast.className='snap-toast'; document.body.appendChild(toast);
+    const flashCrop = document.createElement('div'); // cropped flash
+    flashCrop.className='snap-flash-crop';
+    document.body.appendChild(flashCrop);
 
-    snapEls = { overlay, helper: overlay.querySelector('.helper'), frame: overlay.querySelector('.frame'), flash, toast };
+    snapEls = { overlay, helper: overlay.querySelector('.helper'), frame: overlay.querySelector('.frame'), flashCrop };
     bindFramingGestures(snapEls.frame);
   }
 
-  function defaultFrame(){
+  function defaultFrameRect(){
     const vw = window.innerWidth, vh = window.innerHeight;
     const w = Math.round(vw*0.7), h = Math.round(vh*0.6);
     const l = Math.round((vw - w)/2), t = Math.round((vh - h)/2);
-    setFrameRect(l,t,w,h);
+    return { left:l, top:t, width:w, height:h };
   }
+
+  const LS_KEYS = {
+    frame: 'dispatchViewer.snapFrameRect',
+    banner:'dispatchViewer.bannerPos',
+    dock:  'dispatchViewer.snapDockPos'
+  };
+
   function setFrameRect(l,t,w,h){
     const f = snapEls.frame;
-    Object.assign(f.style, { left: `${clamp(l,0,window.innerWidth-20)}px`, top: `${clamp(t,0,window.innerHeight-20)}px`,
-      width: `${Math.max(40, Math.min(w, window.innerWidth))}px`, height: `${Math.max(40, Math.min(h, window.innerHeight))}px` });
+    Object.assign(f.style, {
+      left: `${clamp(l,0,window.innerWidth-20)}px`,
+      top: `${clamp(t,0,window.innerHeight-20)}px`,
+      width: `${Math.max(40, Math.min(w, window.innerWidth))}px`,
+      height:`${Math.max(40, Math.min(h, window.innerHeight))}px`
+    });
   }
   function getFrameRect(){
     const f = snapEls.frame.getBoundingClientRect();
     return { left: Math.round(f.left), top: Math.round(f.top), width: Math.round(f.width), height: Math.round(f.height) };
+  }
+  function saveFrameRect(){
+    const r = getFrameRect();
+    try{ localStorage.setItem(LS_KEYS.frame, JSON.stringify(r)); }catch{}
+  }
+  function restoreFrameRect(){
+    try{
+      const raw = localStorage.getItem(LS_KEYS.frame);
+      if (!raw) return false;
+      const p = JSON.parse(raw);
+      if (typeof p.left==='number' && typeof p.top==='number' && typeof p.width==='number' && typeof p.height==='number') {
+        setFrameRect(p.left, p.top, p.width, p.height);
+        return true;
+      }
+    }catch{}
+    return false;
   }
 
   async function onSnapClick(){
     if (!batchItems.length || currentIndex < 0) return;
     const btn = document.getElementById('btnSnap');
     if (!snapArmed){
-      ensureSnapshotUi(); defaultFrame();
+      ensureSnapshotUi();
+      if (!restoreFrameRect()) {
+        const r = defaultFrameRect(); setFrameRect(r.left, r.top, r.width, r.height);
+      }
       snapEls.overlay.style.display='block';
       snapEls.helper.style.display='block';
       btn.classList.add('armed'); btn.setAttribute('aria-label','Capture framed snapshot');
       snapArmed = true;
     } else {
       try{
-        await ensureLibs(); // make sure html2canvas / leaflet-image exist
-        await performCapture();
+        await ensureLibs();
+        const it = (currentIndex>=0 && currentIndex<batchItems.length) ? batchItems[currentIndex] : null;
+        if (!it) throw new Error('No focused route to capture.');
+        const r = getFrameRect();
+        const canvas = await captureCanvas(r);             // DOM-first with Leaflet fallback
+        drawBannerOntoCanvas(canvas, it);                  // draw (only if visible)
+        flashCropped(r);                                   // 0.25s inside the frame
+        lastPngDataUrl = canvas.toDataURL('image/png');
+        lastSuggestedName = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
+        showDock(lastPngDataUrl, lastSuggestedName, it);   // persist panel; user decides Save/Exit
+        saveFrameRect();                                   // remember rect for next time
       } catch (e) {
-        showToast(`Capture failed — ${String(e && e.message || e)}`);
+        showDock(null, null, null, `Capture failed — ${escapeHtml(e && e.message || e)}`);
       } finally {
         exitFraming();
       }
@@ -427,7 +456,7 @@
   function cancelFraming(){
     if (!snapArmed) return;
     exitFraming();
-    showToast('Framing cancelled.');
+    showDock(null, null, null, 'Framing cancelled.');
   }
   function exitFraming(){
     const btn = document.getElementById('btnSnap');
@@ -460,53 +489,46 @@
       }
       setFrameRect(l,t,w,h);
     };
-    const onUp = () => { window.removeEventListener('pointermove', onMove, {passive:false}); };
+    const onUp = () => { window.removeEventListener('pointermove', onMove, {passive:false}); saveFrameRect(); };
     frameEl.addEventListener('pointerdown', (e)=>{ if (!e.target.classList.contains('handle')) onDown(e, null); });
     frameEl.querySelectorAll('.handle').forEach(h => h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir'))));
   }
 
-  async function performCapture(){
-    const it = (currentIndex>=0 && currentIndex<batchItems.length) ? batchItems[currentIndex] : null;
-    if (!it) throw new Error('No focused route to capture.');
-    const r = getFrameRect();
-
-    // DOM-first capture
-    let canvas = null;
+  async function captureCanvas(r){
+    // Try DOM-first
     if (window.html2canvas) {
       try{
-        canvas = await html2canvas(document.body, {
-          useCORS: true, backgroundColor: null,
+        return await html2canvas(document.body, {
+          useCORS: true,
+          backgroundColor: null,
           x: r.left, y: r.top, width: r.width, height: r.height,
           windowWidth: document.documentElement.clientWidth,
           windowHeight: document.documentElement.clientHeight,
           scrollX: 0, scrollY: 0
         });
-      } catch (e) { console.warn('html2canvas failed; falling back to leaflet-image:', e); }
+      } catch (e) { console.warn('html2canvas failed; trying Leaflet fallback:', e); }
     }
+    // Fallback: map-only, crop, return canvas
+    if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
+    const mapRect = document.getElementById('map').getBoundingClientRect();
+    const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
+    if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap the map; fallback capture cannot proceed.');
+    const baseCanvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
+    // Crop to intersection
+    const sx = Math.max(0, Math.round(ix.left - mapRect.left));
+    const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
+    const sw = Math.round(ix.width), sh = Math.round(ix.height);
+    const out = document.createElement('canvas'); out.width = sw; out.height = sh;
+    out.getContext('2d').drawImage(baseCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+    return out;
+  }
 
-    // Fallback: map-only + banner draw
-    if (!canvas) {
-      if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
-      const mapRect = document.getElementById('map').getBoundingClientRect();
-      const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
-      if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap the map; fallback capture cannot proceed.');
-
-      canvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
-      // Crop to intersection (relative to map origin)
-      const sx = Math.max(0, Math.round(ix.left - mapRect.left));
-      const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
-      const sw = Math.round(ix.width), sh = Math.round(ix.height);
-      const out = document.createElement('canvas'); out.width = sw; out.height = sh;
-      out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
-
-      if (statsVisible) drawBannerOntoCanvas(out, it);
-      canvas = out;
-    }
-
-    flash();
-    const png = canvas.toDataURL('image/png');
-    const name = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
-    await uploadOrDownload(png, name, it);
+  function flashCropped(r){
+    if (!snapEls) return;
+    const f = snapEls.flashCrop;
+    Object.assign(f.style, { left:`${r.left}px`, top:`${r.top}px`, width:`${r.width}px`, height:`${r.height}px` });
+    f.style.opacity = '0.65';
+    setTimeout(()=>{ f.style.opacity = '0'; }, 125);  // fade back, total ~0.25s including CSS transition
   }
 
   function intersectRects(a,b){
@@ -518,33 +540,348 @@
     return { left:x1, top:y1, width:x2-x1, height:y2-y1 };
   }
 
-  async function uploadOrDownload(pngDataUrl, name, it){
-    if (!cbUrl) { downloadFallback(pngDataUrl, name); showToast(`Saved locally as ${escapeHtml(name)}.`); return; }
-    try{
-      const body = JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: pngDataUrl });
-      const res = await fetch(cbUrl, { method:'POST', mode: cbAck?'cors':'no-cors', headers: cbAck?{'Content-Type':'application/json'}:undefined, body });
-      if (cbAck) {
-        const j = await res.json().catch(()=>null);
-        if (j && j.ok) {
-          const link = j.webViewLink || j.alternateLink;
-          showToast(`Saved to <b>${escapeHtml(j.folder || 'Snapshots')}</b> as ${escapeHtml(name)}.` + (link ? ` <a href="${link}" target="_blank" rel="noopener">Open</a>` : ''));
-          return;
+  // ---------- Snapshot Dock (persistent review/save panel) ----------
+  function ensureDockUi(){
+    if (dockEls) return;
+    const dock = document.createElement('div');
+    dock.className = 'snap-dock';
+    dock.innerHTML = `
+      <div class="head" id="snapDockHead" aria-grabbed="false">
+        <div class="title">Snapshot</div>
+        <div class="spacer"></div>
+        <button class="x" id="snapDockClose" aria-label="Close">✕</button>
+      </div>
+      <div class="body">
+        <img class="preview" id="snapDockImg" alt="Snapshot preview"/>
+        <div class="row">
+          <input type="text" name="snapName" id="snapDockName" placeholder="filename.png" />
+        </div>
+        <div class="row">
+          <button class="btn" id="snapDockSave">Save</button>
+          <button class="btn secondary" id="snapDockDownload">Download</button>
+          <button class="btn secondary" id="snapDockExit">Exit</button>
+        </div>
+        <div class="note" id="snapDockNote"></div>
+      </div>
+    `;
+    document.body.appendChild(dock);
+
+    const img = dock.querySelector('#snapDockImg');
+    const name = dock.querySelector('#snapDockName');
+    const saveBtn = dock.querySelector('#snapDockSave');
+    const dlBtn = dock.querySelector('#snapDockDownload');
+    const exitBtn = dock.querySelector('#snapDockExit');
+    const closeBtn = dock.querySelector('#snapDockClose');
+    const title = dock.querySelector('.title');
+    const note = dock.querySelector('#snapDockNote');
+
+    // Drag dock by header
+    makeDockDraggable(dock, dock.querySelector('#snapDockHead')); restoreDockPos(dock);
+
+    saveBtn.addEventListener('click', async ()=>{
+      if (!lastPngDataUrl) { note.textContent = 'No snapshot to save.'; return; }
+      if (!cbUrl) { note.textContent = 'No upload endpoint (cb) provided in URL — use Download instead.'; return; }
+      saveBtn.disabled = true; note.textContent = 'Saving…';
+      try{
+        const ctx = currentIndex>=0 ? batchItems[currentIndex] : {};
+        const outName = (name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_');
+        const res = await fetch(cbUrl, {
+          method: 'POST',
+          mode: cbAck ? 'cors' : 'no-cors',
+          headers: cbAck ? { 'Content-Type':'application/json' } : undefined,
+          body: JSON.stringify({ name: outName, day: ctx.day, driver: ctx.driver, routeName: ctx.name, pngBase64: lastPngDataUrl })
+        });
+        if (cbAck) {
+          const j = await res.json().catch(()=>null);
+          if (j && j.ok) {
+            title.textContent = 'Saved ✓';
+            note.innerHTML = `Saved to <b>${escapeHtml(j.folder || 'Snapshots')}</b> as <b>${escapeHtml(outName)}</b>.` + (j.webViewLink ? ` <a href="${j.webViewLink}" target="_blank" rel="noopener">Open</a>` : '');
+          } else {
+            note.textContent = 'Save completed (no ACK) or server did not return {ok:true}.';
+          }
+        } else {
+          title.textContent = 'Saved ✓';
+          note.textContent = 'Saved to Drive (no ACK).';
         }
+      } catch (err) {
+        note.textContent = `Upload failed — you can still Download. (${String(err && err.message || err)})`;
+      } finally {
+        saveBtn.disabled = false;
       }
-      showToast(`Saved to Drive (Snapshots) as ${escapeHtml(name)}.`);
-    } catch (e) {
-      console.warn('Upload failed, falling back to download:', e);
-      downloadFallback(pngDataUrl, name);
-      showToast(`Upload failed — downloaded locally as ${escapeHtml(name)}.`);
-    }
+    });
+
+    dlBtn.addEventListener('click', ()=>{
+      if (!lastPngDataUrl) { note.textContent = 'No snapshot to download.'; return; }
+      const nm = (name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_');
+      downloadFallback(lastPngDataUrl, nm);
+      title.textContent = 'Downloaded ✓';
+      note.textContent = `Downloaded as ${nm}.`;
+    });
+
+    const closeDock = ()=>{ dock.style.display='none'; lastPngDataUrl=null; lastSuggestedName=null; note.textContent=''; };
+    exitBtn.addEventListener('click', closeDock);
+    closeBtn.addEventListener('click', closeDock);
+
+    dockEls = { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note };
   }
 
-  function flash(){ if (!snapEls) return; snapEls.flash.classList.add('active'); setTimeout(()=>snapEls.flash.classList.remove('active'), 200); }
-  function showToast(html){ if (!snapEls) return; const t = snapEls.toast; t.innerHTML = html; t.style.display='block'; clearTimeout(t._tmr); t._tmr = setTimeout(()=>{ t.style.display='none'; }, 4200); }
+  function showDock(pngDataUrl, suggestedName, ctx, message){
+    ensureDockUi();
+    const { dock, img, name, title, note } = dockEls;
+    if (message) { title.textContent = 'Snapshot'; note.textContent = message; }
+    dock.style.display = 'block';
+    if (pngDataUrl) img.src = pngDataUrl;
+    if (suggestedName) name.value = suggestedName;
+    saveDockPos(dock); // persist position if first time showing
+  }
+
+  function makeDockDraggable(el, handle){
+    let dragging=false, start={x:0,y:0, left:0, top:0};
+    const onDown=(e)=>{ dragging=true; const r=el.getBoundingClientRect(); start={x:e.clientX,y:e.clientY,left:r.left,top:r.top}; window.addEventListener('pointermove',onMove,{passive:false}); window.addEventListener('pointerup',onUp,{once:true}); };
+    const onMove=(e)=>{ if(!dragging) return; e.preventDefault(); const dx=e.clientX-start.x, dy=e.clientY-start.y; const L = clamp(start.left+dx, 0, window.innerWidth - el.offsetWidth); const T = clamp(start.top +dy, 0, window.innerHeight- el.offsetHeight); el.style.left = `${L}px`; el.style.top = `${T}px`; el.style.right='auto'; el.style.bottom='auto'; };
+    const onUp=()=>{ dragging=false; saveDockPos(el); window.removeEventListener('pointermove',onMove,{passive:false}); };
+    handle.addEventListener('pointerdown', onDown);
+  }
+  function saveDockPos(el){ const r = el.getBoundingClientRect(); try{ localStorage.setItem(LS_KEYS.dock, JSON.stringify({ left:r.left, top:r.top })); }catch{} }
+  function restoreDockPos(el){
+    try{ const raw = localStorage.getItem(LS_KEYS.dock); if (!raw) return;
+      const p = JSON.parse(raw);
+      if (typeof p.left==='number' && typeof p.top==='number') { el.style.left = `${clamp(p.left,0,window.innerWidth - el.offsetWidth)}px`; el.style.top = `${clamp(p.top, 0,window.innerHeight- el.offsetHeight)}px`; el.style.right='auto'; el.style.bottom='auto'; }
+    }catch{}
+  }
+
+  // ---------- banner drag helpers ----------
+  function makeBannerDraggable(el){
+    let dragging=false, start={x:0,y:0, left:0, top:0};
+    const onDown=(e)=>{ dragging=true; el.classList.add('dragging'); const r=el.getBoundingClientRect(); start={x:e.clientX,y:e.clientY,left:r.left,top:r.top}; window.addEventListener('pointermove',onMove,{passive:false}); window.addEventListener('pointerup',onUp,{once:true}); };
+    const onMove=(e)=>{ if(!dragging) return; e.preventDefault(); const dx=e.clientX-start.x, dy=e.clientY-start.y; const L = clamp(start.left+dx, 0, window.innerWidth - el.offsetWidth); const T = clamp(start.top +dy, 0, window.innerHeight- el.offsetHeight); el.style.left = `${L}px`; el.style.top = `${T}px`; el.style.transform=''; el.style.right='auto'; el.style.bottom='auto'; };
+    const onUp=()=>{ dragging=false; el.classList.remove('dragging'); saveBannerPos(el); window.removeEventListener('pointermove',onMove,{passive:false}); };
+    el.addEventListener('pointerdown', onDown);
+  }
+  function saveBannerPos(el){
+    const r = el.getBoundingClientRect();
+    try{ localStorage.setItem(LS_KEYS.banner, JSON.stringify({ left:r.left, top:r.top })); }catch{}
+  }
+  function restoreBannerPos(el){
+    try{
+      const raw = localStorage.getItem(LS_KEYS.banner);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (typeof p.left === 'number' && typeof p.top === 'number') {
+        el.style.left = `${clamp(p.left,0,window.innerWidth - el.offsetWidth)}px`;
+        el.style.top  = `${clamp(p.top, 0,window.innerHeight- el.offsetHeight)}px`;
+        el.style.transform = '';
+      }
+    }catch{}
+  }
+
+  // ---------- helpers ----------
+  function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
+  async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
+  async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  function parseBatchItems(b64){ if (!b64) return []; try { const json = atob(String(b64).replace(/-/g,'+').replace(/_/g,'/')); const arr = JSON.parse(json); return Array.isArray(arr) ? arr : []; } catch { return []; } }
+
+  function parseCsvRows(text) {
+    const out = []; let i=0, f='', r=[], q=false;
+    text = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const N = text.length;
+    const pushF=()=>{ r.push(f); f=''; }, pushR=()=>{ out.push(r); r=[]; };
+    while (i<N) {
+      const c = text[i];
+      if (q) {
+        if (c === '"') { if (i+1<N && text[i+1] === '"') { f+='"'; i+=2; } else { q=false; i++; } }
+        else { f+=c; i++; }
+      } else {
+        if (c === '"') { q=true; i++; }
+        else if (c === ',') { pushF(); i++; }
+        else if (c === '\n') { pushF(); pushR(); i++; }
+        else { f+=c; i++; }
+      }
+    }
+    pushF(); pushR();
+    return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
+  }
+
+  function findHeaderFlexible(rows, schema) {
+    if (!rows?.length) return null;
+    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase();
+    const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    for (let i=0;i<rows.length;i++){
+      const row = rows[i] || [];
+      let keysCol = -1;
+      row.forEach((h, idx) => {
+        const v = like(h);
+        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys'))))
+          keysCol = idx;
+      });
+      if (keysCol !== -1) return { headerIndex: i, keysCol };
+    }
+    return null;
+  }
+
+  function findCustomerHeaderIndex(rows, schema) {
+    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+    for (let i=0;i<rows.length;i++) {
+      const hdr = rows[i] || [];
+      const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
+      const hasNote   = hdr.some(h => (h||'').toLowerCase() === wantNote);
+      if (hasCoords || hasNote) return i;
+    }
+    return -1;
+  }
+  function headerIndexMap(hdrRow, schema) {
+    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+    const wantNote   = ((schema and schema.note) || 'Order Note').toLowerCase();
+    const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
+    return { coords: idx(wantCoords), note: idx(wantNote) };
+  }
+
+  function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
+  function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
+
+  function normalizeKey(s) {
+    s = String(s || '').trim().toUpperCase();
+    const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
+    if (m) return m[1] + String(parseInt(m[2], 10)) + (m[3] || '');
+    return s;
+  }
+  function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
+  function quadParts(key) { const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/); return m ? { quad: m[1], sub: m[2] || null } : null; }
+  function basePlusQuad(key) { const p = quadParts(key); return p ? (baseKeyFrom(key) + '_' + p.quad) : null; }
+  function isSubquadrantKey(k) { const p = quadParts(k); return !!(p && p.sub); }
+  function isQuadrantKey(k)    { const p = quadParts(k); return !!(p && !p.sub); }
+
+  function parseLatLng(s) {
+    const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
+    if (!m) return null;
+    const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+    return { lat, lng };
+  }
+
+  function dimFill(perDay, cfg) {
+    const base = perDay.fillOpacity ?? 0.8;
+    const factor = cfg.style?.dimmed?.fillFactor ?? 0.3;
+    return Math.max(0.08, base * factor);
+  }
+
+  function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
+  function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
+
+  function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+
+  function smartTitleCase(s) {
+    if (!s) return '';
+    s = s.toLowerCase();
+    const parts = s.split(/([\/-])/g);
+    const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']);
+    const fixWord = (w, isFirst) => {
+      if (!w) return w;
+      if (!isFirst && small.has(w)) return w;
+      if (w === 'st' || w === 'st.') return 'St.';
+      if (w === 'mt' || w === 'mt.') return 'Mt.';
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    };
+    let tokenIdx = 0;
+    for (let i=0;i<parts.length;i++){
+      if (parts[i] === '/' || parts[i] === '-') continue;
+      const tokens = parts[i].split(/\s+/).map(tok => fixWord(tok, tokenIdx++ === 0));
+      parts[i] = tokens.join(' ');
+    }
+    return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
+  }
+
+  function showTopError(title, msg) { const el = document.getElementById('error'); if (!el) return; el.style.display = 'block'; el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`; }
+  function renderError(msg) { showTopError('Load error', msg); }
+  function phase(msg){ setStatus(`⏳ ${msg}`); }
+  function info(msg){ setStatus(`ℹ️ ${msg}`); }
+  function warn(msg){ showTopError('Warning', msg); }
+
+  function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
+  function makeStatusLine(selMunis, inCount, outCount, activeKeysLowerArray) {
+    const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
+    const keysTxt = (Array.isArray(activeKeysLowerArray) && activeKeysLowerArray.length) ? activeKeysLowerArray.join(', ') : '—';
+    return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList} • active zone keys: ${keysTxt}`;
+  }
+
+  function extractAssignmentsFromCsv(rows, knownNamesSet) {
+    const like = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const dayWords = new Set(['mon','monday','tue','tues','tuesday','wed','weds','wednesday','thu','thur','thurs','thursday','fri','friday','sat','saturday','sun','sunday']);
+    const looksLikeName = (s) => { const v = like(s); if (!v) return false; if (dayWords.has(v)) return false; if (knownNamesSet && knownNamesSet.size) return knownNamesSet.has(v); return /^[a-z][a-z .'\-]{1,30}$/.test(v) && !/\d/.test(v); };
+    const isKeysHeader = (s) => { const v = like(s); return v.includes('key') || v.includes('zone') || v.includes('route'); };
+    const isDriverHeader = (s) => { const v = like(s); return v.includes('driver') || v === 'name' || v.includes('assigned'); };
+
+    let headerIndex=-1, driverCol=-1, keysCol=-1;
+    for (let i=0; i<Math.min(rows.length, 50); i++) {
+      const row = rows[i] || [];
+      let d=-1, k=-1;
+      for (let c=0;c<row.length;c++) {
+        const cell=(row[c]||'');
+        if (d === -1 && isDriverHeader(cell)) d = c;
+        if (k === -1 && isKeysHeader(cell))   k = c;
+      }
+      if (d !== -1 && k !== -1) { headerIndex = i; driverCol = d; keysCol = k; break; }
+    }
+
+    const out = {};
+    if (headerIndex !== -1) {
+      for (let r = headerIndex + 1; r < rows.length; r++) {
+        const row = rows[r] || [];
+        const dn = (row[driverCol] || '').trim();
+        const ks = (row[keysCol]   || '').trim();
+        if (!dn || !ks) continue;
+        if (!looksLikeName(dn)) continue;
+        splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
+      }
+      return out;
+    }
+
+    for (let r = 0; r < Math.min(rows.length, 40); r++) {
+      const row = rows[r] || [];
+      if (!row.length) continue;
+      let dn = '';
+      for (let c=0;c<row.length;c++) {
+        const cell = (row[c]||'').trim(); if (!cell) continue;
+        if (looksLikeName(cell)) { dn = cell; break; }
+      }
+      if (!dn) continue;
+      let allKeys = [];
+      for (let c=0;c<row.length;c++) {
+        const cell = (row[c]||'').trim();
+        if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW)(_(TL|TR|LL|LR))?)?/i.test(cell)) {
+          allKeys = allKeys.concat(splitKeys(cell).map(normalizeKey));
+        }
+      }
+      allKeys = Array.from(new Set(allKeys)).filter(Boolean);
+      allKeys.forEach(k => { out[k] = dn; });
+    }
+    return out;
+  }
+
+  function ensureDriverMeta(metaList, driverNames) {
+    const out = Array.isArray(metaList) ? [...metaList] : [];
+    const seen = new Set(out.map(d => String(d.name||'').toLowerCase()));
+    for (const nm of (driverNames || [])) {
+      const low = String(nm||'').toLowerCase(); if (!low) continue;
+      if (!seen.has(low)) { out.push({ name: nm, color: colorFromName(nm) }); seen.add(low); }
+    }
+    return out;
+  }
+
+  function colorFromName(name) { let h=0; const s=65, l=50; const str = String(name||''); for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360; return `hsl(${h}, ${s}%, ${l}%)`; }
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
   const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
 
-  // Load libs on demand if missing (DOM-first capture prefers html2canvas)
+  function downloadFallback(dataUrl, name){
+    try{ const a = document.createElement('a'); a.href = dataUrl; a.download = name || 'snapshot.png'; document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(), 0); }
+    catch(e){ console.warn('downloadFallback failed:', e); }
+  }
+
+  // Load libs if missing
   async function ensureLibs(){
     const loadScript = (src) => new Promise((resolve, reject) => {
       if ([...document.scripts].some(s => s.src && s.src.includes(src))) return resolve();
@@ -572,9 +909,8 @@
         await sleep(350);
 
         if (!window.leafletImage) await ensureLibs();
-        const canvas = await new Promise((resolve, reject) =>
-          leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
-        if (statsVisible) drawBannerOntoCanvas(canvas, it);
+        const canvas = await new Promise((resolve, reject) => leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
+        drawBannerOntoCanvas(canvas, it);
         const png = canvas.toDataURL('image/png');
         const name = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
         if (cbUrl) {
@@ -586,7 +922,7 @@
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — (kept, with minor hardening)
+  // LOADERS / SELECTION / CUSTOMERS — (kept)
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
@@ -826,46 +1162,26 @@
 
     const turfOn = (typeof turf !== 'undefined');
     const cst = cfg.style?.customers || {};
-    const outStyle = {
-      radius: cst.radius || 9, color:  '#7a7a7a', weight: cst.weightPx || 2, opacity: 0.8,
-      fillColor: '#c7c7c7', fillOpacity: 0.6
-    };
+    const outStyle = { radius: cst.radius || 9, color: '#7a7a7a', weight: cst.weightPx || 2, opacity: 0.8, fillColor: '#c7c7c7', fillOpacity: 0.6 };
 
     const onlySelectedCustomers = manualMode && (currentIndex >= 0);
 
     for (const rec of customerMarkers) {
-      let show = true;
-      let style = { ...outStyle };
-      let insideSel = false;
-      let selDay = null;
+      let show = true, style = { ...outStyle }, insideSel = false, selDay = null;
 
       if (turfOn) {
         const pt = turf.point([rec.lng, rec.lat]);
-
         for (let j = 0; j < coveragePolysAll.length; j++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
-            const lyr = coveragePolysAll[j].layerRef;
-            if (lyr) lyr._custAny += 1;
-            break;
+            const lyr = coveragePolysAll[j].layerRef; if (lyr) lyr._custAny += 1; break;
           }
         }
-
         for (let k = 0; k < coveragePolysSelected.length; k++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
-            insideSel = true;
-            selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
+            insideSel = true; selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
             const pd = coveragePolysSelected[k].perDay || {};
-            style = {
-              radius:  (cst.radius || 9),
-              color:   pd.stroke || (cst.stroke || '#111'),
-              weight:  (cst.weightPx || 2),
-              opacity: (cst.opacity ?? 0.95),
-              fillColor: pd.fill || (cst.fill || '#ffffff'),
-              fillOpacity: (cst.fillOpacity ?? 0.95)
-            };
-            const lyr = coveragePolysSelected[k].layerRef;
-            if (lyr) lyr._custSel += 1;
-            break;
+            style = { radius:(cst.radius||9), color: pd.stroke || (cst.stroke || '#111'), weight:(cst.weightPx||2), opacity:(cst.opacity ?? 0.95), fillColor: pd.fill || (cst.fill || '#ffffff'), fillOpacity:(cst.fillOpacity ?? 0.95) };
+            const lyr = coveragePolysSelected[k].layerRef; if (lyr) lyr._custSel += 1; break;
           }
         }
       }
@@ -881,9 +1197,7 @@
       if (show) rec.marker.setStyle(style);
     }
 
-    custWithinSel = inSel;
-    custOutsideSel = outSel;
-
+    custWithinSel = inSel; custOutsideSel = outSel;
     driverSelectedCounts = computeDriverCounts();
     renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
@@ -892,8 +1206,7 @@
     const out = {};
     for (const rec of coveragePolysSelected) {
       const lyr = rec.layerRef; if (!lyr) continue;
-      const drv = lookupDriverForKey(lyr._routeKey);
-      if (!drv) continue;
+      const drv = lookupDriverForKey(lyr._routeKey); if (!drv) continue;
       out[drv] = (out[drv] || 0) + (lyr._custSel || 0);
     }
     return out;
@@ -1018,312 +1331,6 @@
       fillColor: perDay.fill || '#ccc',
       fillOpacity: dimFill(perDay, cfg)
     });
-  }
-
-  // ---------- UI PANELS (kept) ----------
-  function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
-    const el = document.getElementById('drivers'); if (!el) return;
-
-    const metaByName = new Map((metaList||[]).map(d => [String(d.name||'').toLowerCase(), d]));
-    const overlayDrivers = Object.keys(overlays || {});
-    const haveOverlays = overlayDrivers.length > 0;
-
-    const allDriverNames = haveOverlays
-      ? overlayDrivers
-      : Array.from(new Set(Object.values(activeAssignMap))).sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
-
-    const orderIndex = new Map((metaList||[]).map((d,i)=>[String(d.name||'').toLowerCase(), i]));
-    allDriverNames.sort((a,b)=>{
-      const ia = orderIndex.has(a.toLowerCase()) ? orderIndex.get(a.toLowerCase()) : 9999;
-      const ib = orderIndex.has(b.toLowerCase()) ? orderIndex.get(b.toLowerCase()) : 9999;
-      if (ia !== ib) return ia - ib;
-      return a.toLowerCase().localeCompare(b.toLowerCase());
-    });
-
-    const rows = allDriverNames.map(name => {
-      const meta = metaByName.get(name.toLowerCase()) || { name, color: colorFromName(name) };
-      const col = meta.color || '#888';
-      const safe = escapeHtml(name || '');
-      const isPresent = !!overlays?.[name];
-      const onAttr = isPresent && defaultOn ? 'checked' : '';
-      const count = typeof countsMap[name] === 'number' ? countsMap[name] : 0;
-      const frac = `${count}/${totalSelected || 0}`;
-      return `<div class="row">
-        <input type="checkbox" data-driver="${safe}" aria-label="Toggle ${safe}" ${onAttr} ${isPresent ? '' : 'disabled'}>
-        <span class="swatch" style="background:${col}; border-color:${col}"></span>
-        <div>${safe}</div>
-        <div class="counts" style="margin-left:auto">${frac}</div>
-      </div>`;
-    }).join('');
-
-    el.innerHTML = `<h4>Drivers</h4>${rows}`;
-    el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-      const name = cb.getAttribute('data-driver');
-      if (!overlays?.[name]) return;
-      toggleDriverOverlay(name, !!cb.checked);
-      cb.addEventListener('change', (e) => toggleDriverOverlay(name, e.target.checked));
-    });
-  }
-  function toggleDriverOverlay(name, on) { const rec = driverOverlays[name]; if (!rec) return; if (on) { rec.group.addTo(map); try { if (rec.labelMarker) rec.labelMarker.openTooltip(); } catch{} } else { map.removeLayer(rec.group); } }
-
-  function renderLegend(cfg, legendCounts, custIn, custOut, outsideToggle) {
-    const el = document.getElementById('legend'); if (!el) return;
-    const rowsHtml = (cfg.layers || []).map(Lcfg => {
-      const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
-      const c  = (legendCounts && legendCounts[Lcfg.day]) ? legendCounts[Lcfg.day] : { selected: 0, total: 0 };
-      const frac = (c.total > 0) ? `${c.selected}/${c.total}` : '0/0';
-      return `<div class="row">
-        <span class="swatch" style="background:${st.fill}; border-color:${st.stroke}"></span>
-        <div>${Lcfg.day}</div>
-        <div class="counts">${frac}</div>
-      </div>`;
-    }).join('');
-    const custBlock = `<div class="row" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px">
-        <div>Customers within selection:</div><div class="counts">${custIn ?? 0}</div>
-      </div>
-      <div class="row">
-        <div>Customers outside selection:</div><div class="counts">${custOut ?? 0}</div>
-      </div>`;
-    const toggle = `<div class="row" style="margin-top:4px">
-        <input type="checkbox" id="toggleOutside" ${outsideToggle ? 'checked' : ''} aria-label="Highlight outside customers">
-        <div>Highlight outside customers</div>
-      </div>`;
-    el.innerHTML = `<h4>Layers</h4>${rowsHtml}${custBlock}${toggle}`;
-  }
-
-  // ---------- banner drag helpers ----------
-  function makeBannerDraggable(el){
-    let dragging=false, start={x:0,y:0, left:0, top:0};
-    const onDown=(e)=>{ dragging=true; el.classList.add('dragging'); const r=el.getBoundingClientRect(); start={x:e.clientX,y:e.clientY,left:r.left,top:r.top}; window.addEventListener('pointermove',onMove,{passive:false}); window.addEventListener('pointerup',onUp,{once:true}); };
-    const onMove=(e)=>{ if(!dragging) return; e.preventDefault(); const dx=e.clientX-start.x, dy=e.clientY-start.y; let L = clamp(start.left+dx, 0, window.innerWidth - el.offsetWidth); let T = clamp(start.top +dy, 0, window.innerHeight- el.offsetHeight); el.style.left = `${L}px`; el.style.top = `${T}px`; el.style.transform=''; el.style.right='auto'; el.style.bottom='auto'; };
-    const onUp=()=>{ dragging=false; el.classList.remove('dragging'); saveBannerPos(el); window.removeEventListener('pointermove',onMove,{passive:false}); };
-    el.addEventListener('pointerdown', onDown);
-  }
-  function saveBannerPos(el){
-    const r = el.getBoundingClientRect();
-    sessionStorage.setItem('dispatchBannerPos', JSON.stringify({ left:r.left, top:r.top }));
-  }
-  function restoreBannerPos(el){
-    try{
-      const raw = sessionStorage.getItem('dispatchBannerPos');
-      if (!raw) return;
-      const p = JSON.parse(raw);
-      if (typeof p.left === 'number' && typeof p.top === 'number') {
-        el.style.left = `${clamp(p.left,0,window.innerWidth - el.offsetWidth)}px`;
-        el.style.top  = `${clamp(p.top, 0,window.innerHeight- el.offsetHeight)}px`;
-        el.style.transform = '';
-      }
-    }catch{}
-  }
-
-  // ---------- helpers ----------
-  function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
-  async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
-  async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-  function parseBatchItems(b64){ if (!b64) return []; try { const json = atob(String(b64).replace(/-/g,'+').replace(/_/g,'/')); const arr = JSON.parse(json); return Array.isArray(arr) ? arr : []; } catch { return []; } }
-
-  function parseCsvRows(text) {
-    const out = []; let i=0, f='', r=[], q=false;
-    text = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    const N = text.length;
-    const pushF=()=>{ r.push(f); f=''; }, pushR=()=>{ out.push(r); r=[]; };
-    while (i<N) {
-      const c = text[i];
-      if (q) {
-        if (c === '"') { if (i+1<N && text[i+1] === '"') { f+='"'; i+=2; } else { q=false; i++; } }
-        else { f+=c; i++; }
-      } else {
-        if (c === '"') { q=true; i++; }
-        else if (c === ',') { pushF(); i++; }
-        else if (c === '\n') { pushF(); pushR(); i++; }
-        else { f+=c; i++; }
-      }
-    }
-    pushF(); pushR();
-    return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
-  }
-
-  function findHeaderFlexible(rows, schema) {
-    if (!rows?.length) return null;
-    const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase();
-    const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-    for (let i=0;i<rows.length;i++){
-      const row = rows[i] || [];
-      let keysCol = -1;
-      row.forEach((h, idx) => {
-        const v = like(h);
-        if (keysCol === -1 && (v === like(wantKeys) || v.startsWith('zone key') || v === 'keys' || (v.includes('selected') && v.includes('keys'))))
-          keysCol = idx;
-      });
-      if (keysCol !== -1) return { headerIndex: i, keysCol };
-    }
-    return null;
-  }
-
-  function findCustomerHeaderIndex(rows, schema) {
-    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
-    for (let i=0;i<rows.length;i++) {
-      const hdr = rows[i] || [];
-      const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
-      const hasNote   = hdr.some(h => (h||'').toLowerCase() === wantNote);
-      if (hasCoords || hasNote) return i;
-    }
-    return -1;
-  }
-  function headerIndexMap(hdrRow, schema) {
-    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
-    const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
-    return { coords: idx(wantCoords), note: idx(wantNote) };
-  }
-
-  function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
-  function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
-
-  function normalizeKey(s) {
-    s = String(s || '').trim().toUpperCase();
-    const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/);
-    if (m) return m[1] + String(parseInt(m[2], 10)) + (m[3] || '');
-    return s;
-  }
-  function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
-  function quadParts(key) { const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/); return m ? { quad: m[1], sub: m[2] || null } : null; }
-  function basePlusQuad(key) { const p = quadParts(key); return p ? (baseKeyFrom(key) + '_' + p.quad) : null; }
-  function isSubquadrantKey(k) { const p = quadParts(k); return !!(p && p.sub); }
-  function isQuadrantKey(k)    { const p = quadParts(k); return !!(p && !p.sub); }
-
-  function parseLatLng(s) {
-    const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/);
-    if (!m) return null;
-    const lat = parseFloat(m[1]), lng = parseFloat(m[2]);
-    if (!isFinite(lat) || !isFinite(lng)) return null;
-    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
-    return { lat, lng };
-  }
-
-  function dimFill(perDay, cfg) {
-    const base = perDay.fillOpacity ?? 0.8;
-    const factor = cfg.style?.dimmed?.fillFactor ?? 0.3;
-    return Math.max(0.08, base * factor);
-  }
-
-  function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
-  function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
-
-  function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
-
-  function smartTitleCase(s) {
-    if (!s) return '';
-    s = s.toLowerCase();
-    const parts = s.split(/([\/-])/g);
-    const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']);
-    const fixWord = (w, isFirst) => {
-      if (!w) return w;
-      if (!isFirst && small.has(w)) return w;
-      if (w === 'st' || w === 'st.') return 'St.';
-      if (w === 'mt' || w === 'mt.') return 'Mt.';
-      return w.charAt(0).toUpperCase() + w.slice(1);
-    };
-    let tokenIdx = 0;
-    for (let i=0;i<parts.length;i++){
-      if (parts[i] === '/' || parts[i] === '-') continue;
-      const tokens = parts[i].split(/\s+/).map(tok => fixWord(tok, tokenIdx++ === 0));
-      parts[i] = tokens.join(' ');
-    }
-    return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
-  }
-
-  function showTopError(title, msg) { const el = document.getElementById('error'); if (!el) return; el.style.display = 'block'; el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`; }
-  function renderError(msg) { showTopError('Load error', msg); }
-  function phase(msg){ setStatus(`⏳ ${msg}`); }
-  function info(msg){ setStatus(`ℹ️ ${msg}`); }
-  function warn(msg){ showTopError('Warning', msg); }
-
-  function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
-  function makeStatusLine(selMunis, inCount, outCount, activeKeysLowerArray) {
-    const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
-    const keysTxt = (Array.isArray(activeKeysLowerArray) && activeKeysLowerArray.length) ? activeKeysLowerArray.join(', ') : '—';
-    return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList} • active zone keys: ${keysTxt}`;
-  }
-
-  function extractAssignmentsFromCsv(rows, knownNamesSet) {
-    const like = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
-    const dayWords = new Set(['mon','monday','tue','tues','tuesday','wed','weds','wednesday','thu','thur','thurs','thursday','fri','friday','sat','saturday','sun','sunday']);
-    const looksLikeName = (s) => {
-      const v = like(s);
-      if (!v) return false;
-      if (dayWords.has(v)) return false;
-      if (knownNamesSet && knownNamesSet.size) return knownNamesSet.has(v);
-      return /^[a-z][a-z .'\-]{1,30}$/.test(v) && !/\d/.test(v);
-    };
-    const isKeysHeader = (s) => { const v = like(s); return v.includes('key') || v.includes('zone') || v.includes('route'); };
-    const isDriverHeader = (s) => { const v = like(s); return v.includes('driver') || v === 'name' || v.includes('assigned'); };
-
-    let headerIndex=-1, driverCol=-1, keysCol=-1;
-    for (let i=0; i<Math.min(rows.length, 50); i++) {
-      const row = rows[i] || [];
-      let d=-1, k=-1;
-      for (let c=0;c<row.length;c++) {
-        const cell=(row[c]||'');
-        if (d === -1 && isDriverHeader(cell)) d = c;
-        if (k === -1 && isKeysHeader(cell))   k = c;
-      }
-      if (d !== -1 && k !== -1) { headerIndex = i; driverCol = d; keysCol = k; break; }
-    }
-
-    const out = {};
-    if (headerIndex !== -1) {
-      for (let r = headerIndex + 1; r < rows.length; r++) {
-        const row = rows[r] || [];
-        const dn = (row[driverCol] || '').trim();
-        const ks = (row[keysCol]   || '').trim();
-        if (!dn || !ks) continue;
-        if (!looksLikeName(dn)) continue;
-        splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
-      }
-      return out;
-    }
-
-    for (let r = 0; r < Math.min(rows.length, 40); r++) {
-      const row = rows[r] || [];
-      if (!row.length) continue;
-      let dn = '';
-      for (let c=0;c<row.length;c++) {
-        const cell = (row[c]||'').trim();
-        if (!cell) continue;
-        if (looksLikeName(cell)) { dn = cell; break; }
-      }
-      if (!dn) continue;
-      let allKeys = [];
-      for (let c=0;c<row.length;c++) {
-        const cell = (row[c]||'').trim();
-        if (/[WTFS]\s*0*\d+(_(NE|NW|SE|SW)(_(TL|TR|LL|LR))?)?/i.test(cell)) {
-          allKeys = allKeys.concat(splitKeys(cell).map(normalizeKey));
-        }
-      }
-      allKeys = Array.from(new Set(allKeys)).filter(Boolean);
-      allKeys.forEach(k => { out[k] = dn; });
-    }
-    return out;
-  }
-
-  function ensureDriverMeta(metaList, driverNames) {
-    const out = Array.isArray(metaList) ? [...metaList] : [];
-    const seen = new Set(out.map(d => String(d.name||'').toLowerCase()));
-    for (const nm of (driverNames || [])) {
-      const low = String(nm||'').toLowerCase(); if (!low) continue;
-      if (!seen.has(low)) { out.push({ name: nm, color: colorFromName(nm) }); seen.add(low); }
-    }
-    return out;
-  }
-  function colorFromName(name) { let h=0; const s=65, l=50; const str = String(name||''); for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360; return `hsl(${h}, ${s}%, ${l}%)`; }
-
-  function downloadFallback(dataUrl, name){
-    try{ const a = document.createElement('a'); a.href = dataUrl; a.download = name || 'snapshot.png'; document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(), 0); }
-    catch(e){ console.warn('downloadFallback failed:', e); }
   }
 
 })().catch(e => {
