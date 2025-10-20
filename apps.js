@@ -1,12 +1,18 @@
-/* apps.js — manual route viewer + draggable banner + persistent frame + snapshot panel (vNext)
+/* apps.js — manual route viewer + draggable banner + persistent frame + snapshot panel (vNext, fixed)
    ----------------------------------------------------------------------------------------------------------------
-   Highlights
-   • Next/Prev cycles overview ↔ routes (overview → 1 → … → n → overview).
-   • Draggable dispatch banner (starts ~78% down); remembers position.
-   • Framing rectangle remembers last position/size across uses & reloads.
-   • Snapshot flow: Frame → Capture → Preview Panel (Save / Download / Exit). No auto-dismiss.
-   • Flash anim is ~0.25s and limited to the framed rectangle.
-   • Upload hardened: if cbAck=1, shows Drive link on success; panel never auto-hides.
+   What’s new in this build
+   • Drive upload flow:
+       - Webhook-first: tries CORS JSON (expects { ok:true, webViewLink, folder, fileId? }) and falls back to no-CORS.
+       - Include Drive folder: pass ?driveFolder=<ID or full folder URL>. Defaults to your “Snapshots” folder below.
+       - On success, shows a clickable Drive link in the dock.
+       - Optional direct-to-Drive (no server): ?driveDirect=1&gClientId=<OAuthClientId> (kept off by default).
+   • Snapshot correctness:
+       - Excludes DOM banner + framing UI from html2canvas; draws 1 programmatic banner (no duplicates).
+       - Excludes dock from capture too.
+   • Stats resiliency:
+       - Fuzzy, case-insensitive key scan; supports nested objects/arrays/strings like “12 + 1”.
+       - Shows “—” if unavailable instead of 0; deliveries/apartments still default to 0.
+   • Minor: safer filenames, guaranteed .png, clearer status notes.
 */
 
 (async function () {
@@ -22,9 +28,18 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});
   const cbUrl           = qs.get('cb') || '';
-  const cbAck           = qs.get('cbAck') === '1';
+  const cbAckParam      = qs.get('cbAck'); // keep raw, we try CORS regardless now
   const batchParam      = qs.get('batch'); // websafe b64 JSON
   const manualMode      = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
+
+  // Upload params
+  const driveFolderRaw  = qs.get('driveFolder') || qs.get('driveFolderId') || qs.get('driveFolderUrl')
+                        || (window.appUpload?.driveFolder) || ''; // optional external global
+  // Default to the folder you gave (“Snapshots”)
+  const DRIVE_FOLDER_FALLBACK = '1ZzGt5_Kmgf1IUdiUdf_kN88lOscL792a';
+  const driveFolderId   = extractDriveFolderId(driveFolderRaw) || DRIVE_FOLDER_FALLBACK;
+  const driveDirect     = qs.get('driveDirect') === '1';
+  const gClientId       = qs.get('gClientId') || '';
 
   // ---------- runtime state ----------
   let batchItems = parseBatchItems(batchParam); // [{name, day, driver, keys[], stats, outName, view?}]
@@ -36,12 +51,12 @@
   let activeAssignMap = { ...assignMapParam };
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
 
-  // --- Snapshot state (declare early to avoid TDZ) ---
+  // --- Snapshot state ---
   let snapArmed = false;
   let snapEls = null;            // { overlay, helper, frame, flashCrop }
-  let dockEls = null;            // { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note }
-  let lastPngDataUrl = null;     // pending image data (held until Save/Exit)
-  let lastSuggestedName = null;  // default file name for save
+  let dockEls = null;            // { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note, link }
+  let lastPngDataUrl = null;
+  let lastSuggestedName = null;
 
   // ---------- map init ----------
   phase('Loading config…');
@@ -126,7 +141,7 @@
       .route-toolbar button:hover{opacity:1}
       .route-toolbar button.armed{background:#c62828}
 
-      /* draggable banner (starts ~78% down) */
+      /* draggable banner */
       .dispatch-banner{position:fixed;left:50%;top:78vh;transform:translateX(-50%);z-index:8500;cursor:grab;
         background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);
         border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);
@@ -153,7 +168,7 @@
       /* cropped flash (only over frame), total ~0.25s */
       .snap-flash-crop{position:fixed;background:#000;opacity:0;pointer-events:none;z-index:9600;transition:opacity .125s ease;border-radius:8px}
 
-      /* persistent snapshot panel (no auto-hide) */
+      /* persistent snapshot panel */
       .snap-dock{position:fixed;left:12px;bottom:12px;z-index:9605;background:rgba(17,17,17,.98);color:#fff;
         border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.3);width:min(90vw,380px);display:none}
       .snap-dock .head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.12);cursor:grab}
@@ -168,6 +183,7 @@
       .snap-dock .btn.secondary{background:#424242}
       .snap-dock .btn:disabled{opacity:.5;cursor:not-allowed}
       .snap-dock .note{font:12px/1.3 system-ui;color:#cfd8dc}
+      .snap-dock .link{font:12px/1.3 system-ui}
     `;
     document.head.appendChild(css);
 
@@ -215,25 +231,68 @@
     banner.classList.toggle('visible', statsVisible);
   }
 
+  // ---------- Stats text (robust) ----------
+  function stringifyStat(val){
+    if (val == null) return '';
+    if (typeof val === 'number') return String(val);
+    if (typeof val === 'string') return val.trim();
+    if (Array.isArray(val)) return val.map(v => stringifyStat(v)).filter(Boolean).join(' | ');
+    if (typeof val === 'object') {
+      // Prefer compact "a:1 | b:2" when keys are short; fallback to just values
+      const entries = Object.entries(val).filter(([k,v]) => v != null && String(v).trim?.() !== '');
+      if (!entries.length) return '';
+      const pretty = entries.map(([k,v]) => `${k}: ${stringifyStat(v)}`).join(' | ');
+      const valuesOnly = entries.map(([,v]) => stringifyStat(v)).join(' | ');
+      const pick = (pretty.length <= 64) ? pretty : valuesOnly;
+      return pick.trim();
+    }
+    return String(val);
+  }
+  function findByKeywords(obj, ...words){
+    if (!obj) return '';
+    const want = words.map(w => String(w).toLowerCase());
+    // 1) direct keys
+    for (const [k,v] of Object.entries(obj)){
+      const lk = k.toLowerCase();
+      if (want.every(w => lk.includes(w))) {
+        const s = stringifyStat(v);
+        if (s) return s;
+      }
+    }
+    // 2) nested one level
+    for (const [,v] of Object.entries(obj)){
+      if (v && typeof v === 'object' && !Array.isArray(v)){
+        for (const [k2,v2] of Object.entries(v)){
+          const lk = k2.toLowerCase();
+          if (want.every(w => lk.includes(w))) {
+            const s = stringifyStat(v2);
+            if (s) return s;
+          }
+        }
+      }
+    }
+    // 3) known aliases
+    const aliases = {
+      base: ['basebox','baseboxes','base','regular'],
+      custom: ['custom','customs','special'],
+      addon: ['add','addon','addons','add-ons','add_ons','extra','extras']
+    };
+    const pool = new Set(aliases[words[0]] || []);
+    for (const [k,v] of Object.entries(obj)){
+      const lk = k.toLowerCase();
+      if ([...pool].some(a => lk.includes(a))) {
+        const s = stringifyStat(v);
+        if (s) return s;
+      }
+    }
+    return '';
+  }
   function getStatsTexts(statsObj) {
     const s = statsObj || {};
-    const firstNonEmpty = (...cands) => {
-      for (const c of cands) {
-        if (c === null || c === undefined) continue;
-        const v = typeof c === 'string' ? c
-              : typeof c === 'number' ? String(c)
-              : Array.isArray(c) ? c.join(' | ')
-              : typeof c === 'object' ? Object.values(c).join(' | ')
-              : '';
-        if (String(v).trim()) return String(v);
-      }
-      return '0';
-    };
-    return {
-      baseTxt: firstNonEmpty(s.baseBoxesText, s.baseText, s.base, s.baseBoxesString, s.baseBoxes, s.base_boxes, s.baseboxes),
-      custTxt: firstNonEmpty(s.customsText,   s.customText, s.customs, s.custom_boxes, s.customBoxes),
-      addTxt:  firstNonEmpty(s.addOnsText,    s.addOns, s.addonsText, s.addons, s.add_ons)
-    };
+    const baseTxt = findByKeywords(s, 'base', 'box') || stringifyStat(s.baseBoxesText) || stringifyStat(s.base) || stringifyStat(s.baseBoxes) || '—';
+    const custTxt = findByKeywords(s, 'custom') || stringifyStat(s.customsText) || stringifyStat(s.customs) || '—';
+    const addTxt  = findByKeywords(s, 'add')    || stringifyStat(s.addOnsText) || stringifyStat(s.addOns) || stringifyStat(s.add_ons) || '—';
+    return { baseTxt, custTxt, addTxt };
   }
 
   function renderDispatchBanner(it){
@@ -241,20 +300,18 @@
     if (!it) { banner.classList.remove('visible'); return; }
     const s = it?.stats || {};
     const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
-
     const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
     const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
     const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
-
     banner.querySelector('.r1').innerHTML = row1;
     banner.querySelector('.r2').innerHTML = row2;
     banner.querySelector('.r3').innerHTML = row3;
     if (statsVisible) banner.classList.add('visible');
   }
 
-  // Canvas banner (for saved PNG)
+  // Canvas banner (for saved PNG) — single source of truth
   function drawBannerOntoCanvas(canvas, it){
-    if (!it || !statsVisible) return; // mirror DOM visibility
+    if (!it || !statsVisible) return;
     const s = it?.stats || {};
     const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
 
@@ -276,7 +333,10 @@
       for (const w of words){ const test = cur ? cur + ' ' + w : w; if (ctx.measureText(test).width <= maxW - pad*2) cur = test; else { if (cur) out.push(cur); cur = w; } }
       if (cur) out.push(cur); return out;
     };
-    const wrapped = [...wrap(row1, fBold), ...wrap(row2, fNorm), ...wrap(row3, fNorm)];
+    const w1 = wrap(row1, fBold);
+    const w2 = wrap(row2, fNorm);
+    const w3 = wrap(row3, fNorm);
+    const wrapped = [...w1, ...w2, ...w3];
     const boxW = maxW, boxH = pad*2 + wrapped.length*lineH + Math.round(lineH*0.2);
     const x = Math.round((W - boxW)/2);
     const y = Math.round(H - boxH - Math.max(pad*2, H*0.12));
@@ -284,9 +344,9 @@
     ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12).fill();
 
     let yy = y + pad + lineH; ctx.fillStyle='#111';
-    ctx.font = fBold; const L0 = wrap(row1, fBold).length;
-    for (let i=0;i<L0;i++) { ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
-    ctx.font = fNorm; for (let i=L0;i<wrapped.length;i++) { ctx.fillText(wrapped[i], x+pad, yy); yy += lineH; }
+    ctx.font = fBold; for (let i=0;i<w1.length;i++) { ctx.fillText(w1[i], x+pad, yy); yy += lineH; }
+    ctx.font = fNorm; for (let i=0;i<w2.length;i++) { ctx.fillText(w2[i], x+pad, yy); yy += lineH; }
+    for (let i=0;i<w3.length;i++) { ctx.fillText(w3[i], x+pad, yy); yy += lineH; }
   }
   function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); return ctx; }
 
@@ -439,12 +499,13 @@
         if (!it) throw new Error('No focused route to capture.');
         const r = getFrameRect();
         const canvas = await captureCanvas(r);             // DOM-first with Leaflet fallback
-        drawBannerOntoCanvas(canvas, it);                  // draw (only if visible)
+        drawBannerOntoCanvas(canvas, it);                  // 1 programmatic banner only
         flashCropped(r);                                   // ~0.25s inside the frame
         lastPngDataUrl = canvas.toDataURL('image/png');
-        lastSuggestedName = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
-        showDock(lastPngDataUrl, lastSuggestedName);       // persist panel; user decides Save/Exit
-        saveFrameRect();                                   // remember rect for next time
+        const rawName = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
+        lastSuggestedName = ensurePngExt(rawName);
+        showDock(lastPngDataUrl, lastSuggestedName, it);   // persistent panel
+        saveFrameRect();                                   // remember rect
       } catch (e) {
         showDock(null, null, null, `Capture failed — ${escapeHtml(e && e.message || e)}`);
       } finally {
@@ -495,7 +556,7 @@
   }
 
   async function captureCanvas(r){
-    // Try DOM-first
+    // Try DOM-first; exclude banner & snapshot UI to avoid duplicates
     if (window.html2canvas) {
       try{
         return await html2canvas(document.body, {
@@ -504,11 +565,17 @@
           x: r.left, y: r.top, width: r.width, height: r.height,
           windowWidth: document.documentElement.clientWidth,
           windowHeight: document.documentElement.clientHeight,
-          scrollX: 0, scrollY: 0
+          scrollX: 0, scrollY: 0,
+          ignoreElements: (el) => {
+            if (!el) return false;
+            if (el.id === 'dispatchBanner') return true;
+            const cls = el.classList || { contains:()=>false };
+            return cls.contains('dispatch-banner') || cls.contains('snap-overlay') || cls.contains('snap-dock') || !!el.closest?.('.snap-dock');
+          }
         });
       } catch (e) { console.warn('html2canvas failed; trying Leaflet fallback:', e); }
     }
-    // Fallback: map-only, crop, return canvas
+    // Fallback: map-only
     if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
     const mapRect = document.getElementById('map').getBoundingClientRect();
     const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
@@ -528,7 +595,7 @@
     const f = snapEls.flashCrop;
     Object.assign(f.style, { left:`${r.left}px`, top:`${r.top}px`, width:`${r.width}px`, height:`${r.height}px` });
     f.style.opacity = '0.65';
-    setTimeout(()=>{ f.style.opacity = '0'; }, 125);  // fade back, total ~0.25s including CSS transition
+    setTimeout(()=>{ f.style.opacity = '0'; }, 125);
   }
 
   function intersectRects(a,b){
@@ -540,7 +607,7 @@
     return { left:x1, top:y1, width:x2-x1, height:y2-y1 };
   }
 
-  // ---------- Snapshot Dock (persistent review/save panel) ----------
+  // ---------- Snapshot Dock ----------
   function ensureDockUi(){
     if (dockEls) return;
     const dock = document.createElement('div');
@@ -561,6 +628,7 @@
           <button class="btn secondary" id="snapDockDownload">Download</button>
           <button class="btn secondary" id="snapDockExit">Exit</button>
         </div>
+        <div class="link" id="snapDockLink"></div>
         <div class="note" id="snapDockNote"></div>
       </div>
     `;
@@ -574,36 +642,62 @@
     const closeBtn = dock.querySelector('#snapDockClose');
     const title = dock.querySelector('.title');
     const note = dock.querySelector('#snapDockNote');
+    const link = dock.querySelector('#snapDockLink');
 
-    // Drag dock by header
     makeDockDraggable(dock, dock.querySelector('#snapDockHead')); restoreDockPos(dock);
 
     saveBtn.addEventListener('click', async ()=>{
       if (!lastPngDataUrl) { note.textContent = 'No snapshot to save.'; return; }
-      if (!cbUrl) { note.textContent = 'No upload endpoint (cb) provided in URL — use Download instead.'; return; }
-      saveBtn.disabled = true; note.textContent = 'Saving…';
-      try{
-        const ctx = currentIndex>=0 ? batchItems[currentIndex] : {};
-        const outName = (name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_');
-        const res = await fetch(cbUrl, {
-          method: 'POST',
-          mode: cbAck ? 'cors' : 'no-cors',
-          headers: cbAck ? { 'Content-Type':'application/json' } : undefined,
-          body: JSON.stringify({ name: outName, day: ctx.day, driver: ctx.driver, routeName: ctx.name, pngBase64: lastPngDataUrl })
-        });
-        if (cbAck) {
-          const j = await res.json().catch(()=>null);
-          if (j && j.ok) {
-            title.textContent = 'Saved ✓';
-            note.innerHTML = `Saved to <b>${escapeHtml(j.folder || 'Snapshots')}</b> as <b>${escapeHtml(outName)}</b>.` + (j.webViewLink ? ` <a href="${j.webViewLink}" target="_blank" rel="noopener">Open</a>` : '');
-          } else {
-            note.textContent = 'Save completed (no ACK) or server did not return {ok:true}.';
+      const ctx = currentIndex>=0 ? batchItems[currentIndex] : {};
+      const outName = ensurePngExt((name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_'));
+      const payload = { name: outName, day: ctx.day, driver: ctx.driver, routeName: ctx.name, pngBase64: lastPngDataUrl, folderId: driveFolderId };
+
+      link.innerHTML = ''; title.textContent = 'Saving…'; note.textContent = '';
+      saveBtn.disabled = true;
+
+      try {
+        let success = false, reply = null;
+
+        // 1) Optional direct-to-Drive (off unless explicitly enabled)
+        if (driveDirect && gClientId) {
+          try {
+            reply = await uploadToDriveDirect({ dataUrl: lastPngDataUrl, name: outName, folderId: driveFolderId, clientId: gClientId });
+            if (reply && reply.id) {
+              success = true;
+              const href = reply.webViewLink || `https://drive.google.com/file/d/${reply.id}/view`;
+              title.textContent = 'Saved ✓';
+              link.innerHTML = `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>`;
+              note.innerHTML = `Saved to <b>Snapshots</b> as <b>${escapeHtml(outName)}</b>.`;
+            }
+          } catch (e) {
+            console.warn('Direct Drive upload failed, will try webhook if available:', e);
           }
-        } else {
-          title.textContent = 'Saved ✓';
-          note.textContent = 'Saved to Drive (no ACK).';
+        }
+
+        // 2) Webhook path
+        if (!success && cbUrl) {
+          reply = await saveViaWebhook(cbUrl, payload);
+          if (reply && reply.ok) {
+            success = true;
+            const href = reply.webViewLink || reply.fileUrl || (reply.fileId ? `https://drive.google.com/file/d/${reply.fileId}/view` : '');
+            title.textContent = 'Saved ✓';
+            link.innerHTML = href ? `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>` : '';
+            const folderName = reply.folder || 'Snapshots';
+            note.innerHTML = `Saved to <b>${escapeHtml(folderName)}</b> as <b>${escapeHtml(outName)}</b>.`;
+          }
+        }
+
+        if (!success) {
+          // As a very last resort, tell the user what to configure
+          title.textContent = 'Saved (unconfirmed)';
+          const folderHref = `https://drive.google.com/drive/folders/${driveFolderId}`;
+          note.innerHTML = cbUrl
+            ? 'Save completed but no server ACK was readable. If this keeps happening, enable CORS on the webhook to return JSON.'
+            : `No upload endpoint configured. Use Download or add <code>?cb=…</code> (and optionally <code>?driveFolder=…</code>).`;
+          link.innerHTML = `<a href="${folderHref}" target="_blank" rel="noopener">Open Snapshots folder</a>`;
         }
       } catch (err) {
+        title.textContent = 'Save failed';
         note.textContent = `Upload failed — you can still Download. (${String(err && err.message || err)})`;
       } finally {
         saveBtn.disabled = false;
@@ -612,27 +706,28 @@
 
     dlBtn.addEventListener('click', ()=>{
       if (!lastPngDataUrl) { note.textContent = 'No snapshot to download.'; return; }
-      const nm = (name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_');
+      const nm = ensurePngExt((name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_'));
       downloadFallback(lastPngDataUrl, nm);
       title.textContent = 'Downloaded ✓';
       note.textContent = `Downloaded as ${nm}.`;
     });
 
-    const closeDock = ()=>{ dock.style.display='none'; lastPngDataUrl=null; lastSuggestedName=null; note.textContent=''; };
+    const closeDock = ()=>{ dock.style.display='none'; lastPngDataUrl=null; lastSuggestedName=null; note.textContent=''; link.textContent=''; };
     exitBtn.addEventListener('click', closeDock);
     closeBtn.addEventListener('click', closeDock);
 
-    dockEls = { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note };
+    dockEls = { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note, link };
   }
 
   function showDock(pngDataUrl, suggestedName, _ctx, message){
     ensureDockUi();
-    const { dock, img, name, title, note } = dockEls;
+    const { dock, img, name, title, note, link } = dockEls;
     if (message) { title.textContent = 'Snapshot'; note.textContent = message; }
     dock.style.display = 'block';
     if (pngDataUrl) img.src = pngDataUrl;
     if (suggestedName) name.value = suggestedName;
-    saveDockPos(dock); // persist position if first time showing
+    link.textContent = '';
+    saveDockPos(dock);
   }
 
   function makeDockDraggable(el, handle){
@@ -834,13 +929,10 @@
       for (let r = headerIndex + 1; r < rows.length; r++) {
         const row = rows[r] || [];
         const dn = (row[driverCol] || '').trim();
-        theKeys:
-        {
-          const ks = (row[keysCol]   || '').trim();
-          if (!dn || !ks) break theKeys;
-          if (!looksLikeName(dn)) break theKeys;
-          splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
-        }
+        const ks = (row[keysCol]   || '').trim();
+        if (!dn || !ks) continue;
+        if (!looksLikeName(dn)) continue;
+        splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
       }
       return out;
     }
@@ -880,6 +972,7 @@
   function colorFromName(name) { let h=0; const s=65, l=50; const str = String(name||''); for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360; return `hsl(${h}, ${s}%, ${l}%)`; }
   function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
   const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
+  const ensurePngExt = s => /\.(png)$/i.test(s) ? s : (s.replace(/\.[a-z0-9]+$/i,'') + '.png');
 
   function downloadFallback(dataUrl, name){
     try{ const a = document.createElement('a'); a.href = dataUrl; a.download = name || 'snapshot.png'; document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(), 0); }
@@ -894,6 +987,94 @@
     });
     if (!window.html2canvas) await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
     if (!window.leafletImage) await loadScript('https://unpkg.com/leaflet-image/leaflet-image.js');
+  }
+
+  // -----------------------------------------------------------------
+  // Upload helpers
+  // -----------------------------------------------------------------
+  async function saveViaWebhook(url, payload){
+    // Try CORS JSON first
+    try{
+      const res = await fetch(url, { method:'POST', mode:'cors', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      const j = await res.json().catch(()=>null);
+      if (j && (j.ok || j.success)) return { ok:true, ...j };
+    } catch (e) {
+      console.warn('CORS JSON upload failed; will try no-cors fallback', e);
+    }
+    // Fallback (unreadable response)
+    try{
+      await fetch(url, { method:'POST', mode:'no-cors', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      return { ok:false };
+    } catch (e) {
+      throw e;
+    }
+  }
+
+  function extractDriveFolderId(str){
+    if (!str) return '';
+    // Accept raw ID or full URL
+    const m = String(str).match(/\/folders\/([A-Za-z0-9_-]{10,})/);
+    if (m) return m[1];
+    if (/^[A-Za-z0-9_-]{10,}$/.test(str)) return str;
+    return '';
+  }
+
+  // Optional direct-to-Drive client side (requires OAuth client ID)
+  async function uploadToDriveDirect({ dataUrl, name, folderId, clientId }){
+    await ensureGoogleApis();
+    const token = await getDriveToken(clientId);
+    const blob = dataURLtoBlob(dataUrl);
+    const metadata = { name, parents: folderId ? [folderId] : undefined, mimeType: 'image/png' };
+    const boundary = '-------314159265358979323846';
+    const delimiter = `\r\n--${boundary}\r\n`;
+    const closeDelim = `\r\n--${boundary}--`;
+
+    const body =
+      delimiter + 'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(metadata) +
+      delimiter + 'Content-Type: image/png\r\n\r\n';
+
+    const bodyUint8 = new Uint8Array(body.length + blob.size + closeDelim.length);
+    let offset = 0;
+    for (let i=0;i<body.length;i++) bodyUint8[offset++] = body.charCodeAt(i);
+    const blobArray = await blob.arrayBuffer();
+    bodyUint8.set(new Uint8Array(blobArray), offset); offset += blob.size;
+    for (let i=0;i<closeDelim.length;i++) bodyUint8[offset++] = closeDelim.charCodeAt(i);
+
+    const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink,parents', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'multipart/related; boundary=' + boundary },
+      body: bodyUint8
+    });
+    if (!resp.ok) throw new Error(`Drive upload ${resp.status}`);
+    return resp.json();
+  }
+  function dataURLtoBlob(dataUrl){
+    const [meta, b64] = dataUrl.split(',');
+    const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'application/octet-stream';
+    const bin = atob(b64);
+    const len = bin.length; const arr = new Uint8Array(len);
+    for (let i=0;i<len;i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: mime });
+  }
+  async function ensureGoogleApis(){
+    const load = src => new Promise((res,rej)=>{
+      if ([...document.scripts].some(s => s.src && s.src.includes(src))) return res();
+      const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = rej; document.head.appendChild(el);
+    });
+    if (!window.google?.accounts?.oauth2) await load('https://accounts.google.com/gsi/client');
+  }
+  function getDriveToken(clientId){
+    return new Promise((resolve, reject)=>{
+      try{
+        const tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: 'https://www.googleapis.com/auth/drive.file',
+          callback: (t) => t && t.access_token ? resolve(t.access_token) : reject(new Error('No access token'))
+        });
+        tokenClient.requestAccessToken({ prompt: '' });
+      }catch(e){ reject(e); }
+    });
   }
 
   // =================================================================
@@ -917,10 +1098,9 @@
         const canvas = await new Promise((resolve, reject) => leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
         drawBannerOntoCanvas(canvas, it);
         const png = canvas.toDataURL('image/png');
-        const name = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
+        const name = ensurePngExt(it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`);
         if (cbUrl) {
-          await fetch(cbUrl, { method:'POST', mode: cbAck?'cors':'no-cors', headers: cbAck?{'Content-Type':'application/json'}:undefined,
-            body: JSON.stringify({ name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png }) });
+          await saveViaWebhook(cbUrl, { name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png, folderId: driveFolderId });
         } else { downloadFallback(png, name); }
       }catch(e){ console.error('auto export item failed', e); }
     }
@@ -1414,3 +1594,13 @@
   if (el) { el.style.display = 'block'; el.innerHTML = `<strong>Load error</strong><br>${String(e && e.message ? e.message : e)}`; }
   console.error(e);
 });
+
+// --------- small helpers kept outside IIFE for reuse in tests ----------
+function headerIndexMap(hdrRow, schema) {
+  const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+  const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+  const idx = (name) => Array.isArray(hdrRow)
+    ? hdrRow.findIndex(h => (h || '').toLowerCase() === name)
+    : -1;
+  return { coords: idx(wantCoords), note: idx(wantNote) };
+}
