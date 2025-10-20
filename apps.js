@@ -5,8 +5,8 @@
    • Draggable dispatch banner (starts ~78% down); remembers position.
    • Framing rectangle remembers last position/size across uses & reloads.
    • Snapshot flow: Frame → Capture → Preview Panel (Save / Download / Exit). No auto-dismiss.
-   • Flash anim is 0.25s and limited to the framed rectangle.
-   • Upload hardened: if cbAck=1, shows Drive link on success; never auto-hides status.
+   • Flash anim is ~0.25s and limited to the framed rectangle.
+   • Upload hardened: if cbAck=1, shows Drive link on success; panel never auto-hides.
 */
 
 (async function () {
@@ -39,7 +39,7 @@
   // --- Snapshot state (declare early to avoid TDZ) ---
   let snapArmed = false;
   let snapEls = null;            // { overlay, helper, frame, flashCrop }
-  let dockEls = null;            // { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title }
+  let dockEls = null;            // { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note }
   let lastPngDataUrl = null;     // pending image data (held until Save/Exit)
   let lastSuggestedName = null;  // default file name for save
 
@@ -440,10 +440,10 @@
         const r = getFrameRect();
         const canvas = await captureCanvas(r);             // DOM-first with Leaflet fallback
         drawBannerOntoCanvas(canvas, it);                  // draw (only if visible)
-        flashCropped(r);                                   // 0.25s inside the frame
+        flashCropped(r);                                   // ~0.25s inside the frame
         lastPngDataUrl = canvas.toDataURL('image/png');
         lastSuggestedName = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
-        showDock(lastPngDataUrl, lastSuggestedName, it);   // persist panel; user decides Save/Exit
+        showDock(lastPngDataUrl, lastSuggestedName);       // persist panel; user decides Save/Exit
         saveFrameRect();                                   // remember rect for next time
       } catch (e) {
         showDock(null, null, null, `Capture failed — ${escapeHtml(e && e.message || e)}`);
@@ -625,7 +625,7 @@
     dockEls = { dock, img, name, saveBtn, dlBtn, exitBtn, closeBtn, title, note };
   }
 
-  function showDock(pngDataUrl, suggestedName, ctx, message){
+  function showDock(pngDataUrl, suggestedName, _ctx, message){
     ensureDockUi();
     const { dock, img, name, title, note } = dockEls;
     if (message) { title.textContent = 'Snapshot'; note.textContent = message; }
@@ -734,8 +734,10 @@
   }
   function headerIndexMap(hdrRow, schema) {
     const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-    const wantNote   = ((schema and schema.note) || 'Order Note').toLowerCase();
-    const idx = (name) => hdrRow.findIndex(h => (h||'').toLowerCase() === name);
+    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+    const idx = (name) => Array.isArray(hdrRow)
+      ? hdrRow.findIndex(h => (h||'').toLowerCase() === name)
+      : -1;
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
 
@@ -832,10 +834,13 @@
       for (let r = headerIndex + 1; r < rows.length; r++) {
         const row = rows[r] || [];
         const dn = (row[driverCol] || '').trim();
-        const ks = (row[keysCol]   || '').trim();
-        if (!dn || !ks) continue;
-        if (!looksLikeName(dn)) continue;
-        splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
+        theKeys:
+        {
+          const ks = (row[keysCol]   || '').trim();
+          if (!dn || !ks) break theKeys;
+          if (!looksLikeName(dn)) break theKeys;
+          splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
+        }
       }
       return out;
     }
@@ -1331,6 +1336,77 @@
       fillColor: perDay.fill || '#ccc',
       fillOpacity: dimFill(perDay, cfg)
     });
+  }
+
+  // ---------- Drivers & Legend panels ----------
+  function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
+    const el = document.getElementById('drivers'); if (!el) return;
+
+    const metaByName = new Map((metaList||[]).map(d => [String(d.name||'').toLowerCase(), d]));
+    const overlayDrivers = Object.keys(overlays || {});
+    const haveOverlays = overlayDrivers.length > 0;
+
+    const allDriverNames = haveOverlays
+      ? overlayDrivers
+      : Array.from(new Set(Object.values(activeAssignMap))).sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
+
+    const orderIndex = new Map((metaList||[]).map((d,i)=>[String(d.name||'').toLowerCase(), i]));
+    allDriverNames.sort((a,b)=>{
+      const ia = orderIndex.has(a.toLowerCase()) ? orderIndex.get(a.toLowerCase()) : 9999;
+      const ib = orderIndex.has(b.toLowerCase()) ? orderIndex.get(b.toLowerCase()) : 9999;
+      if (ia !== ib) return ia - ib;
+      return a.toLowerCase().localeCompare(b.toLowerCase());
+    });
+
+    const rows = allDriverNames.map(name => {
+      const meta = metaByName.get(name.toLowerCase()) || { name, color: colorFromName(name) };
+      const col = meta.color || '#888';
+      const safe = escapeHtml(name || '');
+      const isPresent = !!overlays?.[name];
+      const onAttr = isPresent && defaultOn ? 'checked' : '';
+      const count = typeof countsMap[name] === 'number' ? countsMap[name] : 0;
+      const frac = `${count}/${totalSelected || 0}`;
+      return `<div class="row" style="display:flex;align-items:center;gap:8px;margin:4px 0">
+        <input type="checkbox" data-driver="${safe}" aria-label="Toggle ${safe}" ${onAttr} ${isPresent ? '' : 'disabled'}>
+        <span class="swatch" style="width:16px;height:16px;border-radius:3px;border:2px solid ${col};background:${col};box-sizing:border-box"></span>
+        <div>${safe}</div>
+        <div class="counts" style="margin-left:auto;opacity:.8;font-variant-numeric:tabular-nums">${frac}</div>
+      </div>`;
+    }).join('');
+
+    el.innerHTML = `<h4 style="margin:0 0 6px 0;font-size:14px">Drivers</h4>${rows}`;
+    el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      const name = cb.getAttribute('data-driver');
+      if (!overlays?.[name]) return;
+      toggleDriverOverlay(name, !!cb.checked);
+      cb.addEventListener('change', (e) => toggleDriverOverlay(name, e.target.checked));
+    });
+  }
+  function toggleDriverOverlay(name, on) { const rec = driverOverlays[name]; if (!rec) return; if (on) { rec.group.addTo(map); try { if (rec.labelMarker) rec.labelMarker.openTooltip(); } catch{} } else { map.removeLayer(rec.group); } }
+
+  function renderLegend(cfg, legendCounts, custIn, custOut, outsideToggle) {
+    const el = document.getElementById('legend'); if (!el) return;
+    const rowsHtml = (cfg.layers || []).map(Lcfg => {
+      const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
+      const c  = (legendCounts && legendCounts[Lcfg.day]) ? legendCounts[Lcfg.day] : { selected: 0, total: 0 };
+      const frac = (c.total > 0) ? `${c.selected}/${c.total}` : '0/0';
+      return `<div class="row" style="display:flex;align-items:center;gap:8px;margin:4px 0">
+        <span class="swatch" style="width:16px;height:16px;border-radius:3px;border:2px solid ${st.stroke};background:${st.fill};box-sizing:border-box"></span>
+        <div>${Lcfg.day}</div>
+        <div class="counts" style="margin-left:auto;opacity:.8;font-variant-numeric:tabular-nums">${frac}</div>
+      </div>`;
+    }).join('');
+    const custBlock = `<div class="row" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px;display:flex;gap:8px;align-items:center">
+        <div>Customers within selection:</div><div class="counts" style="margin-left:auto;opacity:.8;font-variant-numeric:tabular-nums">${custIn ?? 0}</div>
+      </div>
+      <div class="row" style="display:flex;gap:8px;align-items:center">
+        <div>Customers outside selection:</div><div class="counts" style="margin-left:auto;opacity:.8;font-variant-numeric:tabular-nums">${custOut ?? 0}</div>
+      </div>`;
+    const toggle = `<div class="row" style="margin-top:4px;display:flex;gap:8px;align-items:center">
+        <input type="checkbox" id="toggleOutside" ${outsideToggle ? 'checked' : ''} aria-label="Highlight outside customers">
+        <div>Highlight outside customers</div>
+      </div>`;
+    el.innerHTML = `<h4 style="margin:0 0 6px 0;font-size:14px">Layers</h4>${rowsHtml}${custBlock}${toggle}`;
   }
 
 })().catch(e => {
