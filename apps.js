@@ -1,12 +1,6 @@
 /* apps.js — 3-tier (base → quadrants → subquadrants) splice-aware viewer
-   - Loads base, quadrant, and subquadrant layers (if present in config).
-   - Visibility precedence (per base): Subquadrant > Quadrant > Base.
-     * Base (e.g., W1) shows only if selected AND no quads/subquads of that base are selected.
-     * A Quadrant (e.g., W1_NE) shows only if selected AND no subquads exist for that quadrant (W1_NE_*).
-     * Subquadrants (e.g., W1_SW_TL) show if selected.
-   - Exact "active zone keys" shown in status, using the selection order and only keys actually drawn.
-   - All existing features kept: outside-customer toggle, never-blank fallback, driver overlays, labels, CSV parsing, counts.
-   - NEW: batch snapshot mode (?batch=websafe-b64-json, ?cb=receiverUrl) that renders each route as a PNG and POSTs to Apps Script.
+   - Normal mode: interactive viewer.
+   - Export mode (?batch=… or ?mode=export or ?ui=off): no UI/animations; render map + stat card per route and POST PNG to Apps Script.
 */
 (async function () {
   // ---- Surface uncaught errors to the page error box ----
@@ -21,10 +15,11 @@
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);   // [{name,color}, ...]
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});   // {"S9":"Devin","S9_NE_TL":"Devin",...}
 
-  // --- Snapshot/batch globals (NEW) ---
+  // --- Snapshot/batch globals ---
   const cbUrl = qs.get('cb') || '';          // Apps Script receiver (doPost Web App)
   let manualSelectedKeys = null;             // override selection for batch
   const batchParam = qs.get('batch');        // websafe base64 JSON array from launcher
+  const exportOnly = !!batchParam || qs.get('mode') === 'export' || qs.get('ui') === 'off';
 
   let activeAssignMap = { ...assignMapParam };     // authoritative mapping after CSV merge
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
@@ -40,7 +35,23 @@
   }
 
   phase('Initializing map…');
-  const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
+  const map = L.map('map', {
+    preferCanvas: true,
+    zoomAnimation: false,        // no animations in export
+    fadeAnimation: false,
+    markerZoomAnimation: false
+  }).setView([43.55, -80.25], 8);
+
+  // disable all interactions when exporting
+  if (exportOnly) {
+    map.dragging.disable();
+    map.touchZoom.disable();
+    map.doubleClickZoom.disable();
+    map.scrollWheelZoom.disable();
+    map.boxZoom.disable();
+    map.keyboard.disable();
+  }
+
   const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
   const base = L.tileLayer(osmTiles, {
     attribution: '&copy; OpenStreetMap contributors',
@@ -52,9 +63,9 @@
   } catch {}
 
   // ---- collections / state ----
-  const baseDayLayers = [];   // [{day, layer, perDay, features: LeafletLayer[]}]  (W1, W2, F12…)
-  const quadDayLayers = [];   // same for quadrants (…_NE, …_SW…)
-  const subqDayLayers = [];   // same for subquadrants (…_NE_TL, …_SW_LR…)
+  const baseDayLayers = [];
+  const quadDayLayers = [];
+  const subqDayLayers = [];
   const allDaySets    = [baseDayLayers, quadDayLayers, subqDayLayers];
 
   let allBounds = null;
@@ -63,23 +74,22 @@
 
   const boundaryFeatures = [];
   const customerLayer = L.layerGroup().addTo(map);
-  const customerMarkers = [];      // [{marker, lat, lng}]
+  const customerMarkers = [];
   let customerCount = 0;
   let custWithinSel = 0;
   let custOutsideSel = 0;
   const custByDayInSel = { Wednesday: 0, Thursday: 0, Friday: 0, Saturday: 0 };
 
   let currentFocus = null;
-  let coveragePolysAll = [];       // visible polygons (all)
-  let coveragePolysSelected = [];  // visible polygons in current selection
+  let coveragePolysAll = [];
+  let coveragePolysSelected = [];
   let selectedMunicipalities = [];
 
-  let driverSelectedCounts = {};   // { "Devin": n, ... } (selected only)
-  const driverOverlays = {};       // name -> { group, color, labelMarker }
+  let driverSelectedCounts = {};
+  const driverOverlays = {};
 
-  // For status line: preserve selection ORDER + show only keys actually drawn
-  let selectedOrderedKeys = [];     // normalized (upper) in order parsed from CSV or manual keys
-  let visibleSelectedKeysSet = new Set(); // keys that actually rendered due to precedence
+  let selectedOrderedKeys = [];
+  let visibleSelectedKeysSet = new Set();
 
   // Render empty panels first
   renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
@@ -110,10 +120,10 @@
   map.on('zoomstart', () => { map.closePopup(); });
 
   // ---- initial selection + customers ----
-  await applySelection();       // never blank
+  await applySelection();
   await loadCustomersIfAny();
 
-  // Kick batch mode (no-op unless ?batch=… present)
+  // Batch/export mode (no UI, save PNGs)
   await runBatchIfRequested();
 
   // optional auto-refresh (disabled during batch snapshots)
@@ -151,8 +161,8 @@
           const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
           const day     = Lcfg.day;
 
-          lyr._routeKey   = keyNorm;                 // exact key: S9 / S9_NE / S9_NE_TL
-          lyr._baseKey    = baseKeyFrom(keyNorm);    // base: S9
+          lyr._routeKey   = keyNorm;
+          lyr._baseKey    = baseKeyFrom(keyNorm);
           lyr._day        = day;
           lyr._perDay     = perDay;
           lyr._labelTxt   = muni;
@@ -183,7 +193,7 @@
   }
 
   // =================================================================
-  // SELECTION (base + quadrants + subquadrants) + CSV-derived assignments
+  // SELECTION & CSV assignments
   // =================================================================
   async function applySelection() {
     clearFocus(false);
@@ -193,12 +203,10 @@
     let loadedSelectionCsv = false;
 
     if (Array.isArray(manualSelectedKeys) && manualSelectedKeys.length) {
-      // Batch mode: explicit keys override
       manualSelectedKeys.map(normalizeKey).forEach(k => {
         if (!selectedSet.has(k)) { selectedSet.add(k); selectedOrderedKeys.push(k); }
       });
     } else {
-      // Normal mode: read from selection CSV
       const selUrl = qs.get('sel') || (cfg.selection && cfg.selection.url) || '';
       if (!selUrl) {
         warn('No selection URL configured — showing all zones.');
@@ -209,7 +217,6 @@
           const rowsAA = parseCsvRows(csvText);
           loadedSelectionCsv = rowsAA?.length > 0;
 
-          // A) parse selection keys from “zone keys”
           const hdr = findHeaderFlexible(rowsAA, cfg.selection?.schema || { keys: 'zone keys' });
           if (hdr) {
             const { headerIndex, keysCol } = hdr;
@@ -222,12 +229,11 @@
             }
           }
 
-          // B) parse driver assignments (ONLY accept known driver names if provided)
           const knownDriverNames = new Set(
             (driverMeta || []).map(d => String(d.name || '').toLowerCase()).filter(Boolean)
           );
           const derivedAssign = extractAssignmentsFromCsv(rowsAA, knownDriverNames);
-          activeAssignMap = { ...activeAssignMap, ...derivedAssign };  // CSV overwrites seed
+          activeAssignMap = { ...activeAssignMap, ...derivedAssign };
           driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
         } catch (e) {
           warn(`Selection CSV load failed (${e && e.message ? e.message : String(e)}). Showing all zones.`);
@@ -242,16 +248,11 @@
     selectedMunicipalities = [];
     visibleSelectedKeysSet = new Set();
 
-    // Helper: record keys that truly rendered as selected
     const recordVisibleSelectedKey = (k) => { if (k) visibleSelectedKeysSet.add(k); };
 
-    // Override tracking:
-    //  - bases with any selected quadrants
-    //  - bases with any selected subquadrants
-    //  - specific quadrants (e.g., W1_SW) that have selected subquadrants
     const quadBasesSelected = new Set();
     const subqBasesSelected = new Set();
-    const subqQuadsSelected = new Set(); // strings like "W1_NE"
+    const subqQuadsSelected = new Set();
 
     if (!noKeys) {
       for (const k of selectedSet) {
@@ -298,37 +299,34 @@
       for (const arr of allDaySets) {
         for (const entry of arr) {
           for (const lyr of entry.features) {
-            setFeatureVisible(entry, lyr, true, false); // visible, not "selected"
+            setFeatureVisible(entry, lyr, true, false);
           }
         }
       }
       rebuildCoverageFromVisible();
       selectedMunicipalities = [];
-      if (cfg.behavior?.autoZoom) {
-        if (allBounds) map.fitBounds(allBounds.pad(0.1));
+      if (cfg.behavior?.autoZoom && !exportOnly) {
+        if (allBounds) map.fitBounds(allBounds.pad(0.1), { animate:false });
       }
     } else {
-      // BASE: show only if base key selected AND no quad/subquad selected for that base
       for (const entry of baseDayLayers) {
         for (const lyr of entry.features) {
-          const keyBase = lyr._routeKey; // base layer uses base key (e.g., W1)
+          const keyBase = lyr._routeKey;
           const visible = selectedSet.has(keyBase) && !quadBasesSelected.has(keyBase) && !subqBasesSelected.has(keyBase);
           setFeatureVisible(entry, lyr, visible, visible);
         }
       }
-      // QUADRANTS: show only if exact quad selected AND no subquads selected for that specific quadrant
       for (const entry of quadDayLayers) {
         for (const lyr of entry.features) {
-          const kQuad = lyr._routeKey;      // e.g., W1_NE
-          const bq = basePlusQuad(kQuad);   // "W1_NE"
+          const kQuad = lyr._routeKey;
+          const bq = basePlusQuad(kQuad);
           const visible = selectedSet.has(kQuad) && !subqQuadsSelected.has(bq);
           setFeatureVisible(entry, lyr, visible, visible);
         }
       }
-      // SUBQUADRANTS: show only if exact subquad selected
       for (const entry of subqDayLayers) {
         for (const lyr of entry.features) {
-          const kSub = lyr._routeKey; // e.g., W1_NE_TL
+          const kSub = lyr._routeKey;
           const visible = selectedSet.has(kSub);
           setFeatureVisible(entry, lyr, visible, visible);
         }
@@ -338,9 +336,9 @@
       selectedMunicipalities = Array.from(new Set(selectedMunicipalities))
         .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
-      if (cfg.behavior?.autoZoom) {
-        if (selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
-        else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+      if (cfg.behavior?.autoZoom && !exportOnly) {
+        if (selectionBounds) map.fitBounds(selectionBounds.pad(0.1), { animate:false });
+        else if (allBounds)  map.fitBounds(allBounds.pad(0.1), { animate:false });
       }
       info(`Loaded ${selectedSet.size} selected key(s).`);
     }
@@ -354,7 +352,6 @@
       Saturday:  { selected: custByDayInSel.Saturday,  total: custWithinSel }
     };
 
-    // Build "active zone keys" list in original selection order, but only keys that actually drew
     const activeKeysOrderedLower = selectedOrderedKeys
       .filter(k => visibleSelectedKeysSet.has(k))
       .map(k => k.toLowerCase());
@@ -385,6 +382,16 @@
     customerLayer.clearLayers();
     customerMarkers.length = 0;
     customerCount = 0;
+
+    // In export mode, default to NO customers unless &cust=on
+    if (exportOnly && (qs.get('cust') || '').toLowerCase() !== 'on') {
+      custWithinSel = custOutsideSel = 0;
+      resetDayCounts();
+      renderLegend(cfg, null, custWithinSel, custOutsideSel, highlightOutside);
+      setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, []));
+      renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
+      return;
+    }
 
     const custToggle = qs.get('cust');
     if (custToggle && custToggle.toLowerCase() === 'off') {
@@ -467,7 +474,6 @@
     };
     renderLegend(cfg, legendCounts, custWithinSel, custOutsideSel, highlightOutside);
 
-    // keep previously computed active keys in status
     const activeKeysOrderedLower = selectedOrderedKeys
       .filter(k => visibleSelectedKeysSet.has(k))
       .map(k => k.toLowerCase());
@@ -515,7 +521,6 @@
       if (turfOn) {
         const pt = turf.point([rec.lng, rec.lat]);
 
-        // any visible polygon (for popup totalAny)
         for (let j = 0; j < coveragePolysAll.length; j++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) {
             const lyr = coveragePolysAll[j].layerRef;
@@ -524,7 +529,6 @@
           }
         }
 
-        // in selection?
         for (let k = 0; k < coveragePolysSelected.length; k++) {
           if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
             insideSel = true;
@@ -558,7 +562,6 @@
     custWithinSel = inSel;
     custOutsideSel = outSel;
 
-    // aggregate to drivers (selected only)
     driverSelectedCounts = computeDriverCounts();
     renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
@@ -578,12 +581,12 @@
   // DRIVER OVERLAYS
   // =================================================================
   async function rebuildDriverOverlays() {
-    // remove existing
     Object.values(driverOverlays).forEach(rec => { try { map.removeLayer(rec.group); } catch {} });
     for (const k of Object.keys(driverOverlays)) delete driverOverlays[k];
 
-    // group selected features by driver
-    const byDriver = new Map(); // name -> [geoJSON Feature]
+    // If you want overlays in export, keep building them;
+    // they don't animate and won't show UI anyway.
+    const byDriver = new Map();
     coveragePolysSelected.forEach(rec => {
       const key = rec.layerRef && rec.layerRef._routeKey;
       if (!key) return;
@@ -603,7 +606,6 @@
                    || { name, color: colorFromName(name) });
       const color = meta.color || '#888';
 
-      // halo under colored outline
       const halo = L.geoJSON({ type:'FeatureCollection', features }, {
         interactive:false,
         style:()=>({ color:'#ffffff', weight:(cfg.drivers?.outlineHaloWeightPx ?? 10), opacity:0.95, lineJoin:'round', lineCap:'round', fill:false })
@@ -633,7 +635,6 @@
     renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel);
   }
 
-  // exact key, then base key
   function lookupDriverForKey(key) {
     if (!key) return null;
     if (activeAssignMap[key]) return activeAssignMap[key];
@@ -646,6 +647,7 @@
   // POPUP / FOCUS / STYLES
   // =================================================================
   function openPolygonPopup(lyr) {
+    if (exportOnly) return; // no popups in export mode
     const muni = lyr._labelTxt || 'Municipality';
     const totalAny = Number(lyr._custAny || 0);
     const inSel    = Number(lyr._custSel || 0);
@@ -657,6 +659,7 @@
   }
 
   function focusFeature(lyr) {
+    if (exportOnly) return; // no focus effects in export mode
     if (currentFocus && currentFocus !== lyr) restoreFeature(currentFocus);
     currentFocus = lyr;
 
@@ -676,7 +679,7 @@
     lyr.bringToFront?.();
 
     const b = lyr.getBounds?.();
-    if (b) map.fitBounds(b.pad(0.2));
+    if (b) map.fitBounds(b.pad(0.2), { animate:false });
   }
   function restoreFeature(lyr) {
     const perDay = lyr._perDay || {};
@@ -684,12 +687,12 @@
     else { applyStyleDim(lyr, perDay, cfg); hideLabel(lyr); }
   }
   function clearFocus(recenter) {
-    if (!currentFocus) { if (recenter && hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1)); return; }
+    if (!currentFocus) { if (!exportOnly && recenter && hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1), { animate:false }); return; }
     restoreFeature(currentFocus);
     currentFocus = null;
-    if (recenter) {
-      if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1));
-      else if (allBounds) map.fitBounds(allBounds.pad(0.1));
+    if (!exportOnly && recenter) {
+      if (hasSelection && selectionBounds) map.fitBounds(selectionBounds.pad(0.1), { animate:false });
+      else if (allBounds) map.fitBounds(allBounds.pad(0.1), { animate:false });
     }
   }
   function applyStyleSelected(lyr, perDay, cfg) {
@@ -717,6 +720,7 @@
   function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
     const el = document.getElementById('drivers');
     if (!el) return;
+    if (exportOnly) { el.style.display = 'none'; return; }
 
     const metaByName = new Map((metaList||[]).map(d => [String(d.name||'').toLowerCase(), d]));
     const overlayDrivers = Object.keys(overlays || {});
@@ -726,7 +730,6 @@
       ? overlayDrivers
       : Array.from(new Set(Object.values(activeAssignMap))).sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
 
-    // order drivers by meta order, else alphabetical
     const orderIndex = new Map((metaList||[]).map((d,i)=>[String(d.name||'').toLowerCase(), i]));
     allDriverNames.sort((a,b)=>{
       const ia = orderIndex.has(a.toLowerCase()) ? orderIndex.get(a.toLowerCase()) : 9999;
@@ -755,7 +758,7 @@
 
     el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
       const name = cb.getAttribute('data-driver');
-      if (!overlays?.[name]) return; // disabled
+      if (!overlays?.[name]) return;
       toggleDriverOverlay(name, !!cb.checked);
       cb.addEventListener('change', (e) => {
         const name = e.target.getAttribute('data-driver');
@@ -778,6 +781,7 @@
   function renderLegend(cfg, legendCounts, custIn, custOut, outsideToggle) {
     const el = document.getElementById('legend');
     if (!el) return;
+    if (exportOnly) { el.style.display = 'none'; return; }
 
     const rowsHtml = (cfg.layers || []).map(Lcfg => {
       const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
@@ -817,7 +821,6 @@
         };
         renderLegend(cfg, legendCounts2, custWithinSel, custOutsideSel, highlightOutside);
 
-        // Keep active keys text stable
         const activeKeysOrderedLower = selectedOrderedKeys
           .filter(k => visibleSelectedKeysSet.has(k))
           .map(k => k.toLowerCase());
@@ -827,27 +830,18 @@
   }
 
   // =================================================================
-  // BATCH SNAPSHOTS (NEW)
+  // BATCH SNAPSHOTS (EXPORT)
   // =================================================================
   async function runBatchIfRequested() {
     if (!batchParam) return;
+
     let items = [];
-    try {
-      items = JSON.parse(atob(batchParam.replace(/-/g,'+').replace(/_/g,'/')));
-    } catch {
-      items = [];
-    }
+    try { items = JSON.parse(atob(batchParam.replace(/-/g,'+').replace(/_/g,'/'))); } catch { items = []; }
     if (!Array.isArray(items) || !items.length) return;
 
-    // Hide side panels for a clean snapshot
-    const legend = document.getElementById('legend');
-    const drivers = document.getElementById('drivers');
-    const statusEl = document.getElementById('status');
-    const errEl = document.getElementById('error');
-    if (legend) legend.style.display = 'none';
-    if (drivers) drivers.style.display = 'none';
-    if (statusEl) statusEl.style.display = 'none';
-    if (errEl) errEl.style.display = 'none';
+    // Hide EVERYTHING for a clean export
+    const hide = (id) => { const n = document.getElementById(id); if (n) n.style.display = 'none'; };
+    hide('legend'); hide('drivers'); hide('status'); hide('error');
 
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
@@ -856,20 +850,13 @@
         await applySelection();
         await loadCustomersIfAny();
 
-        // --- NEW: per-item view frame (pad + zoom clamp)
-        const v = it.view || {};
-        const pad = (typeof v.padPct === 'number') ? v.padPct : 0.10;
+        // Fit to selection bounds (no animation), or fallback to all bounds.
+        const padPct = (it.view && typeof it.view.padPct === 'number') ? it.view.padPct : 0.10;
+        if (selectionBounds) map.fitBounds(selectionBounds.pad(padPct), { animate:false });
+        else if (allBounds)  map.fitBounds(allBounds.pad(padPct), { animate:false });
 
-        if (selectionBounds) map.fitBounds(selectionBounds.pad(pad));
-        else if (allBounds)  map.fitBounds(allBounds.pad(pad));
-
-        // Allow Leaflet to compute zoom, then clamp if requested
-        await settle(120);
-        try {
-          if (typeof v.maxZoom === 'number' && map.getZoom() > v.maxZoom) map.setZoom(v.maxZoom);
-          if (typeof v.minZoom === 'number' && map.getZoom() < v.minZoom) map.setZoom(v.minZoom);
-        } catch {}
-        await settle(300);
+        // Let tiles/labels settle briefly
+        await settle(350);
 
         // Render to canvas (leaflet-image)
         const canvas = await new Promise((resolve, reject) =>
@@ -878,21 +865,21 @@
             : reject(new Error('leaflet-image not loaded'))
         );
 
-        // Stat card overlay (compact, legible)
+        // Stat card (compact)
         const ctx = canvas.getContext('2d');
         const w = canvas.width, h = canvas.height;
-        const padPx = Math.round(Math.min(w, h) * 0.02);
+        const pad = Math.round(Math.min(w, h) * 0.02);
         const boxW = Math.min(Math.round(w * 0.5), 620);
         const lineH = Math.round(Math.min(w, h) * 0.03);
-        const boxH = lineH * 6 + padPx * 2;
+        const boxH = lineH * 6 + pad * 2;
 
         ctx.fillStyle = 'rgba(255,255,255,0.92)';
-        roundRect(ctx, w - boxW - padPx, padPx, boxW, boxH, 10).fill();
+        roundRect(ctx, w - boxW - pad, pad, boxW, boxH, 10).fill();
 
         ctx.fillStyle = '#111';
         ctx.font = 'bold ' + (lineH * 0.9) + 'px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-        const x = w - boxW - padPx + padPx;
-        let y = padPx + lineH;
+        const x = w - boxW - pad + pad;
+        let y = pad + lineH;
 
         const title = `${it.day} — ${it.driver}`;
         ctx.fillText(title, x, y); y += lineH * 1.1;
@@ -909,7 +896,7 @@
           `Apts: ${s.apartments || 0}`
         ].forEach(t => { ctx.fillText(t, x, y); y += lineH * 1.0; });
 
-        // POST PNG to Apps Script receiver — use no-cors and NO headers (avoid preflight)
+        // POST PNG to Apps Script receiver — no-cors, no headers (avoid preflight)
         const png = canvas.toDataURL('image/png');
         if (cbUrl) {
           await fetch(cbUrl, {
@@ -1014,14 +1001,13 @@
   }
   function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
 
-  // quadrant + subquadrant helpers
   function quadParts(key) {
     const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/);
     return m ? { quad: m[1], sub: m[2] || null } : null;
   }
   function basePlusQuad(key) {
     const p = quadParts(key);
-    return p ? (baseKeyFrom(key) + '_' + p.quad) : null; // e.g., "W1_SW"
+    return p ? (baseKeyFrom(key) + '_' + p.quad) : null;
   }
   function isSubquadrantKey(k) { const p = quadParts(k); return !!(p && p.sub); }
   function isQuadrantKey(k)    { const p = quadParts(k); return !!(p && !p.sub); }
@@ -1083,8 +1069,7 @@
   function info(msg){ setStatus(`ℹ️ ${msg}`); }
   function warn(msg){ showTopError('Warning', msg); }
 
-  // Status line now includes "active zone keys"
-  function setStatus(msg) { const n = document.getElementById('status'); if (n) n.textContent = msg || ''; }
+  function setStatus(msg) { const n = document.getElementById('status'); if (n) { if (exportOnly) n.style.display='none'; else n.textContent = msg || ''; } }
   function makeStatusLine(selMunis, inCount, outCount, activeKeysLowerArray) {
     const muniList = (Array.isArray(selMunis) && selMunis.length) ? selMunis.join(', ') : '—';
     const keysTxt = (Array.isArray(activeKeysLowerArray) && activeKeysLowerArray.length)
@@ -1093,7 +1078,6 @@
     return `Customers (in/out): ${inCount}/${outCount} • Municipalities: ${muniList} • active zone keys: ${keysTxt}`;
   }
 
-  // Assignment extraction – ONLY accept known driver names, avoid day words like “Sat”
   function extractAssignmentsFromCsv(rows, knownNamesSet) {
     const like = (s) => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
     const dayWords = new Set(['mon','monday','tue','tues','tuesday','wed','weds','wednesday','thu','thur','thurs','thursday','fri','friday','sat','saturday','sun','sunday']);
@@ -1107,7 +1091,6 @@
     const isKeysHeader = (s) => { const v = like(s); return v.includes('key') || v.includes('zone') || v.includes('route'); };
     const isDriverHeader = (s) => { const v = like(s); return v.includes('driver') || v === 'name' || v.includes('assigned'); };
 
-    // Try header-based table
     let headerIndex = -1, driverCol = -1, keysCol = -1;
     for (let i=0; i<Math.min(rows.length, 50); i++) {
       const row = rows[i] || [];
@@ -1126,13 +1109,12 @@
         const dn = (row[driverCol] || '').trim();
         const ks = (row[keysCol]   || '').trim();
         if (!dn || !ks) continue;
-        if (!looksLikeName(dn)) continue; // reject “Sat”
+        if (!looksLikeName(dn)) continue;
         splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
       }
       return out;
     }
 
-    // Fallback: scan first 40 rows; only accept KNOWN names
     for (let r = 0; r < Math.min(rows.length, 40); r++) {
       const row = rows[r] || [];
       if (!row.length) continue;
@@ -1145,7 +1127,6 @@
       }
       if (!dn) continue;
 
-      // find any cell(s) with keys and merge
       let allKeys = [];
       for (let c=0;c<row.length;c++) {
         const cell = (row[c]||'').trim();
@@ -1159,7 +1140,6 @@
     return out;
   }
 
-  // ensure every driver referenced has a color entry
   function ensureDriverMeta(metaList, driverNames) {
     const out = Array.isArray(metaList) ? [...metaList] : [];
     const seen = new Set(out.map(d => String(d.name||'').toLowerCase()));
@@ -1170,14 +1150,12 @@
     return out;
   }
 
-  // stable HSL from name
   function colorFromName(name) {
     let h=0; const s=65, l=50; const str = String(name||'');
     for (let i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) % 360;
     return `hsl(${h}, ${s}%, ${l}%)`;
   }
 
-  // Small settle helper for map transitions
   function settle(ms=300){ return new Promise(r => setTimeout(r, ms)); }
 
 })().catch(e => {
