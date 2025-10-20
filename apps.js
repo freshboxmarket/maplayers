@@ -1,4 +1,4 @@
-<!-- apps.js (vNext, banner-pos accurate + robust stats + save UX) -->
+<!-- apps.js (vNext, banner-pos accurate + robust stats + save UX; fixed + consolidated) -->
 <script>
 (async function () {
   // ---------- error surfacing ----------
@@ -194,8 +194,10 @@
     document.getElementById('btnStats').addEventListener('click', () => toggleStats());
     document.getElementById('btnSnap').addEventListener('click', onSnapClick);
 
-    // keyboard
+    // keyboard (ignore when typing in inputs)
     window.addEventListener('keydown', async (e)=>{
+      const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+      if (tag === 'input' || tag === 'textarea' || e.target?.isContentEditable) return;
       if (!batchItems.length) return;
       if (e.key === 'ArrowRight') { e.preventDefault(); await stepRouteCycle(+1); }
       else if (e.key === 'ArrowLeft') { e.preventDefault(); await stepRouteCycle(-1); }
@@ -231,7 +233,6 @@
   function trySumExpression(s){
     if (!s) return null;
     const t = String(s).trim();
-    // support "12+1", "12 + 1", "12.5+1.25"
     if (!/[+\d]/.test(t)) return null;
     const parts = t.replace(/[^0-9.+-]/g,'').split('+').map(x=>x.trim()).filter(Boolean);
     if (parts.length < 2) return null;
@@ -253,7 +254,6 @@
     const want = words.map(w => String(w).toLowerCase());
     const direct = scanObject(obj, (k,v)=> want.every(w => k.includes(w)));
     if (direct) return direct;
-    // loose aliases
     const aliases = {
       base: ['basebox','baseboxes','base','regular'],
       custom: ['custom','customs','special','custom_boxes','customBoxes','customsText'],
@@ -833,6 +833,16 @@
     return -1;
   }
 
+  // ✅ Correct, in-scope version (fixes the aconst → const bug and removes duplication)
+  function headerIndexMap(hdrRow, schema) {
+    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+    const idx = (name) => Array.isArray(hdrRow)
+      ? hdrRow.findIndex(h => (h||'').toLowerCase() === name)
+      : -1;
+    return { coords: idx(wantCoords), note: idx(wantNote) };
+  }
+
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
   function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
 
@@ -975,14 +985,15 @@
     catch(e){ console.warn('downloadFallback failed:', e); }
   }
 
-  // Load libs if missing
+  // Load libs if missing (also ensures Turf for point-in-polygon)
   async function ensureLibs(){
     const loadScript = (src) => new Promise((resolve, reject) => {
       if ([...document.scripts].some(s => s.src && s.src.includes(src))) return resolve();
       const el = document.createElement('script'); el.src = src; el.onload = resolve; el.onerror = reject; document.head.appendChild(el);
     });
-    if (!window.html2canvas) await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
+    if (!window.html2canvas)  await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
     if (!window.leafletImage) await loadScript('https://unpkg.com/leaflet-image/leaflet-image.js');
+    if (!(window.turf && turf.booleanPointInPolygon)) await loadScript('https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js');
   }
 
   // -----------------------------------------------------------------
@@ -1097,7 +1108,7 @@
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — (unchanged)
+  // LOADERS / SELECTION / CUSTOMERS
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
@@ -1316,6 +1327,9 @@
       added++;
     }
     customerCount = added; info(`Loaded ${customerCount} customers.`);
+
+    // Make sure Turf is around for counts/styling
+    if (!(window.turf && turf.booleanPointInPolygon)) { try { await ensureLibs(); } catch {} }
 
     recolorAndRecountCustomers();
 
@@ -1585,13 +1599,12 @@
   console.error(e);
 });
 
-// --------- small helpers kept outside IIFE for reuse in tests ----------
-function headerIndexMap(hdrRow, schema) {
-  const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-  const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
-  const idx = (name) => Array.isArray(hdrRow)
-    ? hdrRow.findIndex(h => (h || '').toLowerCase() === name)
-    : -1;
-  return { coords: idx(wantCoords), note: idx(wantNote) };
+// --------- tiny helpers kept outside IIFE for reuse in tests ----------
+function extractDriveFolderId(str){
+  if (!str) return '';
+  const m = String(str).match(/\/folders\/([A-Za-z0-9_-]{10,})/);
+  if (m) return m[1];
+  if (/^[A-Za-z0-9_-]{10,}$/.test(str)) return str;
+  return '';
 }
 </script>
