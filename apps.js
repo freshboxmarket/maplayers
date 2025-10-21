@@ -247,103 +247,92 @@
         return undefined;
       }
 
-+      // Heuristic helpers: prefer descriptive strings (e.g. "A = 1 | B = 2") over bare numbers
-+      function isTextish(v) {
-+        if (v == null) return false;
-+        if (Array.isArray(v)) return v.length > 0;
-+        if (typeof v === 'object') {
-+          // If object has any common text fields, consider it textish
-+          const prefer = ['baseBoxesText','customsText','addOnsText','text','desc','description','value','label'];
-+          return prefer.some(k => v[k] != null && String(v[k]).trim() !== '');
-+        }
-+        if (typeof v === 'string') {
-+          const s = v.trim();
-+          if (!s) return false;
-+          // signs of descriptive content
-+          if (/[=|,]/.test(s)) return true;
-+          if (/\s{2,}/.test(s)) return true;      // multiple words / spacing
-+          if (/\d+\s*\+\s*\d+/.test(s)) return true; // summed expressions
-+          if (s.length >= 4 && /\D/.test(s)) return true; // non-trivial, non-pure-numeric
-+          return s !== '0';
-+        }
-+        // numbers: non-zero can be meaningful, but not "textish"
-+        return false;
-+      }
-+
-+      function firstTextish(s, names = [], keywords = []) {
-+        // 1) explicit property name preference
-+        for (const n of names) {
-+          if (s[n] != null && isTextish(s[n])) return s[n];
-+        }
-+        // 2) keyword scan across object keys
-+        if (keywords.length) {
-+          for (const [k, v] of Object.entries(s || {})) {
-+            const lk = (k || '').toLowerCase();
-+            if (keywords.every(w => lk.includes(w)) && isTextish(v)) return v;
-+          }
-+        }
-+        return undefined;
-+      }
-+
-+      // REPLACED: Prefer descriptive "text" for E/F/G; fall back to letters only if nothing text-ish exists.
-+      function getStatsTexts(statsObj) {
-+        const s = statsObj || {};
-+
-+        // D / H keep the simple precedence (these are often numeric)
-+        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
-+        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
-+
-+        // E — Base Boxes (prefer explicit text-like fields *before* letter fallback)
-+        const baseRaw =
-+          firstTextish(s,
-+            ['baseBoxesText','baseBoxes','base','EText','E'],
-+            ['base','box']
-+          ) ?? s.E ?? pickByKeysLike(s, ['base','box']);
-+
-+        // F — Customs
-+        const custRaw =
-+          firstTextish(s,
-+            ['customsText','customs','FText','F'],
-+            ['custom'] // catches 'custom', 'customs'
-+          ) ?? s.F ?? pickByKeysLike(s, ['custom']);
-+
-+        // G — Add Ons (cover a few common spellings)
-+        const addRaw =
-+          firstTextish(s,
-+            ['addOnsText','addOns','add_ons','addons','GText','G'],
-+            ['add'] // matches 'add ons', 'addons', etc.
-+          ) ?? s.G ?? (s.addOns ?? s.add_ons ?? s.addons) ?? pickByKeysLike(s, ['add']);
-+
-+        const asText = (v) => stringifyStat(v) || '';
-+        return {
-+          deliveriesTxt: asText(deliveriesRaw),
-+          apartmentsTxt: asText(aptsRaw),
-+          baseTxt:       asText(baseRaw),
-+          custTxt:       asText(custRaw),
-+          addTxt:        asText(addRaw),
-+        };
-+      }
 
-      
-+      // Build one-line stats string in order D,H,E,F,G **with headers**.
-+      // Preserves your “single-line” rule by collapsing newlines to spaces.
-+      function buildStatsOneLiner(t) {
-+        const seg = (label, val) => {
-+          const v = String(val || '').trim();
-+          if (!v || v === '—') return '';
-+          const oneLine = v.replace(/\s*\n+\s*/g, ' ');
-+          return `${label}: ${oneLine}`;
-+        };
-+        const parts = [
-+          seg('# deliveries', t.deliveriesTxt),
-+          seg('# apartments', t.apartmentsTxt),
-+          seg('# base boxes', t.baseTxt),
-+          seg('# customs',    t.custTxt),
-+          seg('# add ons',    t.addTxt),
-+        ].filter(Boolean);
-+        return parts.join(' • ');
-+      }
++            // getStatsTexts update goes here
+      // Heuristic helpers: prefer descriptive strings (e.g. "A = 1 | B = 2") over bare numbers
+      function isTextish(v) {
+        if (v == null) return false;
+        if (Array.isArray(v)) return v.length > 0;
+        if (typeof v === 'object') {
+          const prefer = ['baseBoxesText','customsText','addOnsText','text','desc','description','value','label'];
+          return prefer.some(k => v[k] != null && String(v[k]).trim() !== '');
+        }
+        if (typeof v === 'string') {
+          const s = v.trim();
+          if (!s) return false;
+          if (/[=|,]/.test(s)) return true;
+          if (/\s{2,}/.test(s)) return true;
+          if (/\d+\s*\+\s*\d+/.test(s)) return true;
+          if (s.length >= 4 && /\D/.test(s)) return true;
+          return s !== '0';
+        }
+        return false;
+      }
 
+      function firstTextish(s, names = [], keywords = []) {
+        for (const n of names) {
+          if (s[n] != null && isTextish(s[n])) return s[n];
+        }
+        if (keywords.length) {
+          for (const [k, v] of Object.entries(s || {})) {
+            const lk = (k || '').toLowerCase();
+            if (keywords.every(w => lk.includes(w)) && isTextish(v)) return v;
+          }
+        }
+        return undefined;
+      }
+
+      // REPLACED: Prefer descriptive "text" for E/F/G; fall back to letters only if nothing text-ish exists.
+      function getStatsTexts(statsObj) {
+        const s = statsObj || {};
+        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
+        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
+
+        const baseRaw =
+          firstTextish(s,
+            ['baseBoxesText','baseBoxes','base','EText','E'],
+            ['base','box']
+          ) ?? s.E ?? pickByKeysLike(s, ['base','box']);
+
+        const custRaw =
+          firstTextish(s,
+            ['customsText','customs','FText','F'],
+            ['custom']
+          ) ?? s.F ?? pickByKeysLike(s, ['custom']);
+
+        const addRaw =
+          firstTextish(s,
+            ['addOnsText','addOns','add_ons','addons','GText','G'],
+            ['add']
+          ) ?? s.G ?? (s.addOns ?? s.add_ons ?? s.addons) ?? pickByKeysLike(s, ['add']);
+
+        const asText = (v) => stringifyStat(v) || '';
+        return {
+          deliveriesTxt: asText(deliveriesRaw),
+          apartmentsTxt: asText(aptsRaw),
+          baseTxt:       asText(baseRaw),
+          custTxt:       asText(custRaw),
+          addTxt:        asText(addRaw),
+        };
+      }
+
+      // Build one-line stats string in order D,H,E,F,G **with headers**
+      function buildStatsOneLiner(t) {
+        const seg = (label, val) => {
+          const v = String(val || '').trim();
+          if (!v || v === '—') return '';
+          const oneLine = v.replace(/\s*\n+\s*/g, ' ');
+          return `${label}: ${oneLine}`;
+        };
+        const parts = [
+          seg('# deliveries', t.deliveriesTxt),
+          seg('# apartments', t.apartmentsTxt),
+          seg('# base boxes', t.baseTxt),
+          seg('# customs',    t.custTxt),
+          seg('# add ons',    t.addTxt),
+        ].filter(Boolean);
+        return parts.join(' • ');
+      }
 
       function renderDispatchBanner(it){
         const banner = document.getElementById('dispatchBanner'); if (!banner) return;
