@@ -1913,12 +1913,20 @@
   }
 
   // FIX B (Option 1): Top error UI helper (safe; no innerHTML, no external deps)
-  function showTopError(title, msg){
-    const n = document.getElementById('error'); if (!n) return;
-    n.style.display='block';
-    n.textContent = (title ? (title + ': ') : '') + (msg || '');
-    setTimeout(()=>{ n.style.display='none'; }, 5000);
-  }
++  function showTopError(title, msg){
++    const n = document.getElementById('error'); if (!n) return;
++    // Nudge below the toolbar if present; otherwise fall back to 12px.
++    const bar = document.querySelector('.route-toolbar');
++    if (bar) {
++      const r = bar.getBoundingClientRect();
++      n.style.top = Math.max(12, Math.round(r.bottom + 8)) + 'px'; // “a few pixels down”
++    } else {
++      n.style.top = '12px';
++    }
++    n.style.display = 'block';
++    n.textContent = (title ? (title + ': ') : '') + (msg || '');
++    setTimeout(() => { n.style.display = 'none'; }, 5000);
++  }
 
   // Kick it off
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
