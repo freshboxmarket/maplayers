@@ -562,15 +562,16 @@
         if (!snapArmed){
           ensureSnapshotUi();
           if (!restoreFrameRect()) {
-            const r = defaultFrameRect(); setFrameRect(r.left, r.top, r.width, r.height);
+            const r = defaultFrameRect();
+            setFrameRect(r.left, r.top, r.width, r.height);
           }
-          + snapEls.overlay.style.display = 'block';
-          + snapEls.helper.style.display  = 'block';
-          + positionSnapHelper();
-          btn.classList.add('armed'); btn.setAttribute('aria-label','Capture framed snapshot');
+          snapEls.overlay.style.display = 'block';
+          snapEls.helper.style.display  = 'block';
+          positionSnapHelper();
+          btn.classList.add('armed');
+          btn.setAttribute('aria-label','Capture framed snapshot');
           snapArmed = true;
         } else {
-          try{
             await ensureLibs();
             await waitForTilesReady(map, 12000);
 
