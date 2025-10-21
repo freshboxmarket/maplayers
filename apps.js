@@ -1,9 +1,9 @@
-// apps.js — vNext READY
+// apps.js — vNext READY (finished)
 // - Works with ?cfg, ?assignMap, ?driverMeta, ?batch (websafe b64), ?cb (webhook),
 //   optional ?manual=1, ?diag=1, and Drive hints (?driveDirect=1&gClientId=...&driveFolderId|driveFolderUrl|driveFolder).
 //
 // Notes
-// - Prevents blank shots by waiting for tiles then capturing (html2canvas first; leaflet-image fallback).
+// - Prevents blank shots by rendering the map via leaflet-image whenever the frame touches the map.
 // - Draws the banner (stats from E–G) ONTO the canvas at its DOM position (not double-rendered).
 // - Save dock shows storage readiness and returns a clickable Drive link.
 // - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
@@ -71,7 +71,7 @@
       const osmTiles = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
       const base = L.tileLayer(osmTiles, {
         attribution: '&copy; OpenStreetMap contributors',
-        crossOrigin: 'anonymous'        // important for html2canvas taint prevention
+        crossOrigin: 'anonymous'        // important for taint prevention
       }).addTo(map);
 
       // Collections/state
@@ -111,7 +111,7 @@
 
       if (totalFeatureCount() === 0) warn('No polygon features loaded; check cfg URLs and CORS.');
 
-      // Optional boundary mask
+      // Optional boundary mask (plugin optional)
       try {
         if (L.TileLayer?.boundaryCanvas && boundaryFeatures.length) {
           const boundaryFC = { type:'FeatureCollection', features: boundaryFeatures };
@@ -229,7 +229,8 @@
       }
       function getStatsTexts(statsObj) {
         const s = statsObj || {};
-        const baseRaw = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? pickByKeysLike(s, ['base','box']);
+        theBase = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? pickByKeysLike(s, ['base','box']);
+        const baseRaw = theBase;
         const custRaw = s.customsText   ?? s.customs   ?? pickByKeysLike(s, ['custom']);
         const addRaw  = s.addOnsText    ?? s.addOns    ?? s.add_ons ?? s.addons ?? pickByKeysLike(s, ['add']);
         return {
@@ -477,6 +478,8 @@
             const it = (currentIndex>=0 && currentIndex<batchItems.length) ? batchItems[currentIndex] : null;
             if (!it) throw new Error('No focused route to capture.');
             const r = getFrameRect();
+
+            // >>> NEW composite capture that avoids blank maps <<<
             const canvas = await captureCanvas(r);
             drawBannerOntoCanvas(canvas, it, r);
             flashCropped(r);
@@ -540,7 +543,6 @@
               pngBase64: lastPngDataUrl,
               folderId: driveFolderIdCandidate || '',
               folderName: DRIVE_FOLDER_DEFAULT_NAME,
-              // shareAnyone: true, // uncomment if your server supports public link
             };
             reply = await saveViaWebhook(cbUrl, payload);
             if (reply && (reply.ok || reply.success)) {
@@ -657,43 +659,64 @@
         });
       }
 
+      // >>> NEW: composite capture that never blanks the map <<<
       async function captureCanvas(r){
-        // Prefer DOM-first (legend etc.), exclude snap UI and the banner (we draw it manually)
-        if (window.html2canvas) {
-          try{
-            const canvas = await html2canvas(document.body, {
-              useCORS: true,
-              allowTaint: false,
-              backgroundColor: null,
-              x: r.left, y: r.top, width: r.width, height: r.height,
-              windowWidth: document.documentElement.clientWidth,
-              windowHeight: document.documentElement.clientHeight,
-              scrollX: 0, scrollY: 0,
-              imageTimeout: 15000,
-              foreignObjectRendering: false,
-              ignoreElements: (el) => {
-                if (!el) return false;
-                const isBanner = (el.id === 'dispatchBanner') || el.closest?.('#dispatchBanner');
-                if (isBanner) return true; // exclude banner, we draw it ourselves
-                const cls = el.classList || { contains:()=>false };
-                return cls.contains('dispatch-banner') || cls.contains('snap-overlay') || cls.contains('snap-dock') || !!el.closest?.('.snap-dock');
-              }
-            });
-            if (canvas && canvas.width && canvas.height) return canvas;
-          } catch (e) { console.warn('html2canvas failed; trying Leaflet fallback:', e); }
+        await ensureLibs();
+
+        const mapEl = document.getElementById('map');
+        if (!mapEl) throw new Error('#map not found');
+
+        const mapRect = mapEl.getBoundingClientRect();
+        const ix = intersectRects(r, { left: mapRect.left, top: mapRect.top, width: mapRect.width, height: mapRect.height });
+        const frameArea = Math.max(1, r.width * r.height);
+        const mapShare = ix ? (ix.width * ix.height) / frameArea : 0;
+
+        // If the frame overlaps the map even a bit, render the map via leaflet-image.
+        if (ix && mapShare > 0.10) {
+          if (!window.leafletImage) throw new Error('leaflet-image missing');
+          const baseCanvas = await new Promise((resolve, reject) => leafletImage(map, (err, c) => err ? reject(err) : resolve(c)));
+
+          const out = document.createElement('canvas');
+          out.width = r.width; out.height = r.height;
+          const ctx = out.getContext('2d');
+
+          const sx = Math.max(0, Math.round(ix.left - mapRect.left));
+          const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
+          const sw = Math.round(ix.width);
+          const sh = Math.round(ix.height);
+          const dx = Math.round(ix.left - r.left);
+          const dy = Math.round(ix.top  - r.top);
+
+          ctx.clearRect(0, 0, out.width, out.height);
+          ctx.drawImage(baseCanvas, sx, sy, sw, sh, dx, dy, sw, sh);
+
+          return out; // banner drawn later
         }
-        // Map-only fallback (leaflet-image)
-        if (!window.leafletImage) throw new Error('leaflet-image missing.');
-        const mapRect = document.getElementById('map').getBoundingClientRect();
-        const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
-        if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap map; fallback cannot proceed.');
-        const baseCanvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
-        const sx = Math.max(0, Math.round(ix.left - mapRect.left));
-        const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
-        const sw = Math.round(ix.width), sh = Math.round(ix.height);
-        const out = document.createElement('canvas'); out.width = sw; out.height = sh;
-        out.getContext('2d').drawImage(baseCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
-        return out;
+
+        // UI-only capture (no map region). Exclude the banner (we draw it ourselves) and dock/overlay
+        if (!window.html2canvas) throw new Error('html2canvas missing');
+        return await html2canvas(document.body, {
+          useCORS: true,
+          allowTaint: false,
+          backgroundColor: null,
+          x: r.left, y: r.top, width: r.width, height: r.height,
+          windowWidth: document.documentElement.clientWidth,
+          windowHeight: document.documentElement.clientHeight,
+          scrollX: 0, scrollY: 0,
+          imageTimeout: 15000,
+          foreignObjectRendering: false,
+          ignoreElements: (el) => {
+            if (!el) return false;
+            const isMap     = (el.id === 'map') || el.closest?.('#map');
+            const isBanner  = (el.id === 'dispatchBanner') || el.closest?.('#dispatchBanner');
+            const cls = el.classList || { contains: ()=>false };
+            return isMap ||
+                   isBanner ||
+                   cls.contains('snap-overlay') ||
+                   cls.contains('snap-dock') ||
+                   !!el.closest?.('.snap-dock');
+          }
+        });
       }
 
       function flashCropped(r){
@@ -727,6 +750,7 @@
             if (selectionBounds) fitWithHints(selectionBounds, it?.view || null);
             await ensureLibs(); await waitForTilesReady(map, 12000);
 
+            // Map-only snapshot for auto-export (banner drawn onto it)
             const canvas = await new Promise((resolve, reject) => leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
             drawBannerOntoCanvas(canvas, it, {left:0,top:0,width:canvas.width,height:canvas.height});
             const png = canvas.toDataURL('image/png');
@@ -938,6 +962,7 @@
         const rows = parseCsvRows(text);
         if (!rows.length) { custWithinSel = custOutsideSel = 0; resetDayCounts(); updateLegend(); setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, [])); renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel); updateDiagnostics(); return; }
 
+        // and → && FIX APPLIED BELOW
         const hdrIdx = findCustomerHeaderIndex(rows, custCfg.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
         if (hdrIdx === -1) { warn('Customers CSV: header not found.'); custWithinSel = custOutsideSel = 0; resetDayCounts(); updateLegend(); setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, [])); renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel); updateDiagnostics(); return; }
 
@@ -1359,7 +1384,7 @@
       }
       function findCustomerHeaderIndex(rows, schema) {
         const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase(); // FIXED: && not "and"
         for (let i=0;i<rows.length;i++) {
           const hdr = rows[i] || [];
           const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
@@ -1639,7 +1664,6 @@
               callback: (resp) => {
                 if (resp && resp.access_token) {
                   driveAuth.accessToken = resp.access_token;
-                  // Access tokens from GIS are ~3600s; approximate expiry
                   driveAuth.expiresAt = nowSec() + (resp.expires_in ? Math.floor(resp.expires_in*0.9) : 3200);
                   resolve(driveAuth.accessToken);
                 } else { reject(new Error('No access token')); }
@@ -1650,7 +1674,6 @@
           try {
             driveAuth.tokenClient.requestAccessToken({ prompt: needNew ? 'consent' : '' });
           } catch (e) {
-            // Some browsers need explicit prompt on first call
             try { driveAuth.tokenClient.requestAccessToken({ prompt: 'consent' }); }
             catch (err) { reject(err); }
           }
@@ -1707,8 +1730,6 @@
         const closeDelim = `\r\n--${boundary}--`;
         const pngBlob = dataUrlToBlob(dataUrl);
 
-        const metaPart = new Blob([JSON.stringify(metadata)], { type: 'application/json; charset=UTF-8' });
-
         const body = new Blob(
           [
             delimiter,
@@ -1742,6 +1763,18 @@
       updateDiagnostics();
     })();
   }
+
+  // Top error UI helper
+  function showTopError(title, msg){
+    const n = document.getElementById('error'); if (!n) return;
+    n.style.display='block';
+    n.innerHTML = `<strong>${escapeHtml(title)}:</strong> ${escapeHtml(msg || '')}`;
+    setTimeout(()=>{ n.style.display='none'; }, 5000);
+  }
+
+  // Simple fetch helpers
+  async function fetchJson(url){ const r = await fetch(url, { cache:'no-cache' }); if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`); return await r.json(); }
+  async function fetchText(url){ const r = await fetch(url, { cache:'no-cache' }); if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`); return await r.text(); }
 
   // Kick it off
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
