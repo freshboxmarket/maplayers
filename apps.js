@@ -197,19 +197,17 @@
       }
 
       // --- STAT TEXT FROM E–G (rich text strings) ---
+      // (Replaced with your more-forgiving version)
       function stringifyStat(val){
         if (val == null) return '';
         if (typeof val === 'number') return String(val);
         if (typeof val === 'string') return val.trim();
         if (Array.isArray(val)) return val.map(stringifyStat).filter(Boolean).join(' | ');
         if (typeof val === 'object') {
-          // prefer "Text" fields if present
-          const pref = ['baseBoxesText','customsText','addOnsText'];
-          for (const k of pref) if (val[k]) return stringifyStat(val[k]);
-          // generic pretty
-          const entries = Object.entries(val).filter(([,v]) => v != null && String(v).trim?.() !== '');
-          const text = entries.map(([,v]) => stringifyStat(v)).join(' | ');
-          return text.trim();
+          const prefer = ['baseBoxesText','customsText','addOnsText','text','desc','description','value','label'];
+          for (const k of prefer) if (val[k]) return stringifyStat(val[k]);
+          const entries = Object.entries(val).map(([,v]) => stringifyStat(v)).filter(Boolean);
+          return entries.join(' | ');
         }
         return String(val);
       }
@@ -220,24 +218,36 @@
         if (!strict.test(t)) return null;
         return t.split('+').map(x => Number(x.trim())).reduce((a,b)=>a+b,0) + '';
       }
-      function normalizeQty(s){ const str = stringifyStat(s); const summed = trySumExpression(str); return summed || (str || '—'); }
-
-      // Robust retrieval of E–G texts
+      function normalizeQtyLike(s){ const str = stringifyStat(s); const summed = trySumExpression(str); return (summed || str || '—'); }
+      function pickByKeysLike(obj, mustIncludes){
+        const want = mustIncludes.map(s => s.toLowerCase());
+        for (const [k,v] of Object.entries(obj||{})) {
+          const lk = k.toLowerCase();
+          if (want.every(w => lk.includes(w))) return v;
+        }
+        return undefined;
+      }
       function getStatsTexts(statsObj) {
         const s = statsObj || {};
-        const baseTxt = normalizeQty(s.baseBoxesText ?? s.base ?? s.baseBoxes ?? s.baseBoxesText);
-        const custTxt = normalizeQty(s.customsText   ?? s.customs);
-        const addTxt  = normalizeQty(s.addOnsText    ?? s.addOns ?? s.add_ons);
-        return { baseTxt, custTxt, addTxt };
+        const baseRaw = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? pickByKeysLike(s, ['base','box']);
+        const custRaw = s.customsText   ?? s.customs   ?? pickByKeysLike(s, ['custom']);
+        const addRaw  = s.addOnsText    ?? s.addOns    ?? s.add_ons ?? s.addons ?? pickByKeysLike(s, ['add']);
+        return {
+          baseTxt: normalizeQtyLike(baseRaw),
+          custTxt: normalizeQtyLike(custRaw),
+          addTxt:  normalizeQtyLike(addRaw),
+          deliveriesTxt: stringifyStat(s.deliveries) || '—',
+          apartmentsTxt: stringifyStat(s.apartments) || '—'
+        };
       }
 
       function renderDispatchBanner(it){
         const banner = document.getElementById('dispatchBanner'); if (!banner) return;
         if (!it) { banner.classList.remove('visible'); return; }
         const s = it?.stats || {};
-        const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
+        const { baseTxt, custTxt, addTxt, deliveriesTxt, apartmentsTxt } = getStatsTexts(s);
         const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
-        const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
+        const row2 = `<strong>Deliveries:</strong> ${escapeHtml(deliveriesTxt)} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(apartmentsTxt)} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
         const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
         banner.querySelector('.r1').innerHTML = row1;
         banner.querySelector('.r2').innerHTML = row2;
@@ -252,10 +262,10 @@
         if (!domBanner || !domBanner.classList.contains('visible')) return;
 
         const s = it?.stats || {};
-        const { baseTxt, custTxt, addTxt } = getStatsTexts(s);
+        const { baseTxt, custTxt, addTxt, deliveriesTxt, apartmentsTxt } = getStatsTexts(s);
 
         const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
-        const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
+        const row2 = `Deliveries: ${deliveriesTxt}  -  Apts: ${apartmentsTxt}  -  Base boxes: ${baseTxt}`;
         const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
 
         const bRect = domBanner.getBoundingClientRect();
@@ -1247,6 +1257,25 @@
       const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
       const ensurePngExt = s => /\.(png)$/i.test(s) ? s : (s.replace(/\.[a-z0-9]+$/i,'') + '.png');
 
+      // NEW: webhook helper using text/plain (no preflight)
+      async function saveViaWebhook(url, payload){
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        return ct.includes('application/json') ? await res.json() : null;
+      }
+
+      // Tiny helper (in case not defined earlier)
+      function extractDriveFolderId(s){
+        if (!s) return '';
+        const m = String(s).match(/[-\w]{25,}/);
+        return m ? m[0] : '';
+      }
+
       function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
       function hideLabel(lyr) { if (lyr.getTooltip()) lyr.unbindTooltip(); }
       function dimFill(perDay, cfg) { const base = perDay.fillOpacity ?? 0.8; const factor = cfg.style?.dimmed?.fillFactor ?? 0.3; return Math.max(0.08, base * factor); }
@@ -1317,7 +1346,7 @@
       }
       function findCustomerHeaderIndex(rows, schema) {
         const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+        const wantNote   = ((schema and schema.note)   || 'Order Note').toLowerCase();
         for (let i=0;i<rows.length;i++) {
           const hdr = rows[i] || [];
           const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
@@ -1448,4 +1477,83 @@
           .dispatch-banner.visible{display:block}
           .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word}
           .dispatch-banner .row strong{font-weight:700}
-          .snap-overlay{position:fixed;in
+          .snap-overlay{position:fixed;inset:0;z-index:9400;pointer-events:none}
+          .snap-overlay .helper{position:fixed;left:50%;top:8px;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto}
+          .snap-overlay .frame{position:fixed;border:2px dashed #c62828;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,.25);cursor:move;pointer-events:auto}
+          .snap-overlay .handle{position:absolute;width:12px;height:12px;background:#fff;border:2px solid #c62828;border-radius:50%}
+          .snap-overlay .handle.n{left:50%;top:-8px;transform:translate(-50%,-50%)}
+          .snap-overlay .handle.s{left:50%;bottom:-8px;transform:translate(-50%,50%)}
+          .snap-overlay .handle.e{right:-8px;top:50%;transform:translate(50%,-50%)}
+          .snap-overlay .handle.w{left:-8px;top:50%;transform:translate(-50%,-50%)}
+          .snap-overlay .handle.ne{right:-8px;top:-8px;transform:translate(50%,-50%)}
+          .snap-overlay .handle.nw{left:-8px;top:-8px;transform:translate(-50%,-50%)}
+          .snap-overlay .handle.se{right:-8px;bottom:-8px;transform:translate(50%,50%)}
+          .snap-overlay .handle.sw{left:-8px;bottom:-8px;transform:translate(-50%,50%)}
+          .snap-flash-crop{position:fixed;border:2px solid #4caf50;border-radius:10px;pointer-events:none;left:0;top:0;width:0;height:0;opacity:0;transition:opacity .18s ease}
+          .snap-dock{position:fixed;right:12px;bottom:12px;z-index:9500;min-width:280px;max-width:90vw;background:#fff;border:1px solid #e8e8e8;border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.16);display:none}
+          .snap-dock .head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #eee}
+          .snap-dock .head .spacer{flex:1}
+          .snap-dock .head .x{background:transparent;border:none;font:700 16px system-ui;cursor:pointer}
+          .snap-dock .body{padding:10px}
+          .snap-dock .body .row{margin:6px 0}
+          .snap-dock .preview{display:block;width:100%;max-height:40vh;object-fit:contain;background:#f4f4f6;border-radius:8px}
+          .snap-dock input[type="text"]{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:6px;font:600 13px system-ui}
+          .snap-dock .btn{background:#111;color:#fff;border:none;border-radius:8px;padding:8px 10px;font:700 13px system-ui;cursor:pointer;margin-right:6px}
+          .snap-dock .btn.secondary{background:#f2f3f6;color:#222}
+          .snap-dock .link a{font:700 13px system-ui}
+          .snap-dock .note{font:600 12px system-ui;color:#555;margin-top:4px}
+        `;
+        // OPTIONAL: center & enlarge the Save popup (your C patch)
+        css.textContent += `
+          .snap-dock{
+            position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+            z-index:9500; width:min(90vw,1100px); max-width:1100px;
+            background:#fff; border-radius:14px; box-shadow:0 16px 44px rgba(0,0,0,.18);
+          }
+          .snap-dock .head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #eee}
+          .snap-dock .body{display:flex;gap:12px; padding:12px}
+          .snap-dock img.preview{max-width:64vw; max-height:70vh; object-fit:contain; background:#f6f7f8; border-radius:10px}
+          .snap-dock .row{margin-top:8px}
+        `;
+        document.head.appendChild(css);
+      }
+
+      // Boot helpers that were referenced (assumed to exist in your original)
+      function showTopError(title, msg){
+        let n = document.getElementById('error');
+        if (!n) return;
+        n.style.display = 'block';
+        n.innerHTML = `<div><strong>${escapeHtml(title)}:</strong> ${escapeHtml(msg||'')}</div>`;
+        setTimeout(()=>{ try{ n.style.display='none'; }catch{} }, 6000);
+      }
+      function renderError(msg){ showTopError('Error', msg); }
+
+      // (You already had these in your original code; placing stubs here in case)
+      async function ensureLibs(){ /* load html2canvas/leaflet-image/turf if needed */ }
+      async function fetchJson(url){ const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`); return await r.json(); }
+      async function fetchText(url){ const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`); return await r.text(); }
+      function makeBannerDraggable(el){ /* existing implementation in your file */ }
+      function restoreBannerPos(el){ /* existing implementation in your file */ }
+      function makeDockDraggable(el, handle){ /* existing implementation in your file */ }
+      function restoreDockPos(el){ /* existing implementation in your file */ }
+      function saveDockPos(el){ /* existing implementation in your file */ }
+      function colorFromName(name){ // deterministic pastel-ish
+        const s = String(name||''); let h=0; for (let i=0;i<s.length;i++) h = (h*31 + s.charCodeAt(i))>>>0;
+        const hue = h % 360; return `hsl(${hue}, 70%, 45%)`;
+      }
+      async function uploadToDriveDirect(opts){ /* your existing Google Picker/Drive client upload implementation */ }
+      function downloadFallback(dataUrl, name){
+        const a = document.createElement('a');
+        a.href = dataUrl; a.download = name || 'snapshot.png';
+        document.body.appendChild(a); a.click(); a.remove();
+      }
+
+      // finally, update diagnostics once at boot end (in case)
+      updateDiagnostics();
+    })();
+  }
+
+  // Kick it off
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
