@@ -1,22 +1,10 @@
-/* apps.js — manual route viewer + bottom banner + framed snapshots (vNext)
-   ------------------------------------------------------------------------
-   What’s new in vNext:
-   • Robust web-safe base64 batch parsing (padding fixer).
-   • If no batch & no sel CSV, seed selection from assignMap so the map isn’t “aimless”.
-   • Layer diagnostics (fetch failures + empty feature sets) + load counts in status.
-   • Map height guard (prevents “invisible #map” due to CSS).
-   • Friendlier error fallback if #error is missing.
-   • Optional debug heads-up overlay (?dbg=1) with quick telemetry.
-   • One-line summary composer + optional log callback (?logCb=...) for G2-style updates.
-   • Optional banner mode: ?banner=one (single row) | three (default).
-
-   URL flags:
-   • manual=1   → force toolbar/manual controls (default if batch present)
-   • auto=1     → run legacy auto-export loop
-   • cbAck=1    → expect JSON ack ({ok, webViewLink, fileId, folder}) from Apps Script
-   • dbg=1      → show a thin debug tray (counts, flags)
-   • banner=one → bottom banner uses a single compact line (instead of 3 rows)
-   • logCb=URL  → POST { type:'log', line, final?, tab?, week? } for G2-style one-line logs
+/* apps.js — manual route viewer + bottom banner + framed snapshots (fixed & upgraded)
+   ----------------------------------------------------------------
+   Adds:
+   • TDZ fixes (snapEls/snapArmed hoisted early).
+   • CSV → stats merge for: # base boxes, # customs, # add ons.
+   • Draggable dispatch banner (persisted; dbl-click to reset).
+   • Hides framing overlay during DOM capture so it won’t appear in snapshots.
 */
 
 (async function () {
@@ -34,9 +22,6 @@
   const cbUrl           = qs.get('cb') || '';
   const cbAck           = qs.get('cbAck') === '1';
   const batchParam      = qs.get('batch'); // websafe b64 JSON
-  const dbgOn           = qs.get('dbg') === '1';
-  const bannerMode      = (qs.get('banner') || 'three').toLowerCase(); // 'one' | 'three'
-  const logCbUrl        = qs.get('logCb') || ''; // optional Apps Script endpoint for one-line logs
 
   // Manual by default when batch exists; explicit manual=1 also honored. Use auto=1 to re-enable auto loop.
   const manualMode = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
@@ -51,6 +36,13 @@
   let activeAssignMap = { ...assignMapParam };
   let driverMeta      = Array.isArray(driverMetaParam) ? [...driverMetaParam] : [];
 
+  // --- SNAP globals (hoisted so early handlers can use them safely)
+  let snapArmed = false;
+  let snapEls = null; // {overlay, helper, frame, flash, toast}
+
+  // Stats overrides parsed from CSV (# base boxes / # customs / # add ons)
+  let statsOverrides = null; // { byDriverDay:Map, byRoute:Map, list:[] }
+
   // ---------- map init ----------
   phase('Loading config…');
   const cfg = await fetchJson(cfgUrl);
@@ -59,13 +51,6 @@
     renderError('Leaflet or #map element not available.');
     return;
   }
-
-  // Map height guard: avoid invisible map due to page CSS
-  try {
-    const mapEl = document.getElementById('map');
-    const h = mapEl?.getBoundingClientRect()?.height || 0;
-    if (h < 120) Object.assign(mapEl.style, { position:'absolute', inset:'0', minHeight:'360px' });
-  } catch {}
 
   phase('Initializing map…');
   const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
@@ -97,11 +82,9 @@
 
   // ---------- layers ----------
   phase('Loading polygon layers…');
-  await loadLayerSet(cfg.layers, baseDayLayers, true, 'base');
-  if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, subqOrQuadCollector('quad'), true, 'quad');
-  if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqOrQuadCollector('subq'), true, 'subq');
-
-  function subqOrQuadCollector(tag){ return (tag==='quad') ? quadDayLayers : subqDayLayers; }
+  await loadLayerSet(cfg.layers, baseDayLayers, true);
+  if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
+  if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
 
   // Optional boundary mask
   try {
@@ -121,22 +104,8 @@
     manualSelectedKeys = unionAllKeys(batchItems);
     runtimeCustEnabled = false; // overview: customers off
   }
-
-  // NEW: seed selection from assignMap when there’s no batch or CSV (prevents “aimless” view)
-  if (!manualMode && !batchItems.length && !manualSelectedKeys) {
-    const assignKeys = Object.keys(activeAssignMap || {});
-    if (assignKeys.length) {
-      manualSelectedKeys = assignKeys.map(normalizeKey);
-      runtimeCustEnabled = false; // consistent with overview
-    }
-  }
-
   await applySelection();
   await loadCustomersIfAny();
-
-  // quick layer counts in status
-  const sum = (arr) => (arr || []).reduce((n,e)=>n+(e.features?.length||0),0);
-  info(`Layers loaded — base:${sum(baseDayLayers)} quad:${sum(quadDayLayers)} subq:${sum(subqDayLayers)}`);
 
   // ---------- UI controls ----------
   if (manualMode && batchItems.length) {
@@ -145,13 +114,7 @@
     await zoomToOverview();
   } else if (!manualMode && batchItems.length) {
     await runAutoExport(batchItems);
-  } else if (manualMode) {
-    // manual with no batch → still offer UI (helps inspection)
-    injectManualUI();
-    ensureSnapshotUi();
   }
-
-  if (dbgOn) showDebugTray();
 
   // =================================================================
   // UI: Manual controller + Banner + Snapshot frame
@@ -168,7 +131,8 @@
       .dispatch-banner{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);z-index:8500;
         background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);
         border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);
-        padding:10px 14px;max-width:min(80vw,1100px);display:none}
+        padding:10px 14px;max-width:min(80vw,1100px);display:none; cursor:grab}
+      .dispatch-banner.dragging{cursor:grabbing}
       .dispatch-banner.visible{display:block}
       .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word}
       .dispatch-banner .row strong{font-weight:700}
@@ -193,12 +157,6 @@
       .snap-toast{position:fixed;left:12px;bottom:12px;z-index:9605;background:rgba(17,17,17,.95);color:#fff;
         border-radius:10px;padding:10px 12px;font:600 13px system-ui;display:none;max-width:min(72vw,520px)}
       .snap-toast a{color:#a5d6ff;text-decoration:underline}
-
-      /* debug tray */
-      .dbg-tray{position:absolute;right:10px;top:10px;z-index:9800;background:rgba(255,255,255,.95);
-        border-radius:10px;box-shadow:0 8px 22px rgba(0,0,0,.14);padding:8px 10px;font:12px system-ui;color:#111}
-      .dbg-tray .row{display:flex;gap:8px;align-items:center;margin:2px 0}
-      .dbg-tray .k{opacity:.65}
     `;
     document.head.appendChild(css);
 
@@ -216,10 +174,9 @@
     const banner = document.createElement('div');
     banner.id = 'dispatchBanner';
     banner.className = 'dispatch-banner';
-    banner.innerHTML = (bannerMode === 'one')
-      ? `<div class="row r1"></div>`
-      : `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
+    banner.innerHTML = `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
     document.body.appendChild(banner);
+    makeBannerDraggable();
 
     // Wire buttons
     document.getElementById('btnPrev').addEventListener('click', async () => { await stepRoute(-1); });
@@ -239,6 +196,36 @@
     updateButtons();
   }
 
+  function makeBannerDraggable(){
+    const el = document.getElementById('dispatchBanner'); if (!el) return;
+    el.style.position = 'fixed';
+    const saved = JSON.parse(localStorage.getItem('dispatchBannerPos') || 'null');
+    if (saved && saved.left && saved.top) {
+      el.style.left = saved.left; el.style.top = saved.top; el.style.bottom = ''; el.style.transform = '';
+    }
+    let dragging=false, sx=0, sy=0, startL=0, startT=0;
+    el.addEventListener('pointerdown', (e)=>{
+      dragging = true; el.setPointerCapture(e.pointerId);
+      const r = el.getBoundingClientRect(); sx = e.clientX; sy = e.clientY; startL = r.left; startT = r.top;
+      el.classList.add('dragging');
+    });
+    window.addEventListener('pointermove', (e)=>{
+      if (!dragging) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      el.style.left = Math.max(0, Math.min(window.innerWidth  - el.offsetWidth,  startL + dx)) + 'px';
+      el.style.top  = Math.max(0, Math.min(window.innerHeight - el.offsetHeight, startT + dy)) + 'px';
+      el.style.bottom = ''; el.style.transform = '';
+    });
+    window.addEventListener('pointerup', ()=>{
+      if (!dragging) return; dragging = false; el.classList.remove('dragging');
+      localStorage.setItem('dispatchBannerPos', JSON.stringify({ left: el.style.left, top: el.style.top }));
+    });
+    el.addEventListener('dblclick', ()=>{
+      localStorage.removeItem('dispatchBannerPos');
+      el.style.left = '50%'; el.style.top = ''; el.style.bottom = '12px'; el.style.transform = 'translateX(-50%)';
+    });
+  }
+
   function toggleStats(){
     statsVisible = !statsVisible;
     const banner = document.getElementById('dispatchBanner');
@@ -246,48 +233,31 @@
     if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
   }
 
-  function composeOneLine(it){
-    if (!it) return '';
-    const s = it.stats || {};
-    const baseTxt = (s.baseBoxesText ?? s.baseBoxes ?? 0);
-    const custTxt = (s.customsText   ?? s.customs   ?? 0);
-    const addTxt  = (s.addOnsText    ?? s.addOns    ?? 0);
-    const delv    = (s.deliveries ?? 0);
-    const apts    = (s.apartments ?? 0);
-    const parts = [
-      `Day:${it.day||''}`,
-      `Driver:${it.driver||''}`,
-      `Route:${it.name||''}`,
-      `Deliv:${delv}`,
-      `Apts:${apts}`,
-      `Base:${baseTxt}`,
-      `Customs:${custTxt}`,
-      `Add-ons:${addTxt}`
-    ];
-    return parts.join(' • ');
+  function preferText(obj, a, b, fallback = '0'){
+    const va = obj?.[a]; if (va != null && String(va).trim() !== '') return String(va);
+    const vb = obj?.[b]; if (vb != null && String(vb).trim() !== '') return String(vb);
+    return fallback;
   }
 
   function renderDispatchBanner(it){
     const banner = document.getElementById('dispatchBanner'); if (!banner) return;
     if (!it) { banner.classList.remove('visible'); return; }
 
-    if (bannerMode === 'one') {
-      banner.querySelector('.r1').innerHTML = escapeHtml(composeOneLine(it));
-    } else {
-      const s = it?.stats || {};
-      const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
-                    : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
-      const custTxt = (s.customsText   != null) ? String(s.customsText)
-                    : (s.customs   != null)     ? String(s.customs)   : '0';
-      const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
-                    : (s.addOns    != null)     ? String(s.addOns)    : '0';
-      const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
-      const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
-      const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
-      banner.querySelector('.r1').innerHTML = row1;
-      banner.querySelector('.r2').innerHTML = row2;
-      banner.querySelector('.r3').innerHTML = row3;
-    }
+    // merge any CSV-derived text before display
+    applyStatsOverrides(it);
+
+    const s = it?.stats || {};
+    const baseTxt = preferText(s, 'baseBoxesText', 'baseBoxes');
+    const custTxt = preferText(s, 'customsText',   'customs');
+    const addTxt  = preferText(s, 'addOnsText',    'addOns');
+
+    const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
+    const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
+    const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
+
+    banner.querySelector('.r1').innerHTML = row1;
+    banner.querySelector('.r2').innerHTML = row2;
+    banner.querySelector('.r3').innerHTML = row3;
 
     if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
   }
@@ -295,33 +265,33 @@
   // Canvas banner (for saved PNG)
   function drawBannerOntoCanvas(canvas, it){
     if (!it) return;
+    applyStatsOverrides(it);
+    const s = it?.stats || {};
+    const baseTxt = preferText(s, 'baseBoxesText', 'baseBoxes');
+    const custTxt = preferText(s, 'customsText',   'customs');
+    const addTxt  = preferText(s, 'addOnsText',    'addOns');
+
+    const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
+    const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
+    const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
+
     const ctx = canvas.getContext('2d');
     const W = canvas.width, H = canvas.height;
     const pad = Math.round(Math.min(W,H)*0.018);
-    const maxW = Math.min(Math.round(W*0.8), 1100); // px
+    const maxW = Math.min(Math.round(W*0.8), 1100); // pixels
     const lineH = Math.max(16, Math.round(Math.min(W,H)*0.027));
-    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
 
-    const lines = (bannerMode === 'one')
-      ? [ composeOneLine(it) ]
-      : (function(){
-          const s = it.stats || {};
-          const baseTxt = (s.baseBoxesText ?? s.baseBoxes ?? 0);
-          const custTxt = (s.customsText   ?? s.customs   ?? 0);
-          const addTxt  = (s.addOnsText    ?? s.addOns    ?? 0);
-          const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
-          const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
-          const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
-          return [row1,row2,row3];
-        })();
+    const lines = [row1,row2,row3];
+    ctx.font = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    ctx.fillStyle='#111';
 
-    const wrapLines = (text, font) => {
+    // measure wrapped lines to compute banner height
+    let wrapped = [];
+    const wrap = (text, font) => {
       ctx.font = font;
       const words = text.split(/\s+/);
-      const out=[], m=()=>ctx.measureText(out[out.length-1]||'').width;
-      let cur='';
-      for (const w of words){
+      let cur='', out=[];
+      for (let w of words){
         const test = cur ? cur + ' ' + w : w;
         if (ctx.measureText(test).width <= maxW - pad*2) cur = test;
         else { if (cur) out.push(cur); cur = w; }
@@ -330,12 +300,12 @@
       return out;
     };
 
-    const all = (bannerMode === 'one')
-      ? wrapLines(lines[0], fBold)
-      : [...wrapLines(lines[0], fBold), ...wrapLines(lines[1], fNorm), ...wrapLines(lines[2], fNorm)];
-
+    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    wrapped = [...wrap(lines[0], fBold), ...wrap(lines[1], fNorm), ...wrap(lines[2], fNorm)];
+    const totalLines = wrapped.length;
     const boxW = maxW;
-    const boxH = pad*2 + all.length*lineH + Math.round(lineH*0.2);
+    const boxH = pad*2 + totalLines*lineH + Math.round(lineH*0.2);
     const x = Math.round((W - boxW)/2);
     const y = H - boxH - pad;
 
@@ -346,15 +316,12 @@
     // text
     let yy = y + pad + lineH;
     ctx.fillStyle='#111';
-    if (bannerMode==='one'){ ctx.font = fBold; }
-    let idx=0;
-    if (bannerMode!=='one'){ // bold for first row only
-      const first = wrapLines(lines[0], fBold).length;
-      ctx.font = fBold;
-      for (let i=0;i<first;i++) ctx.fillText(all[idx++], x+pad, yy), yy+=lineH;
-      ctx.font = fNorm;
-    }
-    for (; idx<all.length; idx++) ctx.fillText(all[idx], x+pad, yy), yy+=lineH;
+    let cursor = 0;
+    const L0 = wrap(lines[0], fBold).length;
+    ctx.font = fBold;
+    for (let i=0;i<L0;i++) { ctx.fillText(wrapped[cursor++], x+pad, yy); yy += lineH; }
+    ctx.font = fNorm;
+    for (;cursor<wrapped.length;cursor++){ ctx.fillText(wrapped[cursor], x+pad, yy); yy += lineH; }
   }
 
   function roundRect(ctx, x, y, w, h, r) {
@@ -389,6 +356,8 @@
     else currentIndex = (currentIndex + delta + batchItems.length) % batchItems.length;
 
     const it = batchItems[currentIndex];
+    applyStatsOverrides(it);
+
     manualSelectedKeys = (it.keys || []).map(normalizeKey);
     runtimeCustEnabled = true; // focused: show only this route’s customers
     await applySelection();
@@ -398,9 +367,6 @@
 
     renderDispatchBanner(it);
     updateButtons();
-
-    // optional: progress log line (one-line, non-final)
-    maybeLog(composeOneLine(it), false, it);
   }
 
   async function zoomToOverview(){
@@ -430,9 +396,6 @@
   // =================================================================
   // SNAPSHOT: frame → capture (DOM-first), flash, upload
   // =================================================================
-  let snapArmed = false;
-  let snapEls = null; // {overlay, helper, frame, flash, toast}
-
   function ensureSnapshotUi(){
     if (snapEls) return;
     const overlay = document.createElement('div');
@@ -525,6 +488,7 @@
         l = clamp(start.l + dx, 0, window.innerWidth  - w);
         t = clamp(start.t + dy, 0, window.innerHeight - h);
       } else {
+        // resize by dir
         if (dir.includes('e')) w = clamp(start.w + dx, 40, window.innerWidth);
         if (dir.includes('s')) h = clamp(start.h + dy, 40, window.innerHeight);
         if (dir.includes('w')) { l = clamp(start.l + dx, 0, start.l + start.w - 40); w = clamp(start.w - dx, 40, window.innerWidth); }
@@ -537,11 +501,14 @@
       window.removeEventListener('pointermove', onMove, {passive:false});
     };
 
+    // Move
     frameEl.addEventListener('pointerdown', (e)=>{
-      if (e.target.classList.contains('handle')) return;
+      const target = e.target;
+      if (target.classList.contains('handle')) return; // handled below
       onDown(e, null);
     });
 
+    // Handles
     frameEl.querySelectorAll('.handle').forEach(h => {
       h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir')));
     });
@@ -555,6 +522,9 @@
     // Try DOM-first capture (html2canvas must be loaded and CORS-safe)
     let canvas = null;
     if (window.html2canvas) {
+      // hide the overlay so it doesn't appear in the snapshot
+      const wasOn = snapEls && snapEls.overlay && snapEls.overlay.style.display !== 'none';
+      if (wasOn) snapEls.overlay.style.display = 'none';
       try{
         canvas = await html2canvas(document.body, {
           useCORS: true,
@@ -566,28 +536,32 @@
         });
       } catch (e) {
         console.warn('html2canvas failed, will try leaflet-image fallback:', e);
+      } finally {
+        if (wasOn) snapEls.overlay.style.display = 'block';
       }
     }
 
     if (!canvas) {
-      // Fallback: map-only render then crop; draw banner ourselves.
+      // Fallback: map-only render then crop to intersecting area; draw banner ourselves.
       if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
       const mapRect = document.getElementById('map').getBoundingClientRect();
       const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
       if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap the map; fallback capture cannot proceed.');
 
       canvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
-      // Crop
+      // Crop to intersection (relative to map origin)
       const sx = Math.max(0, Math.round(ix.left - mapRect.left));
       const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
       const sw = Math.round(ix.width), sh = Math.round(ix.height);
       const out = document.createElement('canvas'); out.width = sw; out.height = sh;
       out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
+      // If banner visible, draw it into the cropped canvas
       if (statsVisible) drawBannerOntoCanvas(out, it);
+
       canvas = out;
     } else {
-      // DOM path: banner already present if visible
+      // DOM path already includes banner when visible.
     }
 
     // Flash + upload
@@ -595,9 +569,6 @@
     const png = canvas.toDataURL('image/png');
     const name = it.outName || `${it.driver}_${it.day}.png`;
     await uploadOrDownload(png, name, it);
-
-    // optional: final one-liner log
-    maybeLog(composeOneLine(it), true, it);
   }
 
   function intersectRects(a,b){
@@ -667,6 +638,7 @@
     for (let i=0;i<items.length;i++){
       const it = items[i];
       try{
+        applyStatsOverrides(it);
         manualSelectedKeys = (it.keys||[]).map(normalizeKey);
         runtimeCustEnabled = true;
         await applySelection();
@@ -691,16 +663,9 @@
   // =================================================================
   // LOADERS / SELECTION / CUSTOMERS
   // =================================================================
-  async function loadLayerSet(arr, collector, addToMap = true, tag='base') {
+  async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
-      let gj = null;
-      try {
-        gj = await fetchJson(Lcfg.url);
-      } catch (e) {
-        warn(`Layer fetch failed (${tag}/${Lcfg.day}) — ${Lcfg.url}`);
-        continue;
-      }
-
+      const gj = await fetchJson(Lcfg.url);
       const perDay = (cfg.style?.perDay?.[Lcfg.day]) || {};
       const color = perDay.stroke || '#666';
       const fillColor = perDay.fill || '#ccc';
@@ -747,10 +712,6 @@
         }
       });
 
-      if (!features.length && !(gj?.features?.length > 0)) {
-        warn(`No features in ${tag}/${Lcfg.day} — ${Lcfg.url}`);
-      }
-
       collector.push({ day: Lcfg.day, layer, perDay, features });
       if (addToMap) layer.addTo(map);
     }
@@ -784,10 +745,14 @@
             }
           }
 
+          // Assignments (driver ↔ keys)
           const knownDriverNames = new Set((driverMeta||[]).map(d => String(d.name||'').toLowerCase()).filter(Boolean));
           const derivedAssign = extractAssignmentsFromCsv(rowsAA, knownDriverNames);
           activeAssignMap = { ...activeAssignMap, ...derivedAssign };
           driverMeta = ensureDriverMeta(driverMeta, Object.values(activeAssignMap));
+
+          // NEW: stats overrides from CSV (# base boxes / # customs / # add ons)
+          statsOverrides = buildStatsOverridesFromCsv(rowsAA);
         } catch (e) { warn(`Selection CSV load failed (${e?.message||e}). Showing all zones.`); }
       }
     }
@@ -1149,7 +1114,7 @@
     });
   }
 
-  // ---------- UI PANELS ----------
+  // ---------- UI PANELS (kept) ----------
   function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
     const el = document.getElementById('drivers'); if (!el) return;
 
@@ -1241,19 +1206,7 @@
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  // NEW: hardened web-safe b64
-  function parseBatchItems(b64){
-    if (!b64) return [];
-    try {
-      let s = String(b64).replace(/-/g,'+').replace(/_/g,'/');
-      while (s.length % 4) s += '=';
-      const json = atob(s);
-      const arr = JSON.parse(json);
-      return Array.isArray(arr) ? arr : [];
-    } catch {
-      return [];
-    }
-  }
+  function parseBatchItems(b64){ if (!b64) return []; try { const json = atob(String(b64).replace(/-/g,'+').replace(/_/g,'/')); const arr = JSON.parse(json); return Array.isArray(arr) ? arr : []; } catch { return []; } }
 
   function parseCsvRows(text) {
     const out = []; let i=0, f='', r=[], q=false;
@@ -1276,6 +1229,7 @@
     return out.map(row => row.map(v => (v||'').replace(/^\uFEFF/, '').trim()));
   }
 
+  // Flexible header finder for keys column
   function findHeaderFlexible(rows, schema) {
     if (!rows?.length) return null;
     const wantKeys = ((schema && schema.keys) || 'zone keys').toLowerCase();
@@ -1291,6 +1245,75 @@
       if (keysCol !== -1) return { headerIndex: i, keysCol };
     }
     return null;
+  }
+
+  // NEW: parse stats override headers
+  function headerIndexMapStats(hdrRow){
+    const like = s => (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    let base=-1, custom=-1, add=-1, driver=-1, day=-1, route=-1;
+    hdrRow.forEach((h,i)=>{
+      const v = like(h);
+      if (base  === -1 && v.includes('base')   && v.includes('box')) base = i;          // "# base boxes"
+      if (custom=== -1 && v.includes('custom'))                    custom = i;          // "# customs"
+      if (add   === -1 && v.includes('add')    && v.includes('on')) add = i;           // "# add ons"
+      if (driver=== -1 && v.includes('driver'))                    driver = i;
+      if (day   === -1 && (v === 'day' || v.includes('weekday')))  day = i;
+      if (route === -1 && (v === 'route' || (v.includes('route') && v.includes('name')))) route = i;
+    });
+    if (base === -1 && custom === -1 && add === -1) return null;
+    return { base, custom, add, driver, day, route };
+  }
+
+  function buildStatsOverridesFromCsv(rows){
+    if (!rows?.length) return null;
+    let hdrIdx = -1, idxs = null;
+    for (let i=0;i<rows.length;i++){
+      const m = headerIndexMapStats(rows[i]);
+      if (m){ hdrIdx = i; idxs = m; break; }
+    }
+    if (hdrIdx === -1 || !idxs) return null;
+
+    const pack = (r) => ({
+      baseBoxesText: idxs.base   !== -1 ? (r[idxs.base]   || '').trim() : '',
+      customsText:   idxs.custom !== -1 ? (r[idxs.custom] || '').trim() : '',
+      addOnsText:    idxs.add    !== -1 ? (r[idxs.add]    || '').trim() : ''
+    });
+
+    const out = { byDriverDay: new Map(), byRoute: new Map(), list: [] };
+    for (let i=hdrIdx+1; i<rows.length; i++){
+      const r = rows[i] || [];
+      if (!r.length) continue;
+      const p = pack(r);
+      const drv = idxs.driver !== -1 ? (r[idxs.driver] || '').trim() : '';
+      const day = idxs.day    !== -1 ? (r[idxs.day]    || '').trim() : '';
+      const rte = idxs.route  !== -1 ? (r[idxs.route]  || '').trim() : '';
+
+      if (drv || day) out.byDriverDay.set((String(day)+'|'+String(drv)).toLowerCase(), p);
+      if (rte)        out.byRoute.set(String(rte).toLowerCase(), p);
+      out.list.push(p);
+    }
+    return out;
+  }
+
+  function applyStatsOverrides(it){
+    if (!it || !statsOverrides) return;
+    // 1) by route name
+    if (it.name && statsOverrides.byRoute?.has(String(it.name).toLowerCase())) {
+      it.stats = { ...it.stats, ...statsOverrides.byRoute.get(String(it.name).toLowerCase()) };
+      return;
+    }
+    // 2) by (day,driver)
+    const key = (String(it.day||'')+'|'+String(it.driver||'')).toLowerCase();
+    if (statsOverrides.byDriverDay?.has(key)) {
+      it.stats = { ...it.stats, ...statsOverrides.byDriverDay.get(key) };
+      return;
+    }
+    // 3) order-based fallback (same-day alignment)
+    const sameDay = batchItems.filter(b => String(b.day||'').toLowerCase() === String(it.day||'').toLowerCase());
+    const idx = sameDay.indexOf(it);
+    if (idx > -1 && statsOverrides.list && statsOverrides.list[idx]) {
+      it.stats = { ...it.stats, ...statsOverrides.list[idx] };
+    }
   }
 
   function findCustomerHeaderIndex(rows, schema) {
@@ -1313,6 +1336,7 @@
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
 
+  // Collect a de-duplicated list of all zone keys across batch items
   function unionAllKeys(items){
     const set = new Set();
     (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k))));
@@ -1380,17 +1404,11 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
-  // NEW: friendlier top-error fallback
   function showTopError(title, msg) {
     const el = document.getElementById('error');
-    const text = `${title}: ${String(msg || '')}`;
-    if (el) {
-      el.style.display = 'block';
-      el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`;
-    } else {
-      console.error(text);
-      try { const s = document.getElementById('status'); if (s) s.textContent = `⚠ ${text}`; } catch {}
-    }
+    if (!el) return;
+    el.style.display = 'block';
+    el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`;
   }
   function renderError(msg) { showTopError('Load error', msg); }
   function phase(msg){ setStatus(`⏳ ${msg}`); }
@@ -1424,9 +1442,8 @@
       const row = rows[i] || [];
       let d=-1, k=-1;
       for (let c=0;c<row.length;c++) {
-        const cell = row[c];
-        if (d === -1 && isDriverHeader(cell)) d = c;
-        if (k === -1 && isKeysHeader(cell))   k = c;
+        if (d === -1 && isDriverHeader(row[c])) d = c;
+        if (k === -1 && isKeysHeader(row[c]))   k = c;
       }
       if (d !== -1 && k !== -1) { headerIndex = i; driverCol = d; keysCol = k; break; }
     }
@@ -1483,6 +1500,7 @@
     return `hsl(${h}, ${s}%, ${l}%)`;
   }
 
+  // Download fallback for local save when no cbUrl or upload fails
   function downloadFallback(dataUrl, name){
     try{
       const a = document.createElement('a');
@@ -1493,46 +1511,6 @@
       setTimeout(()=>a.remove(), 0);
     }catch(e){
       console.warn('downloadFallback failed:', e);
-    }
-  }
-
-  // ---------- debug tray ----------
-  function showDebugTray(){
-    const tray = document.createElement('div');
-    tray.className = 'dbg-tray';
-    const mk = (k,v)=>`<div class="row"><div class="k">${k}</div><div>${escapeHtml(String(v))}</div></div>`;
-    const counts = {
-      'batch items': batchItems.length,
-      'assignMap keys': Object.keys(activeAssignMap||{}).length,
-      'drivers meta': (driverMeta||[]).length,
-      'customers loaded': customerCount,
-    };
-    tray.innerHTML = `<div style="font-weight:700;margin-bottom:4px">Debug</div>
-      ${mk('manualMode', manualMode)}
-      ${mk('bannerMode', bannerMode)}
-      ${mk('cbAck', cbAck)}
-      ${mk('logCb', logCbUrl ? 'yes' : 'no')}
-      ${mk('hasSelection', hasSelection)}
-      ${mk('selected keys', selectedOrderedKeys.length)}
-      ${mk('visible keys', visibleSelectedKeysSet.size)}
-      ${mk('layers base/quad/subq', `${sum(baseDayLayers)}/${sum(quadDayLayers)}/${sum(subqDayLayers)}`)}
-      ${mk('customers in/out', `${custWithinSel}/${custOutsideSel}`)}
-    `;
-    document.body.appendChild(tray);
-  }
-
-  // ---------- optional one-line logger (Apps Script G2-style) ----------
-  async function maybeLog(line, final=false, it=null){
-    if (!logCbUrl || !line) return;
-    try {
-      const body = { type:'log', line: String(line), final: !!final };
-      if (it) {
-        body.tab  = it.name || '';
-        body.week = it.week || ''; // if you include this in your batch items
-      }
-      await fetch(logCbUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    } catch(e) {
-      console.warn('logCb failed:', e);
     }
   }
 
