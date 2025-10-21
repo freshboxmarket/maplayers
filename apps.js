@@ -1028,8 +1028,8 @@
         const turfOn = (typeof turf !== 'undefined');
         const cst = cfg.style?.customers || {};
         let outStyle = outsideHighlight
-          ? { radius: cst.radius || 9, color: '#d32f2f', weight: cst.weightPx || 2, opacity: 0.95, fillColor: '#ffcdd2', fillOpacity: 0.95 }
-          : { radius: cst.radius || 9, color: '#7a7a7a', weight: cst.weightPx || 2, opacity: 0.8,  fillColor: '#c7c7c7', fillOpacity: 0.6 };
+          ? { radius: (cst.radius || 9), color: '#d32f2f', weight: (cst.weightPx || 2), opacity: 0.95, fillColor: '#ffcdd2', fillOpacity: 0.95 }
+          : { radius: (cst.radius || 9), color: '#7a7a7a', weight: (cst.weightPx || 2), opacity: 0.8,  fillColor: '#c7c7c7', fillOpacity: 0.6 };
 
         const onlySelectedCustomers = manualMode && (currentIndex >= 0) && !outsideHighlight;
 
@@ -1190,7 +1190,7 @@
         });
       }
       function applyStyleDim(lyr, perDay, cfg) {
-        lyr.setStyle({
+      lyr.setStyle({
           color: perDay.stroke || '#666',
           weight: cfg.style?.dimmed?.weightPx ?? 1,
           opacity: cfg.style?.dimmed?.strokeOpacity ?? 0.35,
@@ -1279,6 +1279,32 @@
             recolorAndRecountCustomers();
           });
         }
+      }
+
+      // Put this directly after renderLegend(...) inside the IIFE
+      function updateLegend() {
+        // Build per-day counts from what's currently visible (coveragePolysAll)
+        // and what's part of the active selection (coveragePolysSelected).
+        // Works across base/quadrant/subquadrant because it only looks at what's
+        // actually on the map right now.
+        const byDay = {};
+        const bump = (day, field) => {
+          const d = day || '';
+          if (!byDay[d]) byDay[d] = { selected: 0, total: 0 };
+          byDay[d][field] += 1;
+        };
+
+        // total = visible features currently on the map
+        for (const rec of coveragePolysAll) {
+          bump(rec?.feat?.properties?.day, 'total');
+        }
+        // selected = features that are part of the active selection
+        for (const rec of coveragePolysSelected) {
+          bump(rec?.feat?.properties?.day, 'selected');
+        }
+
+        // Push the numbers into the legend
+        renderLegend(cfg, byDay, custWithinSel, custOutsideSel, outsideHighlight);
       }
 
       // =================================================================
