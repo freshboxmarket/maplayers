@@ -1,12 +1,12 @@
-// apps.js — vNext (stable snapshots + banner text from E–G + storage validation)
-// - No G2 log dependency (that stays in Apps Script).
+// apps.js — vNext READY
 // - Works with ?cfg, ?assignMap, ?driverMeta, ?batch (websafe b64), ?cb (webhook),
 //   optional ?manual=1, ?diag=1, and Drive hints (?driveDirect=1&gClientId=...&driveFolderId|driveFolderUrl|driveFolder).
 //
 // Notes
-// - Prevents blank shots by (a) waiting for tiles to finish loading and (b) falling back to leaflet-image.
-// - Draws banner (stats from E–G) into the canvas at the exact DOM position, inside the crop rect.
-// - Snap dock shows target storage readiness (Webhook/Drive) and returns a clickable Drive link on success.
+// - Prevents blank shots by waiting for tiles then capturing (html2canvas first; leaflet-image fallback).
+// - Draws the banner (stats from E–G) ONTO the canvas at its DOM position (not double-rendered).
+// - Save dock shows storage readiness and returns a clickable Drive link.
+// - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
 
 (function () {
   function start() {
@@ -49,7 +49,8 @@
         frame: 'dispatchViewer.snapFrameRect',
         banner:'dispatchViewer.bannerPos',
         dock:  'dispatchViewer.snapDockPos',
-        outside: 'dispatchViewer.highlightOutside'
+        outside: 'dispatchViewer.highlightOutside',
+        driveFolderCachePrefix: 'dispatchViewer.driveFolderId.'
       };
       let outsideHighlight = false;
       try { outsideHighlight = localStorage.getItem(LS_KEYS.outside) === '1'; } catch {}
@@ -140,7 +141,7 @@
         ensureDockUi();
         await zoomToOverview();
       } else if (!manualMode && batchItems.length) {
-        await runAutoExport(batchItems); // legacy auto
+        await runAutoExport(batchItems);
       }
 
       // =================================================================
@@ -197,7 +198,6 @@
       }
 
       // --- STAT TEXT FROM E–G (rich text strings) ---
-      // (Replaced with your more-forgiving version)
       function stringifyStat(val){
         if (val == null) return '';
         if (typeof val === 'number') return String(val);
@@ -289,7 +289,7 @@
 
         const wrap = (text, font) => {
           ctx.font = font;
-          const chunks = String(text||'').split(/\n+/); // support multiline rich text
+          const chunks = String(text||'').split(/\n+/);
           const out = [];
           for (const ch of chunks) {
             const words = ch.split(/\s+/);
@@ -429,14 +429,14 @@
 
         el.saveBtn.addEventListener('click', onSaveClick);
         el.dlBtn.addEventListener('click', onDownloadClick);
-        const closeDock = ()=>{ dock.style.display='none'; lastPngDataUrl=null; lastSuggestedName=null; el.note.textContent=''; el.link.textContent=''; };
+        const closeDock = ()=>{ dock.style.display='none'; lastPngDataUrl=null; lastSuggestedName=null; el.note.textContent=''; el.link.textContent=''; saveDockPos(dock); };
         el.exitBtn.addEventListener('click', closeDock);
         el.closeBtn.addEventListener('click', closeDock);
 
         dockEls = el;
       }
 
-      function showDock(pngDataUrl, suggestedName, ctxItem){
+      function showDock(pngDataUrl, suggestedName){
         ensureDockUi();
         const { dock, img, name, title, note, link, targets } = dockEls;
         title.textContent = 'Snapshot'; note.textContent = ''; link.textContent='';
@@ -472,7 +472,6 @@
         } else {
           try{
             await ensureLibs();
-            // wait tiles to avoid blank shots
             await waitForTilesReady(map, 12000);
 
             const it = (currentIndex>=0 && currentIndex<batchItems.length) ? batchItems[currentIndex] : null;
@@ -482,17 +481,16 @@
             drawBannerOntoCanvas(canvas, it, r);
             flashCropped(r);
 
-            // sanity check: images shouldn't be "tiny" data URLs
             const dataUrl = canvas.toDataURL('image/png');
             if (dataUrl.length < 256) throw new Error('Empty image produced. Check CORS or waitForTilesReady.');
             lastPngDataUrl = dataUrl;
 
             const rawName = it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`;
             lastSuggestedName = ensurePngExt(rawName);
-            showDock(lastPngDataUrl, lastSuggestedName, it);
+            showDock(lastPngDataUrl, lastSuggestedName);
             saveFrameRect();
           } catch (e) {
-            showDock(null, null, null);
+            showDock(null, null);
             dockEls.note.textContent = `Capture failed — ${String(e && e.message || e)}`;
           } finally {
             exitFraming();
@@ -512,7 +510,7 @@
         try {
           let success = false, reply = null;
 
-          // 1) Try Drive Direct (if enabled)
+          // 1) Drive Direct (if enabled)
           if (driveDirect && gClientId) {
             try {
               reply = await uploadToDriveDirect({
@@ -524,9 +522,9 @@
               });
               if (reply && reply.id) {
                 success = true;
-                const href = reply.webViewLink || `https://drive.google.com/file/d/${reply.id}/view`;
+                const href = toDriveViewLink(reply);
                 title.textContent = 'Saved ✓';
-                link.innerHTML = `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>`;
+                link.innerHTML = href ? `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>` : '';
                 note.innerHTML = `Saved to <b>${escapeHtml(DRIVE_FOLDER_DEFAULT_NAME)}</b> as <b>${escapeHtml(outName)}</b>.`;
               }
             } catch (e) {
@@ -541,12 +539,13 @@
               day: ctx.day, driver: ctx.driver, routeName: ctx.name,
               pngBase64: lastPngDataUrl,
               folderId: driveFolderIdCandidate || '',
-              folderName: DRIVE_FOLDER_DEFAULT_NAME
+              folderName: DRIVE_FOLDER_DEFAULT_NAME,
+              // shareAnyone: true, // uncomment if your server supports public link
             };
             reply = await saveViaWebhook(cbUrl, payload);
             if (reply && (reply.ok || reply.success)) {
               success = true;
-              const href = reply.webViewLink || reply.fileUrl || (reply.fileId ? `https://drive.google.com/file/d/${reply.fileId}/view` : '');
+              const href = toDriveViewLink(reply);
               title.textContent = 'Saved ✓';
               link.innerHTML = href ? `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>` : '';
               const folderPretty = reply.folder || DRIVE_FOLDER_DEFAULT_NAME;
@@ -558,7 +557,7 @@
           if (!success) {
             title.textContent = 'Saved (unconfirmed)';
             note.innerHTML = cbUrl
-              ? 'Upload returned no readable ACK (CORS). If this continues, enable JSON CORS on the webhook.'
+              ? 'Upload returned no readable ACK. Ensure your webhook returns JSON (or JSON text).'
               : 'No upload target configured. Use Download or provide ?cb=… (webhook) or ?driveDirect=1&gClientId=…';
           }
         } catch (err) {
@@ -581,7 +580,7 @@
       function cancelFraming(){
         if (!snapArmed) return;
         exitFraming();
-        showDock(null, null, null);
+        showDock(null, null);
         dockEls.note.textContent = 'Framing cancelled.';
       }
       function exitFraming(){
@@ -659,7 +658,7 @@
       }
 
       async function captureCanvas(r){
-        // Prefer DOM-first (can include banner, legend etc.), exclude snap UI
+        // Prefer DOM-first (legend etc.), exclude snap UI and the banner (we draw it manually)
         if (window.html2canvas) {
           try{
             const canvas = await html2canvas(document.body, {
@@ -674,7 +673,8 @@
               foreignObjectRendering: false,
               ignoreElements: (el) => {
                 if (!el) return false;
-                if (el.id === 'dispatchBanner' || el.closest?.('#dispatchBanner')) return false; // keep banner out of DOM capture—we draw it manually (safer sizing)
+                const isBanner = (el.id === 'dispatchBanner') || el.closest?.('#dispatchBanner');
+                if (isBanner) return true; // exclude banner, we draw it ourselves
                 const cls = el.classList || { contains:()=>false };
                 return cls.contains('dispatch-banner') || cls.contains('snap-overlay') || cls.contains('snap-dock') || !!el.closest?.('.snap-dock');
               }
@@ -712,10 +712,9 @@
       }
 
       // =================================================================
-      // Legacy auto export (optional)
+      // Auto export (headless)
       // =================================================================
       async function runAutoExport(items){
-        // hide chrome
         ['legend','drivers','status','error'].forEach(id=>{ const n=document.getElementById(id); if(n) n.style.display='none'; });
 
         for (let i=0;i<items.length;i++){
@@ -733,13 +732,15 @@
             const png = canvas.toDataURL('image/png');
             const name = ensurePngExt(it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`);
 
+            let reply = null;
             if (cbUrl) {
-              await saveViaWebhook(cbUrl, { name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME });
+              reply = await saveViaWebhook(cbUrl, { name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME });
             } else if (driveDirect && gClientId) {
-              await uploadToDriveDirect({ dataUrl: png, name, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME, clientId: gClientId });
+              reply = await uploadToDriveDirect({ dataUrl: png, name, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME, clientId: gClientId });
             } else {
               downloadFallback(png, name);
             }
+            if (reply) console.log('Saved:', toDriveViewLink(reply) || reply);
           }catch(e){ console.error('auto export item failed', e); }
         }
       }
@@ -1233,10 +1234,8 @@
       // Helpers
       // =================================================================
       function totalFeatureCount(){
-        try {
-          return [...baseDayLayers, ...quadDayLayers, ...subqDayLayers]
-            .reduce((acc,e) => acc + (e.features?.length || 0), 0);
-        } catch { return 0; }
+        try { return [...baseDayLayers, ...quadDayLayers, ...subqDayLayers].reduce((acc,e) => acc + (e.features?.length || 0), 0); }
+        catch { return 0; }
       }
       function fitWithHints(bounds, hints){
         try{
@@ -1257,7 +1256,7 @@
       const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
       const ensurePngExt = s => /\.(png)$/i.test(s) ? s : (s.replace(/\.[a-z0-9]+$/i,'') + '.png');
 
-      // NEW: webhook helper using text/plain (no preflight)
+      // Webhook helper (text/plain to avoid preflight); robust reply parsing
       async function saveViaWebhook(url, payload){
         const res = await fetch(url, {
           method: 'POST',
@@ -1266,14 +1265,28 @@
         });
         if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
         const ct = (res.headers.get('content-type') || '').toLowerCase();
-        return ct.includes('application/json') ? await res.json() : null;
+        if (ct.includes('application/json')) return await res.json();
+        const txt = await res.text();
+        try { return JSON.parse(txt); } catch { return null; }
       }
 
-      // Tiny helper (in case not defined earlier)
+      function toDriveViewLink(reply){
+        if (!reply || typeof reply !== 'object') return '';
+        const id  = reply.id || reply.fileId || '';
+        const url = reply.webViewLink || reply.fileUrl || reply.alternateLink || reply.openUrl || '';
+        if (url) return url;
+        if (id)  return `https://drive.google.com/file/d/${id}/view`;
+        return '';
+      }
+
+      // Safer folder id extraction
       function extractDriveFolderId(s){
         if (!s) return '';
-        const m = String(s).match(/[-\w]{25,}/);
-        return m ? m[0] : '';
+        const str = String(s);
+        const m = str.match(/(?:folders\/|id=)([-\w]{25,})/);
+        if (m) return m[1];
+        const idOnly = str.match(/^[-\w]{25,}$/);
+        return idOnly ? idOnly[0] : '';
       }
 
       function showLabel(lyr, text) { if (lyr.getTooltip()) lyr.unbindTooltip(); lyr.bindTooltip(text, { permanent: true, direction: 'center', className: 'lbl' }); }
@@ -1346,7 +1359,7 @@
       }
       function findCustomerHeaderIndex(rows, schema) {
         const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-        const wantNote   = ((schema and schema.note)   || 'Order Note').toLowerCase();
+        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
         for (let i=0;i<rows.length;i++) {
           const hdr = rows[i] || [];
           const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
@@ -1490,65 +1503,242 @@
           .snap-overlay .handle.se{right:-8px;bottom:-8px;transform:translate(50%,50%)}
           .snap-overlay .handle.sw{left:-8px;bottom:-8px;transform:translate(-50%,50%)}
           .snap-flash-crop{position:fixed;border:2px solid #4caf50;border-radius:10px;pointer-events:none;left:0;top:0;width:0;height:0;opacity:0;transition:opacity .18s ease}
-          .snap-dock{position:fixed;right:12px;bottom:12px;z-index:9500;min-width:280px;max-width:90vw;background:#fff;border:1px solid #e8e8e8;border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.16);display:none}
-          .snap-dock .head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #eee}
+          .snap-dock{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:9500;min-width:280px;width:min(90vw,1100px);max-width:1100px;background:#fff;border:1px solid #e8e8e8;border-radius:14px;box-shadow:0 16px 44px rgba(0,0,0,.18);display:none}
+          .snap-dock .head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #eee;cursor:move}
           .snap-dock .head .spacer{flex:1}
           .snap-dock .head .x{background:transparent;border:none;font:700 16px system-ui;cursor:pointer}
-          .snap-dock .body{padding:10px}
+          .snap-dock .body{display:flex;gap:12px; padding:12px}
           .snap-dock .body .row{margin:6px 0}
-          .snap-dock .preview{display:block;width:100%;max-height:40vh;object-fit:contain;background:#f4f4f6;border-radius:8px}
+          .snap-dock .preview{display:block;max-width:64vw; max-height:70vh;object-fit:contain;background:#f6f7f8;border-radius:10px}
           .snap-dock input[type="text"]{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:6px;font:600 13px system-ui}
           .snap-dock .btn{background:#111;color:#fff;border:none;border-radius:8px;padding:8px 10px;font:700 13px system-ui;cursor:pointer;margin-right:6px}
           .snap-dock .btn.secondary{background:#f2f3f6;color:#222}
           .snap-dock .link a{font:700 13px system-ui}
           .snap-dock .note{font:600 12px system-ui;color:#555;margin-top:4px}
         `;
-        // OPTIONAL: center & enlarge the Save popup (your C patch)
-        css.textContent += `
-          .snap-dock{
-            position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
-            z-index:9500; width:min(90vw,1100px); max-width:1100px;
-            background:#fff; border-radius:14px; box-shadow:0 16px 44px rgba(0,0,0,.18);
-          }
-          .snap-dock .head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #eee}
-          .snap-dock .body{display:flex;gap:12px; padding:12px}
-          .snap-dock img.preview{max-width:64vw; max-height:70vh; object-fit:contain; background:#f6f7f8; border-radius:10px}
-          .snap-dock .row{margin-top:8px}
-        `;
         document.head.appendChild(css);
       }
 
-      // Boot helpers that were referenced (assumed to exist in your original)
-      function showTopError(title, msg){
-        let n = document.getElementById('error');
-        if (!n) return;
-        n.style.display = 'block';
-        n.innerHTML = `<div><strong>${escapeHtml(title)}:</strong> ${escapeHtml(msg||'')}</div>`;
-        setTimeout(()=>{ try{ n.style.display='none'; }catch{} }, 6000);
+      // ---------- UI Drag helpers ----------
+      function makeBannerDraggable(el){
+        let dragging=false, dx=0, dy=0;
+        const onDown = (e)=>{ dragging=true; el.classList.add('dragging'); const r=el.getBoundingClientRect(); dx=e.clientX - r.left; dy=e.clientY - r.top; e.preventDefault(); };
+        const onMove = (e)=>{ if(!dragging) return; const x = clamp(e.clientX - dx, 8, window.innerWidth - el.offsetWidth - 8); const y = clamp(e.clientY - dy, 8, window.innerHeight - el.offsetHeight - 8); el.style.left = `${x}px`; el.style.top = `${y}px`; el.style.transform='none'; };
+        const onUp   = ()=>{ if(!dragging) return; dragging=false; el.classList.remove('dragging'); saveBannerPos(el); };
+        el.addEventListener('pointerdown', onDown);
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
       }
-      function renderError(msg){ showTopError('Error', msg); }
+      function saveBannerPos(el){
+        try {
+          const r = el.getBoundingClientRect();
+          localStorage.setItem(LS_KEYS.banner, JSON.stringify({left:r.left, top:r.top}));
+        }catch{}
+      }
+      function restoreBannerPos(el){
+        try{
+          const raw = localStorage.getItem(LS_KEYS.banner);
+          if (!raw) return;
+          const p = JSON.parse(raw);
+          if (typeof p.left==='number' && typeof p.top==='number'){
+            el.style.left = `${p.left}px`;
+            el.style.top  = `${p.top}px`;
+            el.style.transform='none';
+          }
+        }catch{}
+      }
+      function makeDockDraggable(dock, handle){
+        let dragging=false, dx=0, dy=0;
+        handle.addEventListener('pointerdown', (e)=>{
+          dragging=true; const r=dock.getBoundingClientRect(); dx=e.clientX - r.left; dy=e.clientY - r.top; e.preventDefault();
+          document.body.style.userSelect='none';
+        });
+        window.addEventListener('pointermove', (e)=>{
+          if(!dragging) return;
+          const x = clamp(e.clientX - dx, 8, window.innerWidth - dock.offsetWidth - 8);
+          const y = clamp(e.clientY - dy, 8, window.innerHeight - dock.offsetHeight - 8);
+          dock.style.left = `${x}px`;
+          dock.style.top  = `${y}px`;
+          dock.style.transform='none';
+        });
+        window.addEventListener('pointerup', ()=>{
+          if(!dragging) return;
+          dragging=false; document.body.style.userSelect='';
+          saveDockPos(dock);
+        });
+      }
+      function saveDockPos(el){
+        try {
+          const r = el.getBoundingClientRect();
+          localStorage.setItem(LS_KEYS.dock, JSON.stringify({left:r.left, top:r.top}));
+        }catch{}
+      }
+      function restoreDockPos(el){
+        try{
+          const raw = localStorage.getItem(LS_KEYS.dock);
+          if (!raw) return;
+          const p = JSON.parse(raw);
+          if (typeof p.left==='number' && typeof p.top==='number'){
+            el.style.left = `${p.left}px`;
+            el.style.top  = `${p.top}px`;
+            el.style.transform='none';
+          }
+        }catch{}
+      }
 
-      // (You already had these in your original code; placing stubs here in case)
-      async function ensureLibs(){ /* load html2canvas/leaflet-image/turf if needed */ }
-      async function fetchJson(url){ const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`); return await r.json(); }
-      async function fetchText(url){ const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status}`); return await r.text(); }
-      function makeBannerDraggable(el){ /* existing implementation in your file */ }
-      function restoreBannerPos(el){ /* existing implementation in your file */ }
-      function makeDockDraggable(el, handle){ /* existing implementation in your file */ }
-      function restoreDockPos(el){ /* existing implementation in your file */ }
-      function saveDockPos(el){ /* existing implementation in your file */ }
-      function colorFromName(name){ // deterministic pastel-ish
-        const s = String(name||''); let h=0; for (let i=0;i<s.length;i++) h = (h*31 + s.charCodeAt(i))>>>0;
-        const hue = h % 360; return `hsl(${hue}, 70%, 45%)`;
+      // ---------- libs loader ----------
+      async function ensureLibs(){
+        const load = (src, attrs={}) => new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = src; s.async = true; Object.entries(attrs).forEach(([k,v])=>s.setAttribute(k,v));
+          s.onload = resolve; s.onerror = () => reject(new Error(`Failed to load ${src}`));
+          document.head.appendChild(s);
+        });
+
+        if (!window.html2canvas) {
+          await load('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
+        }
+        if (!window.leafletImage) {
+          await load('https://unpkg.com/leaflet-image@0.0.4/leaflet-image.js');
+        }
+        if (!(window.turf && turf.booleanPointInPolygon)) {
+          await load('https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js');
+        }
+        // Optional boundary mask if you use it:
+        // if (!(L.TileLayer && L.TileLayer.boundaryCanvas)) {
+        //   await load('https://unpkg.com/leaflet-boundary-canvas@2.0.1/dist/leaflet-boundary-canvas.min.js');
+        // }
       }
-      async function uploadToDriveDirect(opts){ /* your existing Google Picker/Drive client upload implementation */ }
+
+      // ---------- Drive Direct upload (GIS) ----------
+      const driveAuth = { ready:false, tokenClient:null, accessToken:'', expiresAt:0, loading:false };
+      async function ensureGIS(){
+        if (driveAuth.ready) return;
+        if (driveAuth.loading) { while(!driveAuth.ready) await new Promise(r=>setTimeout(r,50)); return; }
+        driveAuth.loading = true;
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = 'https://accounts.google.com/gsi/client';
+          s.async = true;
+          s.onload = () => resolve();
+          s.onerror = () => reject(new Error('Failed to load Google Identity Services'));
+          document.head.appendChild(s);
+        });
+        driveAuth.ready = true; driveAuth.loading = false;
+      }
+      function nowSec(){ return Math.floor(Date.now()/1000); }
+      async function getAccessToken(clientId, forcePrompt=false){
+        await ensureGIS();
+        return new Promise((resolve, reject)=>{
+          const scope = 'https://www.googleapis.com/auth/drive.file';
+          if (!driveAuth.tokenClient) {
+            driveAuth.tokenClient = google.accounts.oauth2.initTokenClient({
+              client_id: clientId,
+              scope,
+              prompt: '',
+              callback: (resp) => {
+                if (resp && resp.access_token) {
+                  driveAuth.accessToken = resp.access_token;
+                  // Access tokens from GIS are ~3600s; approximate expiry
+                  driveAuth.expiresAt = nowSec() + (resp.expires_in ? Math.floor(resp.expires_in*0.9) : 3200);
+                  resolve(driveAuth.accessToken);
+                } else { reject(new Error('No access token')); }
+              }
+            });
+          }
+          const needNew = !driveAuth.accessToken || nowSec() >= driveAuth.expiresAt || forcePrompt;
+          try {
+            driveAuth.tokenClient.requestAccessToken({ prompt: needNew ? 'consent' : '' });
+          } catch (e) {
+            // Some browsers need explicit prompt on first call
+            try { driveAuth.tokenClient.requestAccessToken({ prompt: 'consent' }); }
+            catch (err) { reject(err); }
+          }
+        });
+      }
+      function dataUrlToBlob(dataUrl){
+        const [meta, b64] = String(dataUrl).split(',');
+        const mime = /data:(.*?);base64/.exec(meta)?.[1] || 'application/octet-stream';
+        const bin = atob(b64 || '');
+        const len = bin.length;
+        const bytes = new Uint8Array(len);
+        for (let i=0; i<len; i++) bytes[i] = bin.charCodeAt(i);
+        return new Blob([bytes], {type: mime});
+      }
+      async function ensureDriveFolder(accessToken, folderId, folderName){
+        if (folderId) return folderId;
+        const cacheKey = LS_KEYS.driveFolderCachePrefix + (folderName || DRIVE_FOLDER_DEFAULT_NAME);
+        try {
+          const cached = localStorage.getItem(cacheKey);
+          if (cached) return cached;
+        } catch {}
+
+        // Create a folder (listing existing may not show results with drive.file scope)
+        const meta = {
+          name: folderName || DRIVE_FOLDER_DEFAULT_NAME,
+          mimeType: 'application/vnd.google-apps.folder'
+        };
+        const res = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,webViewLink', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(meta)
+        });
+        if (!res.ok) throw new Error(`Drive folder create failed HTTP ${res.status}`);
+        const js = await res.json();
+        const id = js.id;
+        try { localStorage.setItem(cacheKey, id); } catch {}
+        return id;
+      }
+      async function uploadToDriveDirect(opts){
+        const { dataUrl, name, folderId, folderName, clientId } = opts || {};
+        if (!dataUrl || !clientId) throw new Error('Drive Direct not configured.');
+        const token = await getAccessToken(clientId);
+
+        // Ensure folder
+        const parentId = await ensureDriveFolder(token, folderId, folderName);
+
+        // Build multipart/related
+        const metadata = {
+          name: name || 'snapshot.png',
+          parents: parentId ? [parentId] : undefined
+        };
+        const boundary = '-------314159265358979323846';
+        const delimiter = `\r\n--${boundary}\r\n`;
+        const closeDelim = `\r\n--${boundary}--`;
+        const pngBlob = dataUrlToBlob(dataUrl);
+
+        const metaPart = new Blob([JSON.stringify(metadata)], { type: 'application/json; charset=UTF-8' });
+
+        const body = new Blob(
+          [
+            delimiter,
+            'Content-Type: application/json; charset=UTF-8\r\n\r\n',
+            JSON.stringify(metadata),
+            delimiter,
+            'Content-Type: image/png\r\n\r\n',
+            pngBlob,
+            closeDelim
+          ],
+          { type: `multipart/related; boundary=${boundary}` }
+        );
+
+        const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body
+        });
+        if (!res.ok) throw new Error(`Drive upload failed HTTP ${res.status}`);
+        const js = await res.json();
+        return js; // { id, webViewLink }
+      }
+
       function downloadFallback(dataUrl, name){
         const a = document.createElement('a');
         a.href = dataUrl; a.download = name || 'snapshot.png';
         document.body.appendChild(a); a.click(); a.remove();
       }
 
-      // finally, update diagnostics once at boot end (in case)
+      // finally, update diagnostics once at boot end
       updateDiagnostics();
     })();
   }
