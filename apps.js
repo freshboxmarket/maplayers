@@ -1680,10 +1680,31 @@
           .snap-dock{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:9500;min-width:280px;width:min(90vw,1100px);max-width:1100px;background:#fff;border:1px solid #e8e8e8;border-radius:14px;box-shadow:0 16px 44px rgba(0,0,0,.18);display:none}
           .snap-dock .head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #eee;cursor:move}
           .snap-dock .head .spacer{flex:1}
-          .snap-dock .head .x{background:transparent;border:none;font:700 16px system-ui;cursor:pointer}
-          .snap-dock .body{display:flex;gap:12px; padding:12px}
-          .snap-dock .body .row{margin:6px 0}
-          .snap-dock .preview{display:block;max-width:64vw; max-height:70vh;object-fit:contain;background:#f6f7f8;border-radius:10px}
+          .snap-dock .head .x{background:transparent;border:none;font:700 16px system-ui;cursor:pointer}  
+          .snap-dock .body {
+          .snap-dock .body{
+            display:grid;
+            grid-template-columns: 1fr min(32vw, 380px);
+            gap:16px;
+            padding:12px;
+            align-items:start;
+          }
+          .snap-dock .col.left{min-width:0}
+          .snap-dock .col.right.stack{
+            display:grid;
+            grid-auto-rows:auto;
+            row-gap:12px;           /* even vertical spacing */
+            align-content:start;
+          }
+          .snap-dock .col.right .item{width:100%}  /* same X alignment */
+          .snap-dock .preview{
+            display:block;
+            width:100%;
+            max-height:70vh;
+            object-fit:contain;
+            background:#f6f7f8;
+            border-radius:10px
+          }
           .snap-dock input[type="text"]{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:6px;font:600 13px system-ui}
           .snap-dock .btn{background:#111;color:#fff;border:none;border-radius:8px;padding:8px 10px;font:700 13px system-ui;cursor:pointer;margin-right:6px}
           .snap-dock .btn.secondary{background:#f2f3f6;color:#222}
