@@ -270,6 +270,15 @@
         };
       }
       
+-      // NEW: Build one-line stats string in order D,H,E,F,G (no headers)
+-      function buildStatsOneLiner(t) {
+-        const parts = [];
+-        [t.deliveriesTxt, t.apartmentsTxt, t.baseTxt, t.custTxt, t.addTxt].forEach((seg) => {
+-          const v = String(seg || '').trim();
+-          if (v && v !== '—') parts.push(v);
+-        });
+-        return parts.join(' • ');
+-      }
 +      // Build one-line stats string in order D,H,E,F,G **with headers**.
 +      // Preserves your “single-line” rule by collapsing newlines to spaces.
 +      function buildStatsOneLiner(t) {
@@ -288,6 +297,7 @@
 +        ].filter(Boolean);
 +        return parts.join(' • ');
 +      }
+
 
 
       function renderDispatchBanner(it){
