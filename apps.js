@@ -1,11 +1,11 @@
-<!-- apps.js (vNext, DPR-accurate banner + strict sums + Drive hardening) -->
+<!-- apps.js (vNext: safe cache-busting + diagnostics + DPR banner + Drive "Screenshots") -->
 <script>
 (async function () {
   // ---------- error surfacing ----------
   window.addEventListener('error', (e) => showTopError('Script error', (e && e.message) ? e.message : String(e)));
   window.addEventListener('unhandledrejection', (e) => showTopError('Promise error', (e?.reason?.message) || String(e?.reason || e)));
 
-  // ---------- helpers used early ----------
+  // ---------- early helpers ----------
   function extractDriveFolderId(str){
     if (!str) return '';
     const s = String(str);
@@ -18,6 +18,22 @@
     return '';
   }
 
+  // only add a cache-buster to safe, same-origin URLs without signatures
+  function safeBust(url) {
+    try {
+      const u = new URL(url, location.href);
+      const sameOrigin = u.origin === location.origin;
+      const isSpecial = (u.protocol === 'data:' || u.protocol === 'blob:' || u.protocol === 'file:');
+      // look for common signed URL params (AWS, GCS, Azure)
+      const hasSig = /(X-Amz-|X-Goog-Signature=|Signature=|Expires=|AWSAccessKeyId=|GoogleAccessId=|sig=|sv=|se=|sp=)/i.test(u.search);
+      if (!sameOrigin || isSpecial || hasSig) return u.toString();
+      u.searchParams.set('_cb', Date.now().toString());
+      return u.toString();
+    } catch {
+      return url; // if URL() fails, don't touch it
+    }
+  }
+
   // ---------- URL / config ----------
   const qs = new URLSearchParams(location.search);
   const cfgUrl = qs.get('cfg') || './config/app.config.json';
@@ -25,14 +41,14 @@
 
   const driverMetaParam = parseJSON(qs.get('driverMeta') || '[]', []);
   const assignMapParam  = parseJSON(qs.get('assignMap')  || '{}', {});
-  const cbUrl           = qs.get('cb') || '';
-  const batchParam      = qs.get('batch'); // websafe b64 JSON
+  const cbUrl           = qs.get('cb') || ''; // webhook (not cache-bust)
+  const batchParam      = qs.get('batch');     // websafe b64 JSON
   const manualMode      = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
 
   // Upload params
+  const DRIVE_FOLDER_DEFAULT_NAME = 'Screenshots';
   const driveFolderRaw  = qs.get('driveFolder') || qs.get('driveFolderId') || qs.get('driveFolderUrl') || (window.appUpload?.driveFolder) || '';
-  const DRIVE_FOLDER_FALLBACK = '1ZzGt5_Kmgf1IUdiUdf_kN88lOscL792a';  // "Snapshots"
-  const driveFolderId   = extractDriveFolderId(driveFolderRaw) || DRIVE_FOLDER_FALLBACK;
+  const driveFolderIdCandidate = extractDriveFolderId(driveFolderRaw) || '';
   const driveDirect     = qs.get('driveDirect') === '1';
   const gClientId       = qs.get('gClientId') || '';
 
@@ -94,14 +110,17 @@
   if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
   if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
 
-  // 👇 Guard to explain "empty app" if nothing loaded
+  // Guard to explain "empty app" if nothing loaded
   try {
     const _totalFeatures = [...baseDayLayers, ...quadDayLayers, ...subqDayLayers]
       .reduce((acc,e) => acc + (e.features?.length || 0), 0);
     if (_totalFeatures === 0) {
-      renderError('No polygon features loaded. Check cfg.layers URLs (CORS/404) or the GeoJSON format.');
+      renderError('No polygon features loaded. Check cfg.layers URLs (CORS/404/signature) or the GeoJSON format.');
+      console.warn('[diagnostic] Layer entries:', { baseDayLayers, quadDayLayers, subqDayLayers });
     }
-  } catch {}
+  } catch (err) {
+    console.warn('[diagnostic] feature count failed', err);
+  }
 
   // Optional boundary mask
   try {
@@ -235,6 +254,10 @@
     const banner = document.getElementById('dispatchBanner');
     if (!banner) return;
     banner.classList.toggle('visible', statsVisible);
+    // keep current stats redrawn for current item
+    if (statsVisible && currentIndex >= 0 && currentIndex < batchItems.length) {
+      renderDispatchBanner(batchItems[currentIndex]);
+    }
   }
 
   // ---------- Stats text (robust + strict sums) ----------
@@ -302,7 +325,7 @@
   }
   function getStatsTexts(statsObj) {
     const s = statsObj || {};
-       const baseTxt = normalizeQty(findByKeywords(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes);
+    const baseTxt = normalizeQty(findByKeywords(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes);
     const custTxt = normalizeQty(findByKeywords(s, 'custom')      || s.customsText || s.customs);
     const addTxt  = normalizeQty(findByKeywords(s, 'addon')       || s.addOnsText  || s.addOns || s.add_ons);
     return { baseTxt, custTxt, addTxt };
@@ -672,7 +695,7 @@
     const img = dock.querySelector('#snapDockImg');
     const name = dock.querySelector('#snapDockName');
     const saveBtn = dock.querySelector('#snapDockSave');
-       const dlBtn = dock.querySelector('#snapDockDownload');
+    const dlBtn = dock.querySelector('#snapDockDownload');
     const exitBtn = dock.querySelector('#snapDockExit');
     const closeBtn = dock.querySelector('#snapDockClose');
     const title = dock.querySelector('.title');
@@ -685,7 +708,6 @@
       if (!lastPngDataUrl) { note.textContent = 'No snapshot to save.'; return; }
       const ctx = currentIndex>=0 ? batchItems[currentIndex] : {};
       const outName = ensurePngExt((name.value || lastSuggestedName || 'snapshot.png').replace(/[^\w.-]+/g,'_'));
-      const payload = { name: outName, day: ctx.day, driver: ctx.driver, routeName: ctx.name, pngBase64: lastPngDataUrl, folderId: driveFolderId };
 
       link.innerHTML = ''; title.textContent = 'Saving…'; note.textContent = '';
       saveBtn.disabled = true;
@@ -696,42 +718,51 @@
         // 1) Optional direct-to-Drive (OAuth client-side)
         if (driveDirect && gClientId) {
           try {
-            reply = await uploadToDriveDirect({ dataUrl: lastPngDataUrl, name: outName, folderId: driveFolderId, clientId: gClientId });
+            reply = await uploadToDriveDirect({
+              dataUrl: lastPngDataUrl,
+              name: outName,
+              folderId: driveFolderIdCandidate || '',
+              folderName: DRIVE_FOLDER_DEFAULT_NAME,
+              clientId: gClientId
+            });
             if (reply && reply.id) {
               success = true;
               const href = reply.webViewLink || `https://drive.google.com/file/d/${reply.id}/view`;
               title.textContent = 'Saved ✓';
               link.innerHTML = `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>`;
-              note.innerHTML = `Saved to <b>Snapshots</b> as <b>${escapeHtml(outName)}</b>.`;
+              note.innerHTML = `Saved to <b>${escapeHtml(DRIVE_FOLDER_DEFAULT_NAME)}</b> as <b>${escapeHtml(outName)}</b>.`;
             }
           } catch (e) {
             console.warn('Direct Drive upload failed, will try webhook if available:', e);
           }
         }
 
-        // 2) Webhook path
+        // 2) Webhook path (send folderName + folderId (if any))
         if (!success && cbUrl) {
+          const payload = {
+            name: outName,
+            day: ctx.day, driver: ctx.driver, routeName: ctx.name,
+            pngBase64: lastPngDataUrl,
+            folderId: driveFolderIdCandidate || '',
+            folderName: DRIVE_FOLDER_DEFAULT_NAME
+          };
           reply = await saveViaWebhook(cbUrl, payload);
           if (reply && reply.ok) {
             success = true;
             const href = reply.webViewLink || reply.fileUrl || (reply.fileId ? `https://drive.google.com/file/d/${reply.fileId}/view` : '');
             title.textContent = 'Saved ✓';
             link.innerHTML = href ? `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>` : '';
-            const folderName = reply.folder || 'Snapshots';
-            note.innerHTML = `Saved to <b>${escapeHtml(folderName)}</b> as <b>${escapeHtml(outName)}</b>.`;
+            const folderPretty = reply.folder || DRIVE_FOLDER_DEFAULT_NAME;
+            note.innerHTML = `Saved to <b>${escapeHtml(folderPretty)}</b> as <b>${escapeHtml(outName)}</b>.`;
           }
         }
 
         // 3) Unconfirmed branch
         if (!success) {
           title.textContent = 'Saved (unconfirmed)';
-          const usingFallback = !driveFolderRaw && driveFolderId === DRIVE_FOLDER_FALLBACK;
           note.innerHTML = cbUrl
             ? 'Save completed but no server ACK was readable. If this keeps happening, enable CORS on the webhook to return JSON.'
-            : `No upload endpoint configured. Use Download or add <code>?cb=…</code>.`;
-          link.innerHTML = usingFallback
-            ? ''  // suppress potentially broken public folder link
-            : `<a href="https://drive.google.com/drive/folders/${driveFolderId}" target="_blank" rel="noopener">Open your folder</a>`;
+            : `No upload endpoint configured. Use Download or add <code>?cb=…</code> (webhook) or <code>?driveDirect=1&gClientId=…</code>.`;
         }
       } catch (err) {
         title.textContent = 'Save failed';
@@ -806,13 +837,45 @@
     }catch{}
   }
 
-  // ---------- helpers ----------
-  function cb(u) { return (u.includes('?') ? '&' : '?') + 'cb=' + Date.now(); }
-  async function fetchJson(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.json(); }
-  async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
+  // ---------- helpers (HOTFIXED fetchers) ----------
+  async function fetchJson(url) {
+    const u = safeBust(url);
+    try {
+      const res = await fetch(u, { cache: 'no-store' });
+      if (!res.ok) {
+        console.error('[fetchJson] HTTP', res.status, 'for', u);
+        throw new Error(`Fetch ${res.status} for ${u}`);
+      }
+      return res.json();
+    } catch (err) {
+      console.error('[fetchJson] failed', u, err);
+      throw err;
+    }
+  }
+  async function fetchText(url) {
+    const u = safeBust(url);
+    try {
+      const res = await fetch(u, { cache: 'no-store' });
+      if (!res.ok) {
+        console.error('[fetchText] HTTP', res.status, 'for', u);
+        throw new Error(`Fetch ${res.status} for ${u}`);
+      }
+      return res.text();
+    } catch (err) {
+      console.error('[fetchText] failed', u, err);
+      throw err;
+    }
+  }
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  function parseBatchItems(b64){ if (!b64) return []; try { const json = atob(String(b64).replace(/-/g,'+').replace(/_/g,'/')); const arr = JSON.parse(json); return Array.isArray(arr) ? arr : []; } catch { return []; } }
+  function parseBatchItems(b64){
+    if (!b64) return [];
+    try {
+      const json = atob(String(b64).replace(/-/g,'+').replace(/_/g,'/'));
+      const arr = JSON.parse(json);
+      return Array.isArray(arr) ? arr : [];
+    } catch { return []; }
+  }
 
   function parseCsvRows(text) {
     const out = []; let i=0, f='', r=[], q=false;
@@ -873,7 +936,6 @@
       : -1;
     return { coords: idx(wantCoords), note: idx(wantNote) };
   }
-  // Also publish globally for compatibility with any external callers:
   try { window.headerIndexMap = window.headerIndexMap || headerIndexMap; } catch {}
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
@@ -968,7 +1030,7 @@
       for (let r = headerIndex + 1; r < rows.length; r++) {
         const row = rows[r] || [];
         const dn = (row[driverCol] || '').trim();
-               const ks = (row[keysCol]   || '').trim();
+        const ks = (row[keysCol]   || '').trim();
         if (!dn || !ks) continue;
         if (!looksLikeName(dn)) continue;
         splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
@@ -976,6 +1038,7 @@
       return out;
     }
 
+    // fallback: name at start of row + keys anywhere
     for (let r = 0; r < Math.min(rows.length, 40); r++) {
       const row = rows[r] || [];
       if (!row.length) continue;
@@ -1046,12 +1109,45 @@
     } catch (e) { throw e; }
   }
 
-  // Optional direct-to-Drive client side
-  async function uploadToDriveDirect({ dataUrl, name, folderId, clientId }){
+  // Find (or create) a Drive folder; returns its id
+  async function ensureDriveFolder(token, folderId, folderName){
+    if (folderId) return folderId;
+    folderName = folderName || DRIVE_FOLDER_DEFAULT_NAME;
+
+    // Try to find an existing folder by name
+    try {
+      const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${folderName.replace(/'/g, "\\'")}' and trashed=false`);
+      const resp = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.files && data.files.length) return data.files[0].id;
+      }
+    } catch (e) {
+      console.warn('ensureDriveFolder: list failed (will attempt to create):', e);
+    }
+
+    // Create the folder at root
+    const meta = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
+    const create = await fetch('https://www.googleapis.com/drive/v3/files', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(meta)
+    });
+    if (!create.ok) throw new Error(`Drive folder create ${create.status}`);
+    const j = await create.json();
+    return j.id;
+  }
+
+  // Optional direct-to-Drive client side (multipart upload)
+  async function uploadToDriveDirect({ dataUrl, name, folderId, folderName, clientId }){
     await ensureGoogleApis();
     const token = await getDriveToken(clientId);
+    const parentId = await ensureDriveFolder(token, folderId, folderName);
+
     const blob = dataURLtoBlob(dataUrl);
-    const metadata = { name, parents: folderId ? [folderId] : undefined, mimeType: 'image/png' };
+    const metadata = { name, parents: parentId ? [parentId] : undefined, mimeType: 'image/png' };
     const boundary = '-------314159265358979323846';
     const delimiter = `\r\n--${boundary}\r\n`;
     const closeDelim = `\r\n--${boundary}--`;
@@ -1076,6 +1172,7 @@
     if (!resp.ok) throw new Error(`Drive upload ${resp.status}`);
     return resp.json();
   }
+
   function dataURLtoBlob(dataUrl){
     const [meta, b64] = dataUrl.split(',');
     const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'application/octet-stream';
@@ -1084,6 +1181,7 @@
     for (let i=0;i<len;i++) arr[i] = bin.charCodeAt(i);
     return new Blob([arr], { type: mime });
   }
+
   async function ensureGoogleApis(){
     const load = src => new Promise((res,rej)=>{
       if ([...document.scripts].some(s => s.src && s.src.includes(src))) return res();
@@ -1091,12 +1189,14 @@
     });
     if (!window.google?.accounts?.oauth2) await load('https://accounts.google.com/gsi/client');
   }
+
   function getDriveToken(clientId){
     return new Promise((resolve, reject)=>{
       try{
         const tokenClient = google.accounts.oauth2.initTokenClient({
           client_id: clientId,
-          scope: 'https://www.googleapis.com/auth/drive.file',
+          // include metadata scope so we can find/create "Screenshots"
+          scope: 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly',
           callback: (t) => t && t.access_token ? resolve(t.access_token) : reject(new Error('No access token'))
         });
         tokenClient.requestAccessToken({ prompt: '' });
@@ -1127,8 +1227,12 @@
         const png = canvas.toDataURL('image/png');
         const name = ensurePngExt(it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`);
         if (cbUrl) {
-          await saveViaWebhook(cbUrl, { name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png, folderId: driveFolderId });
-        } else { downloadFallback(png, name); }
+          await saveViaWebhook(cbUrl, { name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME });
+        } else if (driveDirect && gClientId) {
+          await uploadToDriveDirect({ dataUrl: png, name, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME, clientId: gClientId });
+        } else {
+          downloadFallback(png, name);
+        }
       }catch(e){ console.error('auto export item failed', e); }
     }
   }
@@ -1138,55 +1242,64 @@
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
-      const gj = await fetchJson(Lcfg.url);
-      const perDay = (cfg.style?.perDay?.[Lcfg.day]) || {};
-      const color = perDay.stroke || '#666';
-      const fillColor = perDay.fill || '#ccc';
-      const features = [];
-
-      const layer = L.geoJSON(gj, {
-        style: () => ({
-          color,
-          weight: cfg.style?.dimmed?.weightPx ?? 1,
-          opacity: cfg.style?.dimmed?.strokeOpacity ?? 0.35,
-          fillColor,
-          fillOpacity: dimFill(perDay, cfg)
-        }),
-        onEachFeature: (feat, lyr) => {
-          const p = feat.properties || {};
-          const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
-          const keyNorm = normalizeKey(rawKey);
-          const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
-          const day     = Lcfg.day;
-
-          lyr._routeKey   = keyNorm;
-          lyr._baseKey    = baseKeyFrom(keyNorm);
-          lyr._day        = day;
-          lyr._perDay     = perDay;
-          lyr._labelTxt   = muni;
-          lyr._isSelected = false;
-          lyr._custAny    = 0;
-          lyr._custSel    = 0;
-          lyr._turfFeat   = { type:'Feature', properties:{ day, muni, key:keyNorm }, geometry: feat.geometry };
-
-          boundaryFeatures.push({ type:'Feature', geometry: feat.geometry });
-          features.push(lyr);
-
-          lyr.on('click', (e) => {
-            L.DomEvent.stopPropagation(e);
-            if (currentFocus === lyr) openPolygonPopup(lyr);
-            else { focusFeature(lyr); openPolygonPopup(lyr); }
-          });
-
-          if (lyr.getBounds) {
-            const b = lyr.getBounds();
-            allBounds = allBounds ? allBounds.extend(b) : L.latLngBounds(b);
-          }
+      try {
+        const url = Lcfg.url;
+        const gj = await fetchJson(url);
+        if (!gj || (gj.type !== 'FeatureCollection' && !gj.features)) {
+          console.warn('[layer] not a FeatureCollection', url, gj);
         }
-      });
+        const perDay = (cfg.style?.perDay?.[Lcfg.day]) || {};
+        const color = perDay.stroke || '#666';
+        const fillColor = perDay.fill || '#ccc';
+        const features = [];
 
-      collector.push({ day: Lcfg.day, layer, perDay, features });
-      if (addToMap) layer.addTo(map);
+        const layer = L.geoJSON(gj, {
+          style: () => ({
+            color,
+            weight: cfg.style?.dimmed?.weightPx ?? 1,
+            opacity: cfg.style?.dimmed?.strokeOpacity ?? 0.35,
+            fillColor,
+            fillOpacity: dimFill(perDay, cfg)
+          }),
+          onEachFeature: (feat, lyr) => {
+            const p = feat.properties || {};
+            const rawKey  = (p[cfg.fields.key]  ?? '').toString().trim();
+            const keyNorm = normalizeKey(rawKey);
+            const muni    = smartTitleCase((p[cfg.fields.muni] ?? '').toString().trim());
+            const day     = Lcfg.day;
+
+            lyr._routeKey   = keyNorm;
+            lyr._baseKey    = baseKeyFrom(keyNorm);
+            lyr._day        = day;
+            lyr._perDay     = perDay;
+            lyr._labelTxt   = muni;
+            lyr._isSelected = false;
+            lyr._custAny    = 0;
+            lyr._custSel    = 0;
+            lyr._turfFeat   = { type:'Feature', properties:{ day, muni, key:keyNorm }, geometry: feat.geometry };
+
+            boundaryFeatures.push({ type:'Feature', geometry: feat.geometry });
+            features.push(lyr);
+
+            lyr.on('click', (e) => {
+              L.DomEvent.stopPropagation(e);
+              if (currentFocus === lyr) openPolygonPopup(lyr);
+              else { focusFeature(lyr); openPolygonPopup(lyr); }
+            });
+
+            if (lyr.getBounds) {
+              const b = lyr.getBounds();
+              allBounds = allBounds ? allBounds.extend(b) : L.latLngBounds(b);
+            }
+          }
+        });
+
+        collector.push({ day: Lcfg.day, layer, perDay, features });
+        if (addToMap) layer.addTo(map);
+      } catch (err) {
+        console.error('[layer] load failed', Lcfg, err);
+        warn(`Layer load failed (${Lcfg?.day || 'day'}). See console for details.`);
+      }
     }
   }
 
