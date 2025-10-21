@@ -25,8 +25,9 @@
       // ---------- base UI + error surfacing ----------
       ensureUiShell();
       injectBaseCss();
-      window.addEventListener('error', (e) => showTopError('Script error', e?.message || String(e)));
-      window.addEventListener('unhandledrejection', (e) => showTopError('Promise error', e?.reason?.message || String(e?.reason || e)));
+      // Hardened global error hooks so they can never crash the app
+      window.addEventListener('error', (e) => { try { showTopError('Script error', e?.message || String(e)); } catch {} });
+      window.addEventListener('unhandledrejection', (e) => { try { showTopError('Promise error', e?.reason?.message || String(e?.reason || e)); } catch {} });
 
       // ---------- URL/config ----------
       const qs = new URLSearchParams(location.search);
@@ -75,7 +76,8 @@
       const mapEl = document.getElementById('map');
       ensureMinHeight(mapEl);
 
-      if (typeof L === 'undefined' || !mapEl) { renderError('Leaflet or #map missing.'); return; }
+      // FIX A: don't call undefined renderError; surface a safe error and exit
+      if (typeof L === 'undefined' || !mapEl) { showTopError('Startup', 'Leaflet or #map missing.'); return; }
 
       phase('Initializing map…');
       const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
@@ -246,7 +248,8 @@
       }
       function getStatsTexts(statsObj) {
         const s = statsObj || {};
-        theBase = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? pickByKeysLike(s, ['base','box']);
+        // FIX C: stop leaking a global
+        const theBase = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? pickByKeysLike(s, ['base','box']);
         const baseRaw = theBase;
         const custRaw = s.customsText   ?? s.customs   ?? pickByKeysLike(s, ['custom']);
         const addRaw  = s.addOnsText    ?? s.addOns    ?? s.add_ons ?? s.addons ?? pickByKeysLike(s, ['add']);
@@ -1282,7 +1285,7 @@
       // Helpers
       // =================================================================
       function totalFeatureCount(){
-        try { return [...baseDayLayers, ...quadDayLayers, ...subqDayLayers].reduce((acc,e) => acc + (e.features?.length || 0), 0); }
+        try { return [...baseDayLayers, ...quadDayLayers, ...subqDayLayers].reduce((acc,e)=> acc + (e.features?.length || 0), 0); }
         catch { return 0; }
       }
       function fitWithHints(bounds, hints){
@@ -1407,7 +1410,7 @@
       }
       function findCustomerHeaderIndex(rows, schema) {
         const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase(); // FIXED: '&&' previously
+        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
         for (let i=0;i<rows.length;i++) {
           const hdr = rows[i] || [];
           const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
@@ -1543,7 +1546,7 @@
           .snap-overlay .frame{position:fixed;border:2px dashed #c62828;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,.25);cursor:move;pointer-events:auto}
           .snap-overlay .handle{position:absolute;width:12px;height:12px;background:#fff;border:2px solid #c62828;border-radius:50%}
           .snap-overlay .handle.n{left:50%;top:-8px;transform:translate(-50%,-50%)}
-          .snap-overlay .handle.s{left:50%;bottom:-8px;transform:translate(-50%,50%)}
+          .snap-overlay .handle.s{left:50%;bottom:-8px;transform:translate(-50%,-50%)}
           .snap-overlay .handle.e{right:-8px;top:50%;transform:translate(50%,-50%)}
           .snap-overlay .handle.w{left:-8px;top:50%;transform:translate(-50%,-50%)}
           .snap-overlay .handle.ne{right:-8px;top:-8px;transform:translate(50%,-50%)}
@@ -1787,11 +1790,11 @@
     })();
   }
 
-  // Top error UI helper
+  // FIX B (Option 1): Top error UI helper (safe; no innerHTML, no external deps)
   function showTopError(title, msg){
     const n = document.getElementById('error'); if (!n) return;
     n.style.display='block';
-    n.innerHTML = `<strong>${escapeHtml(title)}:</strong> ${escapeHtml(msg || '')}`;
+    n.textContent = (title ? (title + ': ') : '') + (msg || '');
     setTimeout(()=>{ n.style.display='none'; }, 5000);
   }
 
