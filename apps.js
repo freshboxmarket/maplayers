@@ -1,9 +1,22 @@
-<!-- apps.js (vNext, DPR-accurate banner placement + robust stats + hardened save UX) -->
+<!-- apps.js (vNext, DPR-accurate banner + strict sums + Drive hardening) -->
 <script>
 (async function () {
   // ---------- error surfacing ----------
   window.addEventListener('error', (e) => showTopError('Script error', (e && e.message) ? e.message : String(e)));
   window.addEventListener('unhandledrejection', (e) => showTopError('Promise error', (e?.reason?.message) || String(e?.reason || e)));
+
+  // ---------- helpers used early ----------
+  function extractDriveFolderId(str){
+    if (!str) return '';
+    const s = String(str);
+    const patterns = [
+      /\/folders\/([A-Za-z0-9_-]{10,})/,
+      /[?&]id=([A-Za-z0-9_-]{10,})/
+    ];
+    for (const re of patterns) { const m = s.match(re); if (m) return m[1]; }
+    if (/^[A-Za-z0-9_-]{10,}$/.test(s)) return s;
+    return '';
+  }
 
   // ---------- URL / config ----------
   const qs = new URLSearchParams(location.search);
@@ -80,6 +93,15 @@
   await loadLayerSet(cfg.layers, baseDayLayers, true);
   if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
   if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
+
+  // 👇 Guard to explain "empty app" if nothing loaded
+  try {
+    const _totalFeatures = [...baseDayLayers, ...quadDayLayers, ...subqDayLayers]
+      .reduce((acc,e) => acc + (e.features?.length || 0), 0);
+    if (_totalFeatures === 0) {
+      renderError('No polygon features loaded. Check cfg.layers URLs (CORS/404) or the GeoJSON format.');
+    }
+  } catch {}
 
   // Optional boundary mask
   try {
@@ -194,8 +216,10 @@
     document.getElementById('btnStats').addEventListener('click', () => toggleStats());
     document.getElementById('btnSnap').addEventListener('click', onSnapClick);
 
-    // keyboard
+    // keyboard (ignore when typing in inputs)
     window.addEventListener('keydown', async (e)=>{
+      const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+      if (tag === 'input' || tag === 'textarea' || e.target?.isContentEditable) return;
       if (!batchItems.length) return;
       if (e.key === 'ArrowRight') { e.preventDefault(); await stepRouteCycle(+1); }
       else if (e.key === 'ArrowLeft') { e.preventDefault(); await stepRouteCycle(-1); }
@@ -213,74 +237,74 @@
     banner.classList.toggle('visible', statsVisible);
   }
 
-  // ---------- Stats text (preserve non-integers; sum only pure integer "+")
-  function stringifyShallow(val){
+  // ---------- Stats text (robust + strict sums) ----------
+  function stringifyStat(val){
     if (val == null) return '';
     if (typeof val === 'number') return String(val);
     if (typeof val === 'string') return val.trim();
-    if (Array.isArray(val)) return val.map(stringifyShallow).filter(Boolean).join(' | ');
+    if (Array.isArray(val)) return val.map(v => stringifyStat(v)).filter(Boolean).join(' | ');
     if (typeof val === 'object') {
       const entries = Object.entries(val).filter(([k,v]) => v != null && String(v).trim?.() !== '');
       if (!entries.length) return '';
-      // prefer values-only to avoid noisy keys
-      return entries.map(([,v]) => stringifyShallow(v)).filter(Boolean).join(' | ');
+      const pretty = entries.map(([k,v]) => `${k}: ${stringifyStat(v)}`).join(' | ');
+      const valuesOnly = entries.map(([,v]) => stringifyStat(v)).join(' | ');
+      return (pretty.length <= 64 ? pretty : valuesOnly).trim();
     }
     return String(val);
   }
-
-  function pureIntegerSumOrRaw(s){
-    const t = String(s || '').trim();
-    if (!t) return '—';
-    // Only allow "12 + 1 + 3" form (integers). If any letters/commas/decimals: return raw text.
-    if (!/^[\d+\s]+$/.test(t)) return t;
-    if (!/\d/.test(t)) return t;
-    const parts = t.split('+').map(x=>x.trim()).filter(Boolean);
-    if (parts.length < 2) return t; // single token -> just show it
+  function trySumExpression(s){
+    if (!s) return null;
+    const t = String(s).trim();
+    // strictly numbers separated by '+', nothing else
+    const strict = /^\s*\d+(?:\.\d+)?(?:\s*\+\s*\d+(?:\.\d+)?)*\s*$/;
+    if (!strict.test(t)) return null;
+    const parts = t.split('+').map(x => x.trim());
     let sum = 0;
     for (const p of parts){
-      if (!/^\d+$/.test(p)) return t;
-      sum += parseInt(p,10);
+      const n = Number(p);
+      if (!Number.isFinite(n)) return null;
+      sum += n;
     }
     return String(sum);
   }
-
-  function scanObjectRaw(obj, pred){
-    for (const [k,v] of Object.entries(obj||{})){
-      const lk = k.toLowerCase();
-      if (pred(lk, v)) return v;
-      if (v && typeof v === 'object' && !Array.isArray(v)) {
-        for (const [k2,v2] of Object.entries(v)){
-          const lk2 = k2.toLowerCase();
-          if (pred(lk2, v2)) return v2;
-        }
-      }
-    }
-    return '';
+  function normalizeQty(s){
+    const str = stringifyStat(s);
+    const summed = trySumExpression(str);
+    return summed || (str || '—');
   }
-  function findStatRaw(obj, ...words){
+  function findByKeywords(obj, ...words){
     if (!obj) return '';
     const want = words.map(w => String(w).toLowerCase());
-    const direct = scanObjectRaw(obj, (k)=> want.every(w => k.includes(w)));
+    const direct = scanObject(obj, (k,v)=> want.every(w => k.includes(w)));
     if (direct) return direct;
-    // aliases
     const aliases = {
       base: ['basebox','baseboxes','base','regular'],
       custom: ['custom','customs','special','custom_boxes','customBoxes','customsText'],
       addon: ['add','addon','addons','add-ons','add_ons','extra','extras','addonsText']
     };
     const pool = new Set(aliases[words[0]] || []);
-    const aliased = scanObjectRaw(obj, (k)=> [...pool].some(a => k.includes(a)));
+    const aliased = scanObject(obj, (k,v)=> [...pool].some(a => k.includes(a)));
     return aliased || '';
   }
-
+  function scanObject(obj, pred){
+    // depth-2 scan
+    for (const [k,v] of Object.entries(obj||{})){
+      const lk = k.toLowerCase();
+      if (pred(lk, v)) { const s = normalizeQty(v); if (s) return s; }
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        for (const [k2,v2] of Object.entries(v)){
+          const lk2 = k2.toLowerCase();
+          if (pred(lk2, v2)) { const s = normalizeQty(v2); if (s) return s; }
+        }
+      }
+    }
+    return '';
+  }
   function getStatsTexts(statsObj) {
     const s = statsObj || {};
-    const baseVal = findStatRaw(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes;
-    const custVal = findStatRaw(s, 'custom')      || s.customsText   || s.customs;
-    const addVal  = findStatRaw(s, 'addon')       || s.addOnsText    || s.addOns || s.add_ons;
-    const baseTxt = (typeof baseVal === 'number') ? String(baseVal) : pureIntegerSumOrRaw(stringifyShallow(baseVal));
-    const custTxt = (typeof custVal === 'number') ? String(custVal) : pureIntegerSumOrRaw(stringifyShallow(custVal));
-    const addTxt  = (typeof addVal  === 'number') ? String(addVal)  : pureIntegerSumOrRaw(stringifyShallow(addVal));
+       const baseTxt = normalizeQty(findByKeywords(s, 'base', 'box') || s.baseBoxesText || s.base || s.baseBoxes);
+    const custTxt = normalizeQty(findByKeywords(s, 'custom')      || s.customsText || s.customs);
+    const addTxt  = normalizeQty(findByKeywords(s, 'addon')       || s.addOnsText  || s.addOns || s.add_ons);
     return { baseTxt, custTxt, addTxt };
   }
 
@@ -298,7 +322,7 @@
     if (statsVisible) banner.classList.add('visible');
   }
 
-  // Canvas banner (for saved PNG) — DPR-aware, correct origin for all capture modes
+  // Canvas banner (for saved PNG) — DPR-accurate to mirror DOM position & width
   function drawBannerOntoCanvas(canvas, it, frameRect){
     if (!it || !statsVisible) return;
     const domBanner = document.getElementById('dispatchBanner');
@@ -311,54 +335,28 @@
     const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
     const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
 
-    const meta = canvas._captureMeta || null;
     const bRect = domBanner.getBoundingClientRect();
 
-    // Determine origin & scale
-    let scale = 1;
-    let originLeft = 0, originTop = 0;
-    // When capturing DOM with html2canvas
-    if (meta && meta.mode === 'dom') {
-      scale = meta.scale || 1;
-      originLeft = meta.originLeft || 0;
-      originTop  = meta.originTop  || 0;
-    }
-    // When capturing Leaflet map only, cropped to a frame
-    else if (meta && meta.mode === 'leafletCrop') {
-      scale = meta.scale || 1;
-      // Compute relative to map, then subtract the crop offset
-      originLeft = (meta.mapLeft + (meta.cropLeft || 0)) || 0;
-      originTop  = (meta.mapTop  + (meta.cropTop  || 0)) || 0;
-    }
-    // When capturing the full Leaflet map (auto export)
-    else if (meta && meta.mode === 'leafletFull') {
-      scale = meta.scale || 1;
-      originLeft = meta.mapLeft || 0;
-      originTop  = meta.mapTop  || 0;
-    }
-    // Legacy fallback using provided frameRect
-    else if (frameRect && frameRect.width) {
-      scale = Math.max(1, Math.round(canvas.width / frameRect.width)) || 1;
-      originLeft = frameRect.left || 0;
-      originTop  = frameRect.top  || 0;
-    }
+    // Handle html2canvas (DPR-scaled) vs. Leaflet (1:1) canvases
+    const frameW = (typeof frameRect?.width === 'number' && frameRect.width > 0) ? Math.round(frameRect.width) : canvas.width;
+    const dpr = canvas.width / Math.max(1, frameW);
 
-    // Position inside the output canvas
-    let x = Math.round((bRect.left - originLeft) * scale);
-    let y = Math.round((bRect.top  - originTop)  * scale);
-    let boxW = Math.max(120, Math.min(canvas.width, Math.round(bRect.width * scale)));
+    // position inside the cropped canvas
+    let x = Math.round((bRect.left - (frameRect.left || 0)) * dpr);
+    let y = Math.round((bRect.top  - (frameRect.top  || 0)) * dpr);
+    let boxW = Math.max(120 * dpr, Math.min(canvas.width, Math.round(bRect.width * dpr)));
 
-    // Clamp within canvas
+    // clamp within canvas
     if (x > canvas.width || y > canvas.height || (x + 10) < 0 || (y + 10) < 0) return;
     x = Math.max(0, Math.min(x, canvas.width - 10));
     y = Math.max(0, Math.min(y, canvas.height - 10));
 
     const ctx = canvas.getContext('2d');
-    const pad   = Math.max(8, Math.round(boxW * 0.04));
-    const lineH = Math.max(16, Math.round(Math.min(canvas.width, canvas.height) * 0.027));
+    const pad = Math.max(8 * dpr, Math.round(boxW * 0.04));
+    const lineH = Math.max(16 * dpr, Math.round(Math.min(canvas.width, canvas.height) * 0.027));
 
     const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    const fNorm = `600 ${Math.round(lineH*0.90)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
 
     const wrap = (text, font) => {
       ctx.font = font;
@@ -379,7 +377,7 @@
     const lines = [...w1, ...w2, ...w3];
     const boxH = pad*2 + lines.length * lineH + Math.round(lineH*0.2);
 
-    ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12).fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12 * dpr).fill();
 
     let yy = y + pad + lineH; ctx.fillStyle='#111';
     ctx.font = fBold; for (const ln of w1) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
@@ -597,7 +595,7 @@
     // DOM-first, exclude banner & dock & overlay
     if (window.html2canvas) {
       try{
-        const c = await html2canvas(document.body, {
+        return await html2canvas(document.body, {
           useCORS: true,
           backgroundColor: null,
           x: r.left, y: r.top, width: r.width, height: r.height,
@@ -611,14 +609,6 @@
             return cls.contains('dispatch-banner') || cls.contains('snap-overlay') || cls.contains('snap-dock') || !!el.closest?.('.snap-dock');
           }
         });
-        // Tag capture metadata for accurate banner placement
-        c._captureMeta = {
-          mode: 'dom',
-          originLeft: r.left,
-          originTop: r.top,
-          scale: c.width && r.width ? (c.width / r.width) : (window.devicePixelRatio || 1)
-        };
-        return c;
       } catch (e) { console.warn('html2canvas failed; trying Leaflet fallback:', e); }
     }
     // Fallback: map-only
@@ -632,12 +622,6 @@
     const sw = Math.round(ix.width), sh = Math.round(ix.height);
     const out = document.createElement('canvas'); out.width = sw; out.height = sh;
     out.getContext('2d').drawImage(baseCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
-    out._captureMeta = {
-      mode: 'leafletCrop',
-      mapLeft: mapRect.left, mapTop: mapRect.top,
-      cropLeft: ix.left - mapRect.left, cropTop: ix.top - mapRect.top,
-      scale: 1
-    };
     return out;
   }
 
@@ -688,7 +672,7 @@
     const img = dock.querySelector('#snapDockImg');
     const name = dock.querySelector('#snapDockName');
     const saveBtn = dock.querySelector('#snapDockSave');
-    const dlBtn = dock.querySelector('#snapDockDownload');
+       const dlBtn = dock.querySelector('#snapDockDownload');
     const exitBtn = dock.querySelector('#snapDockExit');
     const closeBtn = dock.querySelector('#snapDockClose');
     const title = dock.querySelector('.title');
@@ -718,7 +702,7 @@
               const href = reply.webViewLink || `https://drive.google.com/file/d/${reply.id}/view`;
               title.textContent = 'Saved ✓';
               link.innerHTML = `<a href="${href}" target="_blank" rel="noopener">Open in Drive</a>`;
-              note.innerHTML = `Saved as <b>${escapeHtml(outName)}</b>.`;
+              note.innerHTML = `Saved to <b>Snapshots</b> as <b>${escapeHtml(outName)}</b>.`;
             }
           } catch (e) {
             console.warn('Direct Drive upload failed, will try webhook if available:', e);
@@ -738,18 +722,16 @@
           }
         }
 
+        // 3) Unconfirmed branch
         if (!success) {
           title.textContent = 'Saved (unconfirmed)';
           const usingFallback = !driveFolderRaw && driveFolderId === DRIVE_FOLDER_FALLBACK;
-          if (!usingFallback) {
-            const folderHref = `https://drive.google.com/drive/folders/${driveFolderId}`;
-            link.innerHTML = `<a href="${folderHref}" target="_blank" rel="noopener">Open your folder</a>`;
-          } else {
-            link.innerHTML = '';
-          }
           note.innerHTML = cbUrl
-            ? 'Save completed but no readable server reply. Enable CORS on the webhook so we can show the file link.'
-            : 'No upload target configured. Click Download or pass &driveFolder=<FOLDER_ID> or &cb=<webhook>.';
+            ? 'Save completed but no server ACK was readable. If this keeps happening, enable CORS on the webhook to return JSON.'
+            : `No upload endpoint configured. Use Download or add <code>?cb=…</code>.`;
+          link.innerHTML = usingFallback
+            ? ''  // suppress potentially broken public folder link
+            : `<a href="https://drive.google.com/drive/folders/${driveFolderId}" target="_blank" rel="noopener">Open your folder</a>`;
         }
       } catch (err) {
         title.textContent = 'Save failed';
@@ -882,6 +864,18 @@
     return -1;
   }
 
+  // ✅ Correct, in-scope version
+  function headerIndexMap(hdrRow, schema) {
+    const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
+    const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
+    const idx = (name) => Array.isArray(hdrRow)
+      ? hdrRow.findIndex(h => (h||'').toLowerCase() === name)
+      : -1;
+    return { coords: idx(wantCoords), note: idx(wantNote) };
+  }
+  // Also publish globally for compatibility with any external callers:
+  try { window.headerIndexMap = window.headerIndexMap || headerIndexMap; } catch {}
+
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
   function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
 
@@ -974,7 +968,7 @@
       for (let r = headerIndex + 1; r < rows.length; r++) {
         const row = rows[r] || [];
         const dn = (row[driverCol] || '').trim();
-        const ks = (row[keysCol]   || '').trim();
+               const ks = (row[keysCol]   || '').trim();
         if (!dn || !ks) continue;
         if (!looksLikeName(dn)) continue;
         splitKeys(ks).map(normalizeKey).forEach(k => { out[k] = dn; });
@@ -1024,14 +1018,15 @@
     catch(e){ console.warn('downloadFallback failed:', e); }
   }
 
-  // Load libs if missing
+  // Load libs if missing (also ensures Turf for point-in-polygon)
   async function ensureLibs(){
     const loadScript = (src) => new Promise((resolve, reject) => {
       if ([...document.scripts].some(s => s.src && s.src.includes(src))) return resolve();
       const el = document.createElement('script'); el.src = src; el.onload = resolve; el.onerror = reject; document.head.appendChild(el);
     });
-    if (!window.html2canvas) await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
+    if (!window.html2canvas)  await loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js');
     if (!window.leafletImage) await loadScript('https://unpkg.com/leaflet-image/leaflet-image.js');
+    if (!(window.turf && turf.booleanPointInPolygon)) await loadScript('https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js');
   }
 
   // -----------------------------------------------------------------
@@ -1043,25 +1038,12 @@
       const j = await res.json().catch(()=>null);
       if (j && (j.ok || j.success)) return { ok:true, ...j };
     } catch (e) {
-      console.warn('CORS JSON upload failed, will try no-cors fallback', e);
+      console.warn('CORS JSON upload failed; will try no-cors fallback', e);
     }
     try{
       await fetch(url, { method:'POST', mode:'no-cors', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
       return { ok:false };
     } catch (e) { throw e; }
-  }
-  function extractDriveFolderId(str){
-    if (!str) return '';
-    const s = String(str);
-    const patterns = [
-      /\/folders\/([A-Za-z0-9_-]{10,})/,      // standard folder URL
-      /[?&]id=([A-Za-z0-9_-]{10,})/           // old-style ?id=<FOLDER_ID>
-    ];
-    for (const re of patterns) {
-      const m = s.match(re); if (m) return m[1];
-    }
-    if (/^[A-Za-z0-9_-]{10,}$/.test(str)) return str;
-    return '';
   }
 
   // Optional direct-to-Drive client side
@@ -1141,15 +1123,7 @@
 
         if (!window.leafletImage) await ensureLibs();
         const canvas = await new Promise((resolve, reject) => leafletImage(map, (err, c) => (err ? reject(err) : resolve(c))));
-        // Attach meta so banner placement is correct relative to the map container (DPR-safe)
-        const mapRect = document.getElementById('map').getBoundingClientRect();
-        canvas._captureMeta = {
-          mode: 'leafletFull',
-          mapLeft: mapRect.left, mapTop: mapRect.top,
-          scale: (canvas.width && mapRect.width) ? (canvas.width / Math.round(mapRect.width)) : 1
-        };
-
-        drawBannerOntoCanvas(canvas, it, null); // entire map canvas with meta
+        drawBannerOntoCanvas(canvas, it, {left:0,top:0}); // entire map canvas (dpr=1)
         const png = canvas.toDataURL('image/png');
         const name = ensurePngExt(it.outName || `${safeName(it.driver)}_${safeName(it.day)}.png`);
         if (cbUrl) {
@@ -1160,7 +1134,7 @@
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — (unchanged except calls above)
+  // LOADERS / SELECTION / CUSTOMERS
   // =================================================================
   async function loadLayerSet(arr, collector, addToMap = true) {
     for (const Lcfg of (arr || [])) {
@@ -1379,6 +1353,9 @@
       added++;
     }
     customerCount = added; info(`Loaded ${customerCount} customers.`);
+
+    // Make sure Turf is around for counts/styling
+    if (!(window.turf && turf.booleanPointInPolygon)) { try { await ensureLibs(); } catch {} }
 
     recolorAndRecountCustomers();
 
@@ -1647,14 +1624,4 @@
   if (el) { el.style.display = 'block'; el.innerHTML = `<strong>Load error</strong><br>${String(e && e.message ? e.message : e)}`; }
   console.error(e);
 });
-
-// --------- small helpers kept outside IIFE for reuse in tests ----------
-function headerIndexMap(hdrRow, schema) {
-  const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-  const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase();
-  const idx = (name) => Array.isArray(hdrRow)
-    ? hdrRow.findIndex(h => (h || '').toLowerCase() === name)
-    : -1;
-  return { coords: idx(wantCoords), note: idx(wantNote) };
-}
 </script>
