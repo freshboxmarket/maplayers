@@ -9,6 +9,17 @@
 // - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
 
 (function () {
+
+  // ---- Robust fetch helpers (top-level, single source of truth) ----
+  async function fetchText(url) {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return await res.text();
+  }
+  async function fetchJson(url) {
+    return JSON.parse(await fetchText(url));
+  }
+
   function start() {
     (async function () {
       // ---------- base UI + error surfacing ----------
@@ -98,7 +109,7 @@
       let snapEls = null, dockEls = null;
       let lastPngDataUrl = null, lastSuggestedName = null;
 
-      // ---------- scaffolding ----------
+      // ---------- scaffolding (now that cfg exists) ----------
       renderLegend(cfg, {}, 0, 0, outsideHighlight);
       renderDriversPanel([], {}, false, {}, 0);
       updateDiagnostics();
@@ -109,7 +120,13 @@
       if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants,  quadDayLayers, true);
       if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
 
-      if (totalFeatureCount() === 0) warn('No polygon features loaded; check cfg URLs and CORS.');
+      // NEW: surface status once layers done
+      if (totalFeatureCount() === 0) {
+        warn('No polygon features loaded; check cfg URLs and CORS.');
+        setStatus('No layers found — check cfg.');
+      } else {
+        setStatus('Layers loaded.');
+      }
 
       // Optional boundary mask (plugin optional)
       try {
@@ -479,7 +496,7 @@
             if (!it) throw new Error('No focused route to capture.');
             const r = getFrameRect();
 
-            // >>> NEW composite capture that avoids blank maps <<<
+            // Composite capture (prevents blank maps)
             const canvas = await captureCanvas(r);
             drawBannerOntoCanvas(canvas, it, r);
             flashCropped(r);
@@ -659,7 +676,7 @@
         });
       }
 
-      // >>> NEW: composite capture that never blanks the map <<<
+      // Composite capture that avoids blank maps
       async function captureCanvas(r){
         await ensureLibs();
 
@@ -826,8 +843,9 @@
             collector.push({ day: Lcfg.day, layer, perDay, features });
             if (addToMap) layer.addTo(map);
           } catch (err) {
+            // BETTER error surfacing
             console.error('[layer] load failed', Lcfg, err);
-            warn(`Layer load failed (${Lcfg?.day || 'day'}). See console for details.`);
+            warn(`Layer load failed for ${escapeHtml(Lcfg?.day || 'day')} — check ${escapeHtml(Lcfg?.url || '(missing URL)')} (CORS / 404?).`);
           }
         }
         updateDiagnostics();
@@ -931,6 +949,9 @@
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, activeKeysOrderedLower));
         await rebuildDriverOverlays();
         updateDiagnostics();
+
+        // NEW: mark ready after successful selection rebuild
+        setStatus('Ready.');
       }
 
       function rebuildCoverageFromVisible() {
@@ -962,7 +983,7 @@
         const rows = parseCsvRows(text);
         if (!rows.length) { custWithinSel = custOutsideSel = 0; resetDayCounts(); updateLegend(); setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, [])); renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel); updateDiagnostics(); return; }
 
-        // and → && FIX APPLIED BELOW
+        // Header finder uses '&&' fix
         const hdrIdx = findCustomerHeaderIndex(rows, custCfg.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
         if (hdrIdx === -1) { warn('Customers CSV: header not found.'); custWithinSel = custOutsideSel = 0; resetDayCounts(); updateLegend(); setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, [])); renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel); updateDiagnostics(); return; }
 
@@ -1223,10 +1244,12 @@
 
       function renderLegend(cfg, legendCounts, custIn, custOut, outsideToggle) {
         const el = document.getElementById('legend'); if (!el) return;
+        // NEW: gate 0/0 display until features are known
+        const totalKnown = Array.isArray(cfg.layers) && cfg.layers.length && totalFeatureCount() > 0;
         const rowsHtml = (cfg.layers || []).map(Lcfg => {
           const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
           const c  = (legendCounts && legendCounts[Lcfg.day]) ? legendCounts[Lcfg.day] : { selected: 0, total: 0 };
-          const frac = (c.total > 0) ? `${c.selected}/${c.total}` : '0/0';
+          const frac = totalKnown ? `${c.selected}/${c.total}` : '—';
           return `<div class="row" style="display:flex;align-items:center;gap:8px;margin:4px 0">
             <span class="swatch" style="width:16px;height:16px;border-radius:3px;border:2px solid ${st.stroke};background:${st.fill};box-sizing:border-box"></span>
             <div>${Lcfg.day}</div>
@@ -1275,7 +1298,7 @@
       }
       function ensureMinHeight(el){ try{ const h = parseInt(getComputedStyle(el).height, 10); if (!isFinite(h) || h < 40) { const fix = document.createElement('style'); fix.textContent = `#map{height:100vh}`; document.head.appendChild(fix); } }catch{} }
       function parseLatLng(s) { const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/); if (!m) return null; const lat = parseFloat(m[1]), lng = parseFloat(m[2]); if (!isFinite(lat) || !isFinite(lng)) return null; if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null; return { lat, lng }; }
-      function smartTitleCase(s) { if (!s) return ''; s = s.toLowerCase(); const parts = s.split(/([\/-])/g); const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']); const fix = (w,first)=>!first && small.has(w) ? w : (w==='st'||w==='st.'?'St.':w==='mt'||w==='mt.'?'Mt.': w.charAt(0).toUpperCase()+w.slice(1)); let idx=0; for (let i=0;i<parts.length;i++){ if (parts[i]==='/'||parts[i]==='-') continue; parts[i]=parts[i].split(/\s+/).map(tok=>fix(tok, idx++===0)).join(' ');} return parts.map(p=>p==='/'?'/':(p==='-'?'-':p)).join('').replace(/\s+/g,' ').trim(); }
+      function smartTitleCase(s) { if (!s) return ''; s = s.toLowerCase(); const parts = s.split(/([\/-])/g); const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']); const fix = (w,first)=>!first && small.has(w) ? w : (w==='st'||w==='st.'?'St.':w==='mt'||w==='mt.'?'Mt.': w.charAt(0).toUpperCase()+w.slice(1)); let idx=0; for (let i=0;i<parts.length;i++){ if (parts[i]==='/'||parts[i]==='-') continue; parts[i]=parts[i].split(/\s+/).map(tok=>fix(tok, idx++===0)).join(' ');} return parts.map(p=>p==='/'?'/':(p==='-'?'-':p)).join('').replace(/\s+/g, ' ').trim(); }
       function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
       function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
       const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
@@ -1384,7 +1407,7 @@
       }
       function findCustomerHeaderIndex(rows, schema) {
         const wantCoords = ((schema && schema.coords) || 'Verified Coordinates').toLowerCase();
-        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase(); // FIXED: && not "and"
+        const wantNote   = ((schema && schema.note)   || 'Order Note').toLowerCase(); // FIXED: '&&' previously
         for (let i=0;i<rows.length;i++) {
           const hdr = rows[i] || [];
           const hasCoords = hdr.some(h => (h||'').toLowerCase() === wantCoords);
@@ -1771,10 +1794,6 @@
     n.innerHTML = `<strong>${escapeHtml(title)}:</strong> ${escapeHtml(msg || '')}`;
     setTimeout(()=>{ n.style.display='none'; }, 5000);
   }
-
-  // Simple fetch helpers
-  async function fetchJson(url){ const r = await fetch(url, { cache:'no-cache' }); if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`); return await r.json(); }
-  async function fetchText(url){ const r = await fetch(url, { cache:'no-cache' }); if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`); return await r.text(); }
 
   // Kick it off
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
