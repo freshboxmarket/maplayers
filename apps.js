@@ -246,9 +246,7 @@
         }
         return undefined;
       }
-
-
-+            // getStatsTexts update goes here
+      
       // Heuristic helpers: prefer descriptive strings (e.g. "A = 1 | B = 2") over bare numbers
       function isTextish(v) {
         if (v == null) return false;
