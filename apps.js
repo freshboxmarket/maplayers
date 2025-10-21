@@ -1666,7 +1666,7 @@
           .dispatch-banner .row strong{font-weight:700}
           .dispatch-banner .row.meta strong{font-weight:700}
           .snap-overlay{position:fixed;inset:0;z-index:9400;pointer-events:none}
-          .snap-overlay .helper{position:fixed;left:50%;top:8px;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto}
+          .snap-overlay .helper{position:fixed;left:50%;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto}
           .snap-overlay .frame{position:fixed;border:2px dashed #c62828;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,.25);cursor:move;pointer-events:auto}
           .snap-overlay .handle{position:absolute;width:12px;height:12px;background:#fff;border:2px solid #c62828;border-radius:50%}
           .snap-overlay .handle.n{left:50%;top:-8px;transform:translate(-50%,-50%)}
