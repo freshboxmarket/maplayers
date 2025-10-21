@@ -285,28 +285,6 @@
 +        return undefined;
 +      }
 +
--      // REPLACED: getStatsTexts — treat E/F/G as TEXT; also accept D/E/F/G/H fallbacks
--      function getStatsTexts(statsObj) {
--        const s = statsObj || {};
--
--        // Prefer “text” fields/arrays; accept letter fallbacks too
--        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
--        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
--
--        const baseRaw = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? s.E ?? pickByKeysLike(s, ['base','box']);
--        const custRaw = s.customsText    ?? s.customs   ?? s.F   ?? pickByKeysLike(s, ['custom']);
--        const addRaw  = s.addOnsText     ?? s.addOns    ?? s.add_ons ?? s.addons ?? s.G ?? pickByKeysLike(s, ['add']);
--
--        const asText = (v) => stringifyStat(v) || '';
--
--        return {
--          deliveriesTxt: asText(deliveriesRaw),
--          apartmentsTxt: asText(aptsRaw),
--          baseTxt: asText(baseRaw),
--          custTxt: asText(custRaw),
--          addTxt:  asText(addRaw),
--        };
--      }
 +      // REPLACED: Prefer descriptive "text" for E/F/G; fall back to letters only if nothing text-ish exists.
 +      function getStatsTexts(statsObj) {
 +        const s = statsObj || {};
