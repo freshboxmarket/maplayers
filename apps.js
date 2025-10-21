@@ -4,7 +4,7 @@
 //
 // Notes
 // - Prevents blank shots by rendering the map via leaflet-image whenever the frame touches the map.
-// - Draws the banner (stats from E–G) ONTO the canvas at its DOM position (not double-rendered).
+// - Draws the banner stats as a single line (D/H/E/F/G texts) onto the canvas at its DOM position (no E–G headers).
 // - Save dock shows storage readiness and returns a clickable Drive link.
 // - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
 
@@ -180,11 +180,11 @@
         `;
         document.body.appendChild(bar);
 
-        // banner (draggable)
+        // banner (draggable) — two rows: meta + one-line stats
         const banner = document.createElement('div');
         banner.id = 'dispatchBanner';
         banner.className = 'dispatch-banner';
-        banner.innerHTML = `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
+        banner.innerHTML = `<div class="row r1 meta"></div><div class="row r2 stats"></div>`;
         document.body.appendChild(banner);
         restoreBannerPos(banner);
         makeBannerDraggable(banner);
@@ -216,7 +216,7 @@
         if (statsVisible && currentIndex >= 0) renderDispatchBanner(batchItems[currentIndex]);
       }
 
-      // --- STAT TEXT FROM E–G (rich text strings) ---
+      // --- STAT TEXT FROM D/H/E/F/G as TEXT (no counters) ---
       function stringifyStat(val){
         if (val == null) return '';
         if (typeof val === 'number') return String(val);
@@ -246,33 +246,51 @@
         }
         return undefined;
       }
+
+      // REPLACED: getStatsTexts — treat E/F/G as TEXT; also accept D/E/F/G/H fallbacks
       function getStatsTexts(statsObj) {
         const s = statsObj || {};
-        // FIX C: stop leaking a global
-        const theBase = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? pickByKeysLike(s, ['base','box']);
-        const baseRaw = theBase;
-        const custRaw = s.customsText   ?? s.customs   ?? pickByKeysLike(s, ['custom']);
-        const addRaw  = s.addOnsText    ?? s.addOns    ?? s.add_ons ?? s.addons ?? pickByKeysLike(s, ['add']);
+
+        // Prefer “text” fields/arrays; accept letter fallbacks too
+        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
+        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
+
+        const baseRaw = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? s.E ?? pickByKeysLike(s, ['base','box']);
+        const custRaw = s.customsText    ?? s.customs   ?? s.F   ?? pickByKeysLike(s, ['custom']);
+        const addRaw  = s.addOnsText     ?? s.addOns    ?? s.add_ons ?? s.addons ?? s.G ?? pickByKeysLike(s, ['add']);
+
+        const asText = (v) => stringifyStat(v) || '';
+
         return {
-          baseTxt: normalizeQtyLike(baseRaw),
-          custTxt: normalizeQtyLike(custRaw),
-          addTxt:  normalizeQtyLike(addRaw),
-          deliveriesTxt: stringifyStat(s.deliveries) || '—',
-          apartmentsTxt: stringifyStat(s.apartments) || '—'
+          deliveriesTxt: asText(deliveriesRaw),
+          apartmentsTxt: asText(aptsRaw),
+          baseTxt: asText(baseRaw),
+          custTxt: asText(custRaw),
+          addTxt:  asText(addRaw),
         };
+      }
+
+      // NEW: Build one-line stats string in order D,H,E,F,G (no headers)
+      function buildStatsOneLiner(t) {
+        const parts = [];
+        [t.deliveriesTxt, t.apartmentsTxt, t.baseTxt, t.custTxt, t.addTxt].forEach((seg) => {
+          const v = String(seg || '').trim();
+          if (v && v !== '—') parts.push(v);
+        });
+        return parts.join(' • ');
       }
 
       function renderDispatchBanner(it){
         const banner = document.getElementById('dispatchBanner'); if (!banner) return;
         if (!it) { banner.classList.remove('visible'); return; }
         const s = it?.stats || {};
-        const { baseTxt, custTxt, addTxt, deliveriesTxt, apartmentsTxt } = getStatsTexts(s);
+        const t = getStatsTexts(s);
         const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
-        const row2 = `<strong>Deliveries:</strong> ${escapeHtml(deliveriesTxt)} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(apartmentsTxt)} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
-        const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
-        banner.querySelector('.r1').innerHTML = row1;
-        banner.querySelector('.r2').innerHTML = row2;
-        banner.querySelector('.r3').innerHTML = row3;
+        const row2 = buildStatsOneLiner(t);
+        const r1 = banner.querySelector('.r1');
+        const r2 = banner.querySelector('.r2');
+        if (r1) r1.innerHTML = row1;
+        if (r2) r2.textContent = row2;
         if (statsVisible) banner.classList.add('visible');
       }
 
@@ -283,11 +301,10 @@
         if (!domBanner || !domBanner.classList.contains('visible')) return;
 
         const s = it?.stats || {};
-        const { baseTxt, custTxt, addTxt, deliveriesTxt, apartmentsTxt } = getStatsTexts(s);
+        const t = getStatsTexts(s);
 
         const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
-        const row2 = `Deliveries: ${deliveriesTxt}  -  Apts: ${apartmentsTxt}  -  Base boxes: ${baseTxt}`;
-        const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
+        const row2 = buildStatsOneLiner(t);
 
         const bRect = domBanner.getBoundingClientRect();
         const frameW = (typeof frameRect?.width === 'number' && frameRect.width > 0) ? Math.round(frameRect.width) : canvas.width;
@@ -305,38 +322,47 @@
         const pad = Math.max(8 * dpr, Math.round(boxW * 0.04));
         const lineH = Math.max(16 * dpr, Math.round(Math.min(canvas.width, canvas.height) * 0.027));
 
-        const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-        const fNorm = `600 ${Math.round(lineH*0.90)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+        const fontFamily = 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+        const fBold = (px)=>`700 ${px}px ${fontFamily}`;
+        const fNorm = (px)=>`600 ${px}px ${fontFamily}`;
 
-        const wrap = (text, font) => {
+        const wrap = (text, fontPx) => {
+          const font = fBold(fontPx);
           ctx.font = font;
-          const chunks = String(text||'').split(/\n+/);
+          const words = String(text||'').split(/\s+/);
           const out = [];
-          for (const ch of chunks) {
-            const words = ch.split(/\s+/);
-            let cur=''; 
-            for (const w of words){
-              const test = cur ? cur + ' ' + w : w;
-              if (ctx.measureText(test).width <= boxW - pad*2) cur = test;
-              else { if (cur) out.push(cur); cur = w; }
-            }
-            if (cur) out.push(cur);
+          let cur='';
+          for (const w of words){
+            const test = cur ? cur + ' ' + w : w;
+            if (ctx.measureText(test).width <= boxW - pad*2) cur = test;
+            else { if (cur) out.push(cur); cur = w; }
           }
-          return out;
+          if (cur) out.push(cur);
+          return { lines: out, font };
         };
 
-        const w1 = wrap(row1, fBold);
-        const w2 = wrap(row2, fNorm);
-        const w3 = wrap(row3, fNorm);
-        const lines = [...w1, ...w2, ...w3];
-        const boxH = pad*2 + lines.length * lineH + Math.round(lineH*0.2);
+        const metaFontPx = Math.round(lineH*0.95);
+        const metaWrapped = wrap(row1, metaFontPx);
+
+        // Stats one-liner shrink-to-fit
+        let statsFontPx = Math.round(lineH*0.90);
+        ctx.font = fNorm(statsFontPx);
+        let statsWidth = ctx.measureText(row2).width;
+        const targetW = boxW - pad*2;
+        while (statsWidth > targetW && statsFontPx > Math.max(10, Math.round(lineH*0.6))) {
+          statsFontPx -= 1;
+          ctx.font = fNorm(statsFontPx);
+          statsWidth = ctx.measureText(row2).width;
+        }
+
+        const totalLines = metaWrapped.lines.length + 1; // meta lines + 1 stats line
+        const boxH = pad*2 + totalLines * lineH + Math.round(lineH*0.2);
 
         ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12 * dpr).fill();
 
         let yy = y + pad + lineH; ctx.fillStyle='#111';
-        ctx.font = fBold; for (const ln of w1) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
-        ctx.font = fNorm; for (const ln of w2) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
-        for (const ln of w3) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
+        ctx.font = metaWrapped.font; for (const ln of metaWrapped.lines) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
+        ctx.font = fNorm(statsFontPx); ctx.fillText(row2, x+pad, yy);
       }
       function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); return ctx; }
 
@@ -1327,7 +1353,7 @@
       }
       function ensureMinHeight(el){ try{ const h = parseInt(getComputedStyle(el).height, 10); if (!isFinite(h) || h < 40) { const fix = document.createElement('style'); fix.textContent = `#map{height:100vh}`; document.head.appendChild(fix); } }catch{} }
       function parseLatLng(s) { const m = String(s||'').trim().match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/); if (!m) return null; const lat = parseFloat(m[1]), lng = parseFloat(m[2]); if (!isFinite(lat) || !isFinite(lng)) return null; if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null; return { lat, lng }; }
-      function smartTitleCase(s) { if (!s) return ''; s = s.toLowerCase(); const parts = s.split(/([\/-])/g); const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']); const fix = (w,first)=>!first && small.has(w) ? w : (w==='st'||w==='st.'?'St.':w==='mt'||w==='mt.'?'Mt.': w.charAt(0).toUpperCase()+w.slice(1)); let idx=0; for (let i=0;i<parts.length;i++){ if (parts[i]==='/'||parts[i]==='-') continue; parts[i]=parts[i].split(/\s+/).map(tok=>fix(tok, idx++===0)).join(' ');} return parts.map(p=>p==='/'?'/':(p==='-'?'-':p)).join('').replace(/\s+/g, ' ').trim(); }
+      function smartTitleCase(s) { if (!s) return ''; s = s.toLowerCase(); const parts = s.split(/([\/-])/g); const small = new Set(['and','or','of','the','a','an','in','on','at','by','for','to','de','la','le','el','du','von','van','di','da','del']); const fix = (w,first)=>!first && small.has(w) ? w : (w==='st'||w==='st.'?'St.':w==='mt'||w==='mt.'?'Mt.': w.charAt(0).toUpperCase()+w.slice(1)); let idx=0; for (let i=0;i<parts.length;i++){ if (parts[i]=='/'||parts[i]=='-') continue; parts[i]=parts[i].split(/\s+/).map(tok=>fix(tok, idx++===0)).join(' ');} return parts.map(p=>p==='/'?'/':(p==='-'?'-':p)).join('').replace(/\s+/g, ' ').trim(); }
       function escapeHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
       function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
       const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
@@ -1582,7 +1608,9 @@
           .dispatch-banner.dragging{cursor:grabbing; user-select:none}
           .dispatch-banner.visible{display:block}
           .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word}
+          .dispatch-banner .row.stats{white-space:nowrap;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
           .dispatch-banner .row strong{font-weight:700}
+          .dispatch-banner .row.meta strong{font-weight:700}
           .snap-overlay{position:fixed;inset:0;z-index:9400;pointer-events:none}
           .snap-overlay .helper{position:fixed;left:50%;top:8px;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto}
           .snap-overlay .frame{position:fixed;border:2px dashed #c62828;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,.25);cursor:move;pointer-events:auto}
