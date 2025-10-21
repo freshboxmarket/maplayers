@@ -496,20 +496,19 @@
             <button class="x" id="snapDockClose" aria-label="Close">✕</button>
           </div>
           <div class="body">
-            <img class="preview" id="snapDockImg" alt="Snapshot preview"/>
-            <div class="row">
-              <input type="text" name="snapName" id="snapDockName" placeholder="filename.png" />
+            <div class="col left">
+              <img class="preview" id="snapDockImg" alt="Snapshot preview"/>
             </div>
-            <div class="row">
-              <button class="btn" id="snapDockSave">Save</button>
-              <button class="btn secondary" id="snapDockDownload">Download</button>
-              <button class="btn secondary" id="snapDockExit">Exit</button>
+            <div class="col right stack">
+              <input class="item" type="text" name="snapName" id="snapDockName" placeholder="filename.png" />
+              <button class="btn item" id="snapDockSave">Save</button>  
+              <button class="btn secondary item" id="snapDockDownload">Download</button>  
+              <button class="btn secondary item" id="snapDockExit">Exit</button>  
+              <div class="link item" id="snapDockLink"></div>  
+              <div class="note item" id="snapDockNote"></div>  
+              <div class="note item" id="snapDockTargets"></div>
             </div>
-            <div class="link" id="snapDockLink"></div>
-            <div class="note" id="snapDockNote"></div>
-            <div class="note" id="snapDockTargets"></div>
           </div>
-        `;
         document.body.appendChild(dock);
 
         const el = {
