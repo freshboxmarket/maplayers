@@ -1,19 +1,22 @@
-/* apps.js — manual route viewer + bottom banner + framed snapshots
-   ----------------------------------------------------------------
-   What’s new:
-   • Bottom-center dispatch banner (3 rows, bold labels). Accepts rich text:
-       stats.baseBoxesText, stats.customsText, stats.addOnsText
-     Falls back to stats.baseBoxes / stats.customs / stats.addOns (numbers).
-   • Two-step “Snap”:
-       1) Click once → shows resizable frame, Snap button turns red, helper text appears.
-       2) Click Snap again → captures exactly the framed area (DOM-first via html2canvas;
-          auto-fallback to leaflet-image for map), flashes, uploads to Apps Script (or downloads).
-   • Keeps your existing map, layers, CSV selection, driver overlays, manual flow.
+/* apps.js — manual route viewer + bottom banner + framed snapshots (vNext)
+   ------------------------------------------------------------------------
+   What’s new in vNext:
+   • Robust web-safe base64 batch parsing (padding fixer).
+   • If no batch & no sel CSV, seed selection from assignMap so the map isn’t “aimless”.
+   • Layer diagnostics (fetch failures + empty feature sets) + load counts in status.
+   • Map height guard (prevents “invisible #map” due to CSS).
+   • Friendlier error fallback if #error is missing.
+   • Optional debug heads-up overlay (?dbg=1) with quick telemetry.
+   • One-line summary composer + optional log callback (?logCb=...) for G2-style updates.
+   • Optional banner mode: ?banner=one (single row) | three (default).
 
    URL flags:
-   • manual=1  → force toolbar/manual controls (default if batch present)
-   • auto=1    → run legacy auto-export loop
-   • cbAck=1   → expect JSON ack ({ok, webViewLink, fileId, folder}) from Apps Script
+   • manual=1   → force toolbar/manual controls (default if batch present)
+   • auto=1     → run legacy auto-export loop
+   • cbAck=1    → expect JSON ack ({ok, webViewLink, fileId, folder}) from Apps Script
+   • dbg=1      → show a thin debug tray (counts, flags)
+   • banner=one → bottom banner uses a single compact line (instead of 3 rows)
+   • logCb=URL  → POST { type:'log', line, final?, tab?, week? } for G2-style one-line logs
 */
 
 (async function () {
@@ -31,6 +34,9 @@
   const cbUrl           = qs.get('cb') || '';
   const cbAck           = qs.get('cbAck') === '1';
   const batchParam      = qs.get('batch'); // websafe b64 JSON
+  const dbgOn           = qs.get('dbg') === '1';
+  const bannerMode      = (qs.get('banner') || 'three').toLowerCase(); // 'one' | 'three'
+  const logCbUrl        = qs.get('logCb') || ''; // optional Apps Script endpoint for one-line logs
 
   // Manual by default when batch exists; explicit manual=1 also honored. Use auto=1 to re-enable auto loop.
   const manualMode = (qs.get('manual') === '1') || (!!batchParam && qs.get('auto') !== '1');
@@ -53,6 +59,13 @@
     renderError('Leaflet or #map element not available.');
     return;
   }
+
+  // Map height guard: avoid invisible map due to page CSS
+  try {
+    const mapEl = document.getElementById('map');
+    const h = mapEl?.getBoundingClientRect()?.height || 0;
+    if (h < 120) Object.assign(mapEl.style, { position:'absolute', inset:'0', minHeight:'360px' });
+  } catch {}
 
   phase('Initializing map…');
   const map = L.map('map', { preferCanvas: true }).setView([43.55, -80.25], 8);
@@ -84,9 +97,11 @@
 
   // ---------- layers ----------
   phase('Loading polygon layers…');
-  await loadLayerSet(cfg.layers, baseDayLayers, true);
-  if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, quadDayLayers, true);
-  if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqDayLayers, true);
+  await loadLayerSet(cfg.layers, baseDayLayers, true, 'base');
+  if (cfg.layersQuadrants?.length)    await loadLayerSet(cfg.layersQuadrants, subqOrQuadCollector('quad'), true, 'quad');
+  if (cfg.layersSubquadrants?.length) await loadLayerSet(cfg.layersSubquadrants, subqOrQuadCollector('subq'), true, 'subq');
+
+  function subqOrQuadCollector(tag){ return (tag==='quad') ? quadDayLayers : subqDayLayers; }
 
   // Optional boundary mask
   try {
@@ -106,8 +121,22 @@
     manualSelectedKeys = unionAllKeys(batchItems);
     runtimeCustEnabled = false; // overview: customers off
   }
+
+  // NEW: seed selection from assignMap when there’s no batch or CSV (prevents “aimless” view)
+  if (!manualMode && !batchItems.length && !manualSelectedKeys) {
+    const assignKeys = Object.keys(activeAssignMap || {});
+    if (assignKeys.length) {
+      manualSelectedKeys = assignKeys.map(normalizeKey);
+      runtimeCustEnabled = false; // consistent with overview
+    }
+  }
+
   await applySelection();
   await loadCustomersIfAny();
+
+  // quick layer counts in status
+  const sum = (arr) => (arr || []).reduce((n,e)=>n+(e.features?.length||0),0);
+  info(`Layers loaded — base:${sum(baseDayLayers)} quad:${sum(quadDayLayers)} subq:${sum(subqDayLayers)}`);
 
   // ---------- UI controls ----------
   if (manualMode && batchItems.length) {
@@ -116,7 +145,13 @@
     await zoomToOverview();
   } else if (!manualMode && batchItems.length) {
     await runAutoExport(batchItems);
+  } else if (manualMode) {
+    // manual with no batch → still offer UI (helps inspection)
+    injectManualUI();
+    ensureSnapshotUi();
   }
+
+  if (dbgOn) showDebugTray();
 
   // =================================================================
   // UI: Manual controller + Banner + Snapshot frame
@@ -158,6 +193,12 @@
       .snap-toast{position:fixed;left:12px;bottom:12px;z-index:9605;background:rgba(17,17,17,.95);color:#fff;
         border-radius:10px;padding:10px 12px;font:600 13px system-ui;display:none;max-width:min(72vw,520px)}
       .snap-toast a{color:#a5d6ff;text-decoration:underline}
+
+      /* debug tray */
+      .dbg-tray{position:absolute;right:10px;top:10px;z-index:9800;background:rgba(255,255,255,.95);
+        border-radius:10px;box-shadow:0 8px 22px rgba(0,0,0,.14);padding:8px 10px;font:12px system-ui;color:#111}
+      .dbg-tray .row{display:flex;gap:8px;align-items:center;margin:2px 0}
+      .dbg-tray .k{opacity:.65}
     `;
     document.head.appendChild(css);
 
@@ -175,7 +216,9 @@
     const banner = document.createElement('div');
     banner.id = 'dispatchBanner';
     banner.className = 'dispatch-banner';
-    banner.innerHTML = `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
+    banner.innerHTML = (bannerMode === 'one')
+      ? `<div class="row r1"></div>`
+      : `<div class="row r1"></div><div class="row r2"></div><div class="row r3"></div>`;
     document.body.appendChild(banner);
 
     // Wire buttons
@@ -203,24 +246,48 @@
     if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
   }
 
+  function composeOneLine(it){
+    if (!it) return '';
+    const s = it.stats || {};
+    const baseTxt = (s.baseBoxesText ?? s.baseBoxes ?? 0);
+    const custTxt = (s.customsText   ?? s.customs   ?? 0);
+    const addTxt  = (s.addOnsText    ?? s.addOns    ?? 0);
+    const delv    = (s.deliveries ?? 0);
+    const apts    = (s.apartments ?? 0);
+    const parts = [
+      `Day:${it.day||''}`,
+      `Driver:${it.driver||''}`,
+      `Route:${it.name||''}`,
+      `Deliv:${delv}`,
+      `Apts:${apts}`,
+      `Base:${baseTxt}`,
+      `Customs:${custTxt}`,
+      `Add-ons:${addTxt}`
+    ];
+    return parts.join(' • ');
+  }
+
   function renderDispatchBanner(it){
     const banner = document.getElementById('dispatchBanner'); if (!banner) return;
     if (!it) { banner.classList.remove('visible'); return; }
-    const s = it?.stats || {};
-    const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
-                  : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
-    const custTxt = (s.customsText   != null) ? String(s.customsText)
-                  : (s.customs   != null)     ? String(s.customs)   : '0';
-    const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
-                  : (s.addOns    != null)     ? String(s.addOns)    : '0';
 
-    const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
-    const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
-    const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
-
-    banner.querySelector('.r1').innerHTML = row1;
-    banner.querySelector('.r2').innerHTML = row2;
-    banner.querySelector('.r3').innerHTML = row3;
+    if (bannerMode === 'one') {
+      banner.querySelector('.r1').innerHTML = escapeHtml(composeOneLine(it));
+    } else {
+      const s = it?.stats || {};
+      const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
+                    : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
+      const custTxt = (s.customsText   != null) ? String(s.customsText)
+                    : (s.customs   != null)     ? String(s.customs)   : '0';
+      const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
+                    : (s.addOns    != null)     ? String(s.addOns)    : '0';
+      const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
+      const row2 = `<strong>Deliveries:</strong> ${escapeHtml(String(s.deliveries ?? 0))} &nbsp; - &nbsp; <strong>Apts:</strong> ${escapeHtml(String(s.apartments ?? 0))} &nbsp; - &nbsp; <strong>Base boxes:</strong> ${escapeHtml(baseTxt)}`;
+      const row3 = `<strong>Customs:</strong> ${escapeHtml(custTxt)} &nbsp; - &nbsp; <strong>Add-ons:</strong> ${escapeHtml(addTxt)}`;
+      banner.querySelector('.r1').innerHTML = row1;
+      banner.querySelector('.r2').innerHTML = row2;
+      banner.querySelector('.r3').innerHTML = row3;
+    }
 
     if (statsVisible) banner.classList.add('visible'); else banner.classList.remove('visible');
   }
@@ -228,35 +295,33 @@
   // Canvas banner (for saved PNG)
   function drawBannerOntoCanvas(canvas, it){
     if (!it) return;
-    const s = it?.stats || {};
-    const baseTxt = (s.baseBoxesText != null) ? String(s.baseBoxesText)
-                  : (s.baseBoxes != null)     ? String(s.baseBoxes) : '0';
-    const custTxt = (s.customsText   != null) ? String(s.customsText)
-                  : (s.customs   != null)     ? String(s.customs)   : '0';
-    const addTxt  = (s.addOnsText    != null) ? String(s.addOnsText)
-                  : (s.addOns    != null)     ? String(s.addOns)    : '0';
-
-    const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
-    const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
-    const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
-
     const ctx = canvas.getContext('2d');
     const W = canvas.width, H = canvas.height;
     const pad = Math.round(Math.min(W,H)*0.018);
-    const maxW = Math.min(Math.round(W*0.8), 1100); // pixels
+    const maxW = Math.min(Math.round(W*0.8), 1100); // px
     const lineH = Math.max(16, Math.round(Math.min(W,H)*0.027));
+    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
+    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
 
-    const lines = [row1,row2,row3];
-    ctx.font = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    ctx.fillStyle='#111';
+    const lines = (bannerMode === 'one')
+      ? [ composeOneLine(it) ]
+      : (function(){
+          const s = it.stats || {};
+          const baseTxt = (s.baseBoxesText ?? s.baseBoxes ?? 0);
+          const custTxt = (s.customsText   ?? s.customs   ?? 0);
+          const addTxt  = (s.addOnsText    ?? s.addOns    ?? 0);
+          const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
+          const row2 = `Deliveries: ${String(s.deliveries ?? 0)}  -  Apts: ${String(s.apartments ?? 0)}  -  Base boxes: ${baseTxt}`;
+          const row3 = `Customs: ${custTxt}  -  Add-ons: ${addTxt}`;
+          return [row1,row2,row3];
+        })();
 
-    // measure wrapped lines to compute banner height
-    let wrapped = [];
-    const wrap = (text, font) => {
+    const wrapLines = (text, font) => {
       ctx.font = font;
       const words = text.split(/\s+/);
-      let cur='', out=[];
-      for (let w of words){
+      const out=[], m=()=>ctx.measureText(out[out.length-1]||'').width;
+      let cur='';
+      for (const w of words){
         const test = cur ? cur + ' ' + w : w;
         if (ctx.measureText(test).width <= maxW - pad*2) cur = test;
         else { if (cur) out.push(cur); cur = w; }
@@ -265,16 +330,12 @@
       return out;
     };
 
-    const fBold = `700 ${Math.round(lineH*0.95)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    const fNorm = `600 ${Math.round(lineH*0.9)}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
-    wrapped = [
-      ...wrap(lines[0], fBold),
-      ...wrap(lines[1], fNorm),
-      ...wrap(lines[2], fNorm)
-    ];
-    const totalLines = wrapped.length;
+    const all = (bannerMode === 'one')
+      ? wrapLines(lines[0], fBold)
+      : [...wrapLines(lines[0], fBold), ...wrapLines(lines[1], fNorm), ...wrapLines(lines[2], fNorm)];
+
     const boxW = maxW;
-    const boxH = pad*2 + totalLines*lineH + Math.round(lineH*0.2);
+    const boxH = pad*2 + all.length*lineH + Math.round(lineH*0.2);
     const x = Math.round((W - boxW)/2);
     const y = H - boxH - pad;
 
@@ -285,12 +346,15 @@
     // text
     let yy = y + pad + lineH;
     ctx.fillStyle='#111';
-    let cursor = 0;
-    const L0 = wrap(lines[0], fBold).length;
-    ctx.font = fBold;
-    for (let i=0;i<L0;i++) { ctx.fillText(wrapped[cursor++], x+pad, yy); yy += lineH; }
-    ctx.font = fNorm;
-    for (;cursor<wrapped.length;cursor++){ ctx.fillText(wrapped[cursor], x+pad, yy); yy += lineH; }
+    if (bannerMode==='one'){ ctx.font = fBold; }
+    let idx=0;
+    if (bannerMode!=='one'){ // bold for first row only
+      const first = wrapLines(lines[0], fBold).length;
+      ctx.font = fBold;
+      for (let i=0;i<first;i++) ctx.fillText(all[idx++], x+pad, yy), yy+=lineH;
+      ctx.font = fNorm;
+    }
+    for (; idx<all.length; idx++) ctx.fillText(all[idx], x+pad, yy), yy+=lineH;
   }
 
   function roundRect(ctx, x, y, w, h, r) {
@@ -334,6 +398,9 @@
 
     renderDispatchBanner(it);
     updateButtons();
+
+    // optional: progress log line (one-line, non-final)
+    maybeLog(composeOneLine(it), false, it);
   }
 
   async function zoomToOverview(){
@@ -458,7 +525,6 @@
         l = clamp(start.l + dx, 0, window.innerWidth  - w);
         t = clamp(start.t + dy, 0, window.innerHeight - h);
       } else {
-        // resize by dir
         if (dir.includes('e')) w = clamp(start.w + dx, 40, window.innerWidth);
         if (dir.includes('s')) h = clamp(start.h + dy, 40, window.innerHeight);
         if (dir.includes('w')) { l = clamp(start.l + dx, 0, start.l + start.w - 40); w = clamp(start.w - dx, 40, window.innerWidth); }
@@ -471,14 +537,11 @@
       window.removeEventListener('pointermove', onMove, {passive:false});
     };
 
-    // Move
     frameEl.addEventListener('pointerdown', (e)=>{
-      const target = e.target;
-      if (target.classList.contains('handle')) return; // handled below
+      if (e.target.classList.contains('handle')) return;
       onDown(e, null);
     });
 
-    // Handles
     frameEl.querySelectorAll('.handle').forEach(h => {
       h.addEventListener('pointerdown', (e)=> onDown(e, h.getAttribute('data-dir')));
     });
@@ -507,29 +570,24 @@
     }
 
     if (!canvas) {
-      // Fallback: map-only render then crop to intersecting area; draw banner ourselves.
+      // Fallback: map-only render then crop; draw banner ourselves.
       if (!window.leafletImage) throw new Error('leaflet-image not loaded (fallback unavailable).');
       const mapRect = document.getElementById('map').getBoundingClientRect();
       const ix = intersectRects(r, {left:mapRect.left, top:mapRect.top, width:mapRect.width, height:mapRect.height});
       if (!ix || ix.width<=0 || ix.height<=0) throw new Error('Frame does not overlap the map; fallback capture cannot proceed.');
 
       canvas = await new Promise((resolve, reject)=>leafletImage(map, (err,c)=>err?reject(err):resolve(c)));
-      // Crop to intersection (relative to map origin)
+      // Crop
       const sx = Math.max(0, Math.round(ix.left - mapRect.left));
       const sy = Math.max(0, Math.round(ix.top  - mapRect.top));
       const sw = Math.round(ix.width), sh = Math.round(ix.height);
       const out = document.createElement('canvas'); out.width = sw; out.height = sh;
       out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
-      // If banner visible, draw it into the cropped canvas
       if (statsVisible) drawBannerOntoCanvas(out, it);
-
       canvas = out;
     } else {
-      // DOM path: if banner is toggled off, still mirror behavior by drawing banner when visible only.
-      if (statsVisible) {
-        // The DOM render already includes the banner. Nothing extra to do.
-      }
+      // DOM path: banner already present if visible
     }
 
     // Flash + upload
@@ -537,6 +595,9 @@
     const png = canvas.toDataURL('image/png');
     const name = it.outName || `${it.driver}_${it.day}.png`;
     await uploadOrDownload(png, name, it);
+
+    // optional: final one-liner log
+    maybeLog(composeOneLine(it), true, it);
   }
 
   function intersectRects(a,b){
@@ -628,11 +689,18 @@
   }
 
   // =================================================================
-  // LOADERS / SELECTION / CUSTOMERS — (unchanged behavior)
+  // LOADERS / SELECTION / CUSTOMERS
   // =================================================================
-  async function loadLayerSet(arr, collector, addToMap = true) {
+  async function loadLayerSet(arr, collector, addToMap = true, tag='base') {
     for (const Lcfg of (arr || [])) {
-      const gj = await fetchJson(Lcfg.url);
+      let gj = null;
+      try {
+        gj = await fetchJson(Lcfg.url);
+      } catch (e) {
+        warn(`Layer fetch failed (${tag}/${Lcfg.day}) — ${Lcfg.url}`);
+        continue;
+      }
+
       const perDay = (cfg.style?.perDay?.[Lcfg.day]) || {};
       const color = perDay.stroke || '#666';
       const fillColor = perDay.fill || '#ccc';
@@ -678,6 +746,10 @@
           }
         }
       });
+
+      if (!features.length && !(gj?.features?.length > 0)) {
+        warn(`No features in ${tag}/${Lcfg.day} — ${Lcfg.url}`);
+      }
 
       collector.push({ day: Lcfg.day, layer, perDay, features });
       if (addToMap) layer.addTo(map);
@@ -1077,7 +1149,7 @@
     });
   }
 
-  // ---------- UI PANELS (kept) ----------
+  // ---------- UI PANELS ----------
   function renderDriversPanel(metaList, overlays, defaultOn=false, countsMap={}, totalSelected=0) {
     const el = document.getElementById('drivers'); if (!el) return;
 
@@ -1169,7 +1241,19 @@
   async function fetchText(url) { const res = await fetch(url + cb(url)); if (!res.ok) throw new Error(`Fetch ${res.status} for ${url}`); return res.text(); }
   function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-  function parseBatchItems(b64){ if (!b64) return []; try { const json = atob(String(b64).replace(/-/g,'+').replace(/_/g,'/')); const arr = JSON.parse(json); return Array.isArray(arr) ? arr : []; } catch { return []; } }
+  // NEW: hardened web-safe b64
+  function parseBatchItems(b64){
+    if (!b64) return [];
+    try {
+      let s = String(b64).replace(/-/g,'+').replace(/_/g,'/');
+      while (s.length % 4) s += '=';
+      const json = atob(s);
+      const arr = JSON.parse(json);
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
 
   function parseCsvRows(text) {
     const out = []; let i=0, f='', r=[], q=false;
@@ -1229,7 +1313,6 @@
 
   function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
 
-  // Collect a de-duplicated list of all zone keys across batch items
   function unionAllKeys(items){
     const set = new Set();
     (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k))));
@@ -1297,11 +1380,17 @@
     return parts.map(p => p === '/' ? '/' : (p === '-' ? '-' : p)).join('').replace(/\s+/g,' ').trim();
   }
 
+  // NEW: friendlier top-error fallback
   function showTopError(title, msg) {
     const el = document.getElementById('error');
-    if (!el) return;
-    el.style.display = 'block';
-    el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`;
+    const text = `${title}: ${String(msg || '')}`;
+    if (el) {
+      el.style.display = 'block';
+      el.innerHTML = `<strong>${escapeHtml(title)}</strong><br>${escapeHtml(String(msg || ''))}`;
+    } else {
+      console.error(text);
+      try { const s = document.getElementById('status'); if (s) s.textContent = `⚠ ${text}`; } catch {}
+    }
   }
   function renderError(msg) { showTopError('Load error', msg); }
   function phase(msg){ setStatus(`⏳ ${msg}`); }
@@ -1335,8 +1424,9 @@
       const row = rows[i] || [];
       let d=-1, k=-1;
       for (let c=0;c<row.length;c++) {
-        if (d === -1 && isDriverHeader(row[c])) d = c;
-        if (k === -1 && isKeysHeader(row[c]))   k = c;
+        const cell = row[c];
+        if (d === -1 && isDriverHeader(cell)) d = c;
+        if (k === -1 && isKeysHeader(cell))   k = c;
       }
       if (d !== -1 && k !== -1) { headerIndex = i; driverCol = d; keysCol = k; break; }
     }
@@ -1393,7 +1483,6 @@
     return `hsl(${h}, ${s}%, ${l}%)`;
   }
 
-  // Download fallback for local save when no cbUrl or upload fails
   function downloadFallback(dataUrl, name){
     try{
       const a = document.createElement('a');
@@ -1404,6 +1493,46 @@
       setTimeout(()=>a.remove(), 0);
     }catch(e){
       console.warn('downloadFallback failed:', e);
+    }
+  }
+
+  // ---------- debug tray ----------
+  function showDebugTray(){
+    const tray = document.createElement('div');
+    tray.className = 'dbg-tray';
+    const mk = (k,v)=>`<div class="row"><div class="k">${k}</div><div>${escapeHtml(String(v))}</div></div>`;
+    const counts = {
+      'batch items': batchItems.length,
+      'assignMap keys': Object.keys(activeAssignMap||{}).length,
+      'drivers meta': (driverMeta||[]).length,
+      'customers loaded': customerCount,
+    };
+    tray.innerHTML = `<div style="font-weight:700;margin-bottom:4px">Debug</div>
+      ${mk('manualMode', manualMode)}
+      ${mk('bannerMode', bannerMode)}
+      ${mk('cbAck', cbAck)}
+      ${mk('logCb', logCbUrl ? 'yes' : 'no')}
+      ${mk('hasSelection', hasSelection)}
+      ${mk('selected keys', selectedOrderedKeys.length)}
+      ${mk('visible keys', visibleSelectedKeysSet.size)}
+      ${mk('layers base/quad/subq', `${sum(baseDayLayers)}/${sum(quadDayLayers)}/${sum(subqDayLayers)}`)}
+      ${mk('customers in/out', `${custWithinSel}/${custOutsideSel}`)}
+    `;
+    document.body.appendChild(tray);
+  }
+
+  // ---------- optional one-line logger (Apps Script G2-style) ----------
+  async function maybeLog(line, final=false, it=null){
+    if (!logCbUrl || !line) return;
+    try {
+      const body = { type:'log', line: String(line), final: !!final };
+      if (it) {
+        body.tab  = it.name || '';
+        body.week = it.week || ''; // if you include this in your batch items
+      }
+      await fetch(logCbUrl, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    } catch(e) {
+      console.warn('logCb failed:', e);
     }
   }
 
