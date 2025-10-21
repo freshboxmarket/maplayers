@@ -383,7 +383,7 @@
 
       // =================================================================
       // Snapshot: frame → wait tiles → capture → banner → save
-      // =================================================================
+      // =================================================================]
       function ensureSnapshotUi(){
         if (snapEls) return;
         const overlay = document.createElement('div');
@@ -1332,6 +1332,22 @@
       function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
       const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
       const ensurePngExt = s => /\.(png)$/i.test(s) ? s : (s.replace(/\.[a-z0-9]+$/i,'') + '.png');
+
+      // ✔ NEW: deterministic name → color helper (needed by driver overlays & panel)
+      function colorFromName(name, opts = {}) {
+        const s = String(name || '');
+        // fast FNV-1a hash
+        let h = 2166136261 >>> 0;
+        for (let i = 0; i < s.length; i++) {
+          h ^= s.charCodeAt(i);
+          h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+        }
+        const hue = h % 360;
+        const sat = opts.sat ?? 70;     // tweak if you want softer colors
+        const light = opts.light ?? 45; // tweak for lighter/darker strokes
+        // Use classic HSL syntax for broad browser support
+        return `hsl(${hue}, ${sat}%, ${light}%)`;
+      }
 
       // Webhook helper (text/plain to avoid preflight); robust reply parsing
       async function saveViaWebhook(url, payload){
