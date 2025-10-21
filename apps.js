@@ -247,38 +247,106 @@
         return undefined;
       }
 
-      // REPLACED: getStatsTexts — treat E/F/G as TEXT; also accept D/E/F/G/H fallbacks
-      function getStatsTexts(statsObj) {
-        const s = statsObj || {};
-
-        // Prefer “text” fields/arrays; accept letter fallbacks too
-        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
-        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
-
-        const baseRaw = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? s.E ?? pickByKeysLike(s, ['base','box']);
-        const custRaw = s.customsText    ?? s.customs   ?? s.F   ?? pickByKeysLike(s, ['custom']);
-        const addRaw  = s.addOnsText     ?? s.addOns    ?? s.add_ons ?? s.addons ?? s.G ?? pickByKeysLike(s, ['add']);
-
-        const asText = (v) => stringifyStat(v) || '';
-
-        return {
-          deliveriesTxt: asText(deliveriesRaw),
-          apartmentsTxt: asText(aptsRaw),
-          baseTxt: asText(baseRaw),
-          custTxt: asText(custRaw),
-          addTxt:  asText(addRaw),
-        };
-      }
-      
--      // NEW: Build one-line stats string in order D,H,E,F,G (no headers)
--      function buildStatsOneLiner(t) {
--        const parts = [];
--        [t.deliveriesTxt, t.apartmentsTxt, t.baseTxt, t.custTxt, t.addTxt].forEach((seg) => {
--          const v = String(seg || '').trim();
--          if (v && v !== '—') parts.push(v);
--        });
--        return parts.join(' • ');
++      // Heuristic helpers: prefer descriptive strings (e.g. "A = 1 | B = 2") over bare numbers
++      function isTextish(v) {
++        if (v == null) return false;
++        if (Array.isArray(v)) return v.length > 0;
++        if (typeof v === 'object') {
++          // If object has any common text fields, consider it textish
++          const prefer = ['baseBoxesText','customsText','addOnsText','text','desc','description','value','label'];
++          return prefer.some(k => v[k] != null && String(v[k]).trim() !== '');
++        }
++        if (typeof v === 'string') {
++          const s = v.trim();
++          if (!s) return false;
++          // signs of descriptive content
++          if (/[=|,]/.test(s)) return true;
++          if (/\s{2,}/.test(s)) return true;      // multiple words / spacing
++          if (/\d+\s*\+\s*\d+/.test(s)) return true; // summed expressions
++          if (s.length >= 4 && /\D/.test(s)) return true; // non-trivial, non-pure-numeric
++          return s !== '0';
++        }
++        // numbers: non-zero can be meaningful, but not "textish"
++        return false;
++      }
++
++      function firstTextish(s, names = [], keywords = []) {
++        // 1) explicit property name preference
++        for (const n of names) {
++          if (s[n] != null && isTextish(s[n])) return s[n];
++        }
++        // 2) keyword scan across object keys
++        if (keywords.length) {
++          for (const [k, v] of Object.entries(s || {})) {
++            const lk = (k || '').toLowerCase();
++            if (keywords.every(w => lk.includes(w)) && isTextish(v)) return v;
++          }
++        }
++        return undefined;
++      }
++
+-      // REPLACED: getStatsTexts — treat E/F/G as TEXT; also accept D/E/F/G/H fallbacks
+-      function getStatsTexts(statsObj) {
+-        const s = statsObj || {};
+-
+-        // Prefer “text” fields/arrays; accept letter fallbacks too
+-        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
+-        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
+-
+-        const baseRaw = s.baseBoxesText ?? s.base ?? s.baseBoxes ?? s.E ?? pickByKeysLike(s, ['base','box']);
+-        const custRaw = s.customsText    ?? s.customs   ?? s.F   ?? pickByKeysLike(s, ['custom']);
+-        const addRaw  = s.addOnsText     ?? s.addOns    ?? s.add_ons ?? s.addons ?? s.G ?? pickByKeysLike(s, ['add']);
+-
+-        const asText = (v) => stringifyStat(v) || '';
+-
+-        return {
+-          deliveriesTxt: asText(deliveriesRaw),
+-          apartmentsTxt: asText(aptsRaw),
+-          baseTxt: asText(baseRaw),
+-          custTxt: asText(custRaw),
+-          addTxt:  asText(addRaw),
+-        };
 -      }
++      // REPLACED: Prefer descriptive "text" for E/F/G; fall back to letters only if nothing text-ish exists.
++      function getStatsTexts(statsObj) {
++        const s = statsObj || {};
++
++        // D / H keep the simple precedence (these are often numeric)
++        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
++        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
++
++        // E — Base Boxes (prefer explicit text-like fields *before* letter fallback)
++        const baseRaw =
++          firstTextish(s,
++            ['baseBoxesText','baseBoxes','base','EText','E'],
++            ['base','box']
++          ) ?? s.E ?? pickByKeysLike(s, ['base','box']);
++
++        // F — Customs
++        const custRaw =
++          firstTextish(s,
++            ['customsText','customs','FText','F'],
++            ['custom'] // catches 'custom', 'customs'
++          ) ?? s.F ?? pickByKeysLike(s, ['custom']);
++
++        // G — Add Ons (cover a few common spellings)
++        const addRaw =
++          firstTextish(s,
++            ['addOnsText','addOns','add_ons','addons','GText','G'],
++            ['add'] // matches 'add ons', 'addons', etc.
++          ) ?? s.G ?? (s.addOns ?? s.add_ons ?? s.addons) ?? pickByKeysLike(s, ['add']);
++
++        const asText = (v) => stringifyStat(v) || '';
++        return {
++          deliveriesTxt: asText(deliveriesRaw),
++          apartmentsTxt: asText(aptsRaw),
++          baseTxt:       asText(baseRaw),
++          custTxt:       asText(custRaw),
++          addTxt:        asText(addRaw),
++        };
++      }
+
+      
 +      // Build one-line stats string in order D,H,E,F,G **with headers**.
 +      // Preserves your “single-line” rule by collapsing newlines to spaces.
 +      function buildStatsOneLiner(t) {
@@ -297,7 +365,6 @@
 +        ].filter(Boolean);
 +        return parts.join(' • ');
 +      }
-
 
 
       function renderDispatchBanner(it){
