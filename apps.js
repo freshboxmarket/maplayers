@@ -269,16 +269,26 @@
           addTxt:  asText(addRaw),
         };
       }
+      
++      // Build one-line stats string in order D,H,E,F,G **with headers**.
++      // Preserves your “single-line” rule by collapsing newlines to spaces.
++      function buildStatsOneLiner(t) {
++        const seg = (label, val) => {
++          const v = String(val || '').trim();
++          if (!v || v === '—') return '';
++          const oneLine = v.replace(/\s*\n+\s*/g, ' ');
++          return `${label}: ${oneLine}`;
++        };
++        const parts = [
++          seg('# deliveries', t.deliveriesTxt),
++          seg('# apartments', t.apartmentsTxt),
++          seg('# base boxes', t.baseTxt),
++          seg('# customs',    t.custTxt),
++          seg('# add ons',    t.addTxt),
++        ].filter(Boolean);
++        return parts.join(' • ');
++      }
 
-      // NEW: Build one-line stats string in order D,H,E,F,G (no headers)
-      function buildStatsOneLiner(t) {
-        const parts = [];
-        [t.deliveriesTxt, t.apartmentsTxt, t.baseTxt, t.custTxt, t.addTxt].forEach((seg) => {
-          const v = String(seg || '').trim();
-          if (v && v !== '—') parts.push(v);
-        });
-        return parts.join(' • ');
-      }
 
       function renderDispatchBanner(it){
         const banner = document.getElementById('dispatchBanner'); if (!banner) return;
