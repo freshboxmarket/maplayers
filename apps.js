@@ -157,6 +157,7 @@
       if (manualMode && batchItems.length) {
         injectManualUI();
         ensureSnapshotUi();
+        window.addEventListener('resize', positionSnapHelper);
         ensureDockUi();
         await zoomToOverview();
       } else if (!manualMode && batchItems.length) {
@@ -564,8 +565,9 @@
           if (!restoreFrameRect()) {
             const r = defaultFrameRect(); setFrameRect(r.left, r.top, r.width, r.height);
           }
-          snapEls.overlay.style.display='block';
-          snapEls.helper.style.display='block';
+          + snapEls.overlay.style.display = 'block';
+          + snapEls.helper.style.display  = 'block';
+          + positionSnapHelper();
           btn.classList.add('armed'); btn.setAttribute('aria-label','Capture framed snapshot');
           snapArmed = true;
         } else {
@@ -1927,6 +1929,12 @@
 +    n.textContent = (title ? (title + ': ') : '') + (msg || '');
 +    setTimeout(() => { n.style.display = 'none'; }, 5000);
 +  }
++    function positionSnapHelper() {
++    if (!snapEls || !snapEls.helper) return;
++    const h = snapEls.helper.getBoundingClientRect().height || 24;
++    // Place ~1.5x its own height from the top
++    snapEls.helper.style.top = Math.round(h * 1.5) + 'px';
++    }
 
   // Kick it off
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
