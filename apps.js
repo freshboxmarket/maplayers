@@ -4,7 +4,7 @@
 //
 // Notes
 // - Prevents blank shots by rendering the map via leaflet-image whenever the frame touches the map.
-// - Draws the banner stats as a single line (D/H/E/F/G texts) onto the canvas at its DOM position (no E–G headers).
+// - Draws the banner stats as a single line (D/H/E/F/G, strictly integers) onto the canvas at its DOM position.
 // - Save dock shows storage readiness and returns a clickable Drive link.
 // - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
 
@@ -76,7 +76,7 @@
       const mapEl = document.getElementById('map');
       ensureMinHeight(mapEl);
 
-      // FIX A: don't call undefined renderError; surface a safe error and exit
+      // Safe startup guard
       if (typeof L === 'undefined' || !mapEl) { showTopError('Startup', 'Leaflet or #map missing.'); return; }
 
       phase('Initializing map…');
@@ -217,129 +217,38 @@
         if (statsVisible && currentIndex >= 0) renderDispatchBanner(batchItems[currentIndex]);
       }
 
-      // --- STAT TEXT FROM D/H/E/F/G as TEXT (no counters) ---
-      function stringifyStat(val){
-        if (val == null) return '';
-        if (typeof val === 'number') return String(val);
-        if (typeof val === 'string') return val.trim();
-        if (Array.isArray(val)) return val.map(stringifyStat).filter(Boolean).join(' | ');
-        if (typeof val === 'object') {
-          const prefer = ['baseBoxesText','customsText','addOnsText','text','desc','description','value','label'];
-          for (const k of prefer) if (val[k]) return stringifyStat(val[k]);
-          const entries = Object.entries(val).map(([,v]) => stringifyStat(v)).filter(Boolean);
-          return entries.join(' | ');
-        }
-        return String(val);
-      }
-      function trySumExpression(s){
-        if (!s) return null;
-        const t = String(s).trim();
-        const strict = /^\s*\d+(?:\.\d+)?(?:\s*\+\s*\d+(?:\.\d+)?)*\s*$/;
-        if (!strict.test(t)) return null;
-        return t.split('+').map(x => Number(x.trim())).reduce((a,b)=>a+b,0) + '';
-      }
-      function normalizeQtyLike(s){ const str = stringifyStat(s); const summed = trySumExpression(str); return (summed || str || '—'); }
-      function pickByKeysLike(obj, mustIncludes){
-        const want = mustIncludes.map(s => s.toLowerCase());
-        for (const [k,v] of Object.entries(obj||{})) {
-          const lk = k.toLowerCase();
-          if (want.every(w => lk.includes(w))) return v;
-        }
-        return undefined;
-      }
-      
-      // Heuristic helpers: prefer descriptive strings (e.g. "A = 1 | B = 2") over bare numbers
-      function isTextish(v) {
-        if (v == null) return false;
-        if (Array.isArray(v)) return v.length > 0;
-        if (typeof v === 'object') {
-          const prefer = ['baseBoxesText','customsText','addOnsText','text','desc','description','value','label'];
-          return prefer.some(k => v[k] != null && String(v[k]).trim() !== '');
-        }
-        if (typeof v === 'string') {
-          const s = v.trim();
-          if (!s) return false;
-          if (/[=|,]/.test(s)) return true;
-          if (/\s{2,}/.test(s)) return true;
-          if (/\d+\s*\+\s*\d+/.test(s)) return true;
-          if (s.length >= 4 && /\D/.test(s)) return true;
-          return s !== '0';
-        }
-        return false;
-      }
-
-      function firstTextish(s, names = [], keywords = []) {
-        for (const n of names) {
-          if (s[n] != null && isTextish(s[n])) return s[n];
-        }
-        if (keywords.length) {
-          for (const [k, v] of Object.entries(s || {})) {
-            const lk = (k || '').toLowerCase();
-            if (keywords.every(w => lk.includes(w)) && isTextish(v)) return v;
-          }
-        }
-        return undefined;
-      }
-
-      // REPLACED: Prefer descriptive "text" for E/F/G; fall back to letters only if nothing text-ish exists.
-      function getStatsTexts(statsObj) {
-        const s = statsObj || {};
-        const deliveriesRaw = s.deliveriesText ?? s.deliveries ?? s.D;
-        const aptsRaw       = s.apartmentsText ?? s.apartments ?? s.H;
-
-        const baseRaw =
-          firstTextish(s,
-            ['baseBoxesText','baseBoxes','base','EText','E'],
-            ['base','box']
-          ) ?? s.E ?? pickByKeysLike(s, ['base','box']);
-
-        const custRaw =
-          firstTextish(s,
-            ['customsText','customs','FText','F'],
-            ['custom']
-          ) ?? s.F ?? pickByKeysLike(s, ['custom']);
-
-        const addRaw =
-          firstTextish(s,
-            ['addOnsText','addOns','add_ons','addons','GText','G'],
-            ['add']
-          ) ?? s.G ?? (s.addOns ?? s.add_ons ?? s.addons) ?? pickByKeysLike(s, ['add']);
-
-        const asText = (v) => stringifyStat(v) || '';
+      // ===== Strictly numeric stats (D/H/E/F/G) =====
+      function getStatsNumbers(statsObj = {}) {
+        const toInt = (v) => {
+          const n = Number(v);
+          return Number.isFinite(n) ? Math.trunc(n) : 0;
+        };
         return {
-          deliveriesTxt: asText(deliveriesRaw),
-          apartmentsTxt: asText(aptsRaw),
-          baseTxt:       asText(baseRaw),
-          custTxt:       asText(custRaw),
-          addTxt:        asText(addRaw),
+          deliveries: toInt(statsObj.deliveries ?? statsObj.D),
+          apartments: toInt(statsObj.apartments ?? statsObj.H),
+          baseBoxes:  toInt(statsObj.baseBoxes  ?? statsObj.E),
+          customs:    toInt(statsObj.customs    ?? statsObj.F),
+          addOns:     toInt(statsObj.addOns     ?? statsObj.G),
         };
       }
 
-      // Build one-line stats string in order D,H,E,F,G **with headers**
-      function buildStatsOneLiner(t) {
-        const seg = (label, val) => {
-          const v = String(val || '').trim();
-          if (!v || v === '—') return '';
-          const oneLine = v.replace(/\s*\n+\s*/g, ' ');
-          return `${label}: ${oneLine}`;
-        };
-        const parts = [
-          seg('# deliveries', t.deliveriesTxt),
-          seg('# apartments', t.apartmentsTxt),
-          seg('# base boxes', t.baseTxt),
-          seg('# customs',    t.custTxt),
-          seg('# add ons',    t.addTxt),
-        ].filter(Boolean);
-        return parts.join(' • ');
+      function buildStatsOneLinerNums(n) {
+        const seg = (label, val) => `${label}: ${val}`;
+        return [
+          seg('# deliveries', n.deliveries),
+          seg('# apartments', n.apartments),
+          seg('# base boxes', n.baseBoxes),
+          seg('# customs',    n.customs),
+          seg('# add ons',    n.addOns),
+        ].join(' • ');
       }
 
       function renderDispatchBanner(it){
         const banner = document.getElementById('dispatchBanner'); if (!banner) return;
         if (!it) { banner.classList.remove('visible'); return; }
-        const s = it?.stats || {};
-        const t = getStatsTexts(s);
+        const s = getStatsNumbers(it.stats || {});
         const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
-        const row2 = buildStatsOneLiner(t);
+        const row2 = buildStatsOneLinerNums(s);
         const r1 = banner.querySelector('.r1');
         const r2 = banner.querySelector('.r2');
         if (r1) r1.innerHTML = row1;
@@ -353,11 +262,9 @@
         const domBanner = document.getElementById('dispatchBanner');
         if (!domBanner || !domBanner.classList.contains('visible')) return;
 
-        const s = it?.stats || {};
-        const t = getStatsTexts(s);
-
+        const s = getStatsNumbers(it.stats || {});
         const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
-        const row2 = buildStatsOneLiner(t);
+        const row2 = buildStatsOneLinerNums(s);
 
         const bRect = domBanner.getBoundingClientRect();
         const frameW = (typeof frameRect?.width === 'number' && frameRect.width > 0) ? Math.round(frameRect.width) : canvas.width;
@@ -462,7 +369,7 @@
 
       // =================================================================
       // Snapshot: frame → wait tiles → capture → banner → save
-      // =================================================================]
+      // =================================================================
       function ensureSnapshotUi(){
         if (snapEls) return;
         const overlay = document.createElement('div');
@@ -500,7 +407,7 @@
               <img class="preview" id="snapDockImg" alt="Snapshot preview"/>
             </div>
             <div class="col right stack">
-              <input class="item" type="text" name="snapName" id="snapDockName" placeholder="filename.png" />
+              <input class="item" type="text" id="snapDockName" placeholder="filename.png" />
               <button class="btn item" id="snapDockSave">Save</button>  
               <button class="btn secondary item" id="snapDockDownload">Download</button>  
               <button class="btn secondary item" id="snapDockExit">Exit</button>  
@@ -509,6 +416,7 @@
               <div class="note item" id="snapDockTargets"></div>
             </div>
           </div>
+        `;
         document.body.appendChild(dock);
 
         const el = {
@@ -572,6 +480,7 @@
           btn.setAttribute('aria-label','Capture framed snapshot');
           snapArmed = true;
         } else {
+          try {
             await ensureLibs();
             await waitForTilesReady(map, 12000);
 
@@ -594,7 +503,7 @@
             saveFrameRect();
           } catch (e) {
             showDock(null, null);
-            dockEls.note.textContent = `Capture failed — ${String(e && e.message || e)}`;
+            if (dockEls?.note) dockEls.note.textContent = `Capture failed — ${String(e?.message || e)}`;
           } finally {
             exitFraming();
           }
@@ -926,7 +835,6 @@
             collector.push({ day: Lcfg.day, layer, perDay, features });
             if (addToMap) layer.addTo(map);
           } catch (err) {
-            // BETTER error surfacing
             console.error('[layer] load failed', Lcfg, err);
             warn(`Layer load failed for ${escapeHtml(Lcfg?.day || 'day')} — check ${escapeHtml(Lcfg?.url || '(missing URL)')} (CORS / 404?).`);
           }
@@ -1066,7 +974,7 @@
         const rows = parseCsvRows(text);
         if (!rows.length) { custWithinSel = custOutsideSel = 0; resetDayCounts(); updateLegend(); setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, [])); renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel); updateDiagnostics(); return; }
 
-        // Header finder uses '&&' fix
+        // Header finder
         const hdrIdx = findCustomerHeaderIndex(rows, custCfg.schema || { coords: 'Verified Coordinates', note: 'Order Note' });
         if (hdrIdx === -1) { warn('Customers CSV: header not found.'); custWithinSel = custOutsideSel = 0; resetDayCounts(); updateLegend(); setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, [])); renderDriversPanel(driverMeta, driverOverlays, true, driverSelectedCounts, custWithinSel); updateDiagnostics(); return; }
 
@@ -1270,7 +1178,7 @@
         });
       }
       function applyStyleDim(lyr, perDay, cfg) {
-      lyr.setStyle({
+        lyr.setStyle({
           color: perDay.stroke || '#666',
           weight: cfg.style?.dimmed?.weightPx ?? 1,
           opacity: cfg.style?.dimmed?.strokeOpacity ?? 0.35,
@@ -1327,7 +1235,7 @@
 
       function renderLegend(cfg, legendCounts, custIn, custOut, outsideToggle) {
         const el = document.getElementById('legend'); if (!el) return;
-        // NEW: gate 0/0 display until features are known
+        // Gate 0/0 display until features are known
         const totalKnown = Array.isArray(cfg.layers) && cfg.layers.length && totalFeatureCount() > 0;
         const rowsHtml = (cfg.layers || []).map(Lcfg => {
           const st = (cfg.style?.perDay?.[Lcfg.day]) || {};
@@ -1363,10 +1271,6 @@
 
       // Put this directly after renderLegend(...) inside the IIFE
       function updateLegend() {
-        // Build per-day counts from what's currently visible (coveragePolysAll)
-        // and what's part of the active selection (coveragePolysSelected).
-        // Works across base/quadrant/subquadrant because it only looks at what's
-        // actually on the map right now.
         const byDay = {};
         const bump = (day, field) => {
           const d = day || '';
@@ -1374,16 +1278,9 @@
           byDay[d][field] += 1;
         };
 
-        // total = visible features currently on the map
-        for (const rec of coveragePolysAll) {
-          bump(rec?.feat?.properties?.day, 'total');
-        }
-        // selected = features that are part of the active selection
-        for (const rec of coveragePolysSelected) {
-          bump(rec?.feat?.properties?.day, 'selected');
-        }
+        for (const rec of coveragePolysAll) bump(rec?.feat?.properties?.day, 'total');
+        for (const rec of coveragePolysSelected) bump(rec?.feat?.properties?.day, 'selected');
 
-        // Push the numbers into the legend
         renderLegend(cfg, byDay, custWithinSel, custOutsideSel, outsideHighlight);
       }
 
@@ -1413,7 +1310,7 @@
       const safeName = s => String(s||'').replace(/[^\w.-]+/g,'_');
       const ensurePngExt = s => /\.(png)$/i.test(s) ? s : (s.replace(/\.[a-z0-9]+$/i,'') + '.png');
 
-      // ✔ NEW: deterministic name → color helper (needed by driver overlays & panel)
+      // ✔ Deterministic name → color helper (needed by driver overlays & panel)
       function colorFromName(name, opts = {}) {
         const s = String(name || '');
         // fast FNV-1a hash
@@ -1423,9 +1320,8 @@
           h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
         }
         const hue = h % 360;
-        const sat = opts.sat ?? 70;     // tweak if you want softer colors
-        const light = opts.light ?? 45; // tweak for lighter/darker strokes
-        // Use classic HSL syntax for broad browser support
+        const sat = opts.sat ?? 70;
+        const light = opts.light ?? 45;
         return `hsl(${hue}, ${sat}%, ${light}%)`;
       }
 
@@ -1681,8 +1577,7 @@
           .snap-dock{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:9500;min-width:280px;width:min(90vw,1100px);max-width:1100px;background:#fff;border:1px solid #e8e8e8;border-radius:14px;box-shadow:0 16px 44px rgba(0,0,0,.18);display:none}
           .snap-dock .head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #eee;cursor:move}
           .snap-dock .head .spacer{flex:1}
-          .snap-dock .head .x{background:transparent;border:none;font:700 16px system-ui;cursor:pointer}  
-          .snap-dock .body {
+          .snap-dock .head .x{background:transparent;border:none;font:700 16px system-ui;cursor:pointer}
           .snap-dock .body{
             display:grid;
             grid-template-columns: 1fr min(32vw, 380px);
@@ -1694,10 +1589,10 @@
           .snap-dock .col.right.stack{
             display:grid;
             grid-auto-rows:auto;
-            row-gap:12px;           /* even vertical spacing */
+            row-gap:12px;
             align-content:start;
           }
-          .snap-dock .col.right .item{width:100%}  /* same X alignment */
+          .snap-dock .col.right .item{width:100%}
           .snap-dock .preview{
             display:block;
             width:100%;
@@ -1856,7 +1751,7 @@
         const bin = atob(b64 || '');
         const len = bin.length;
         const bytes = new Uint8Array(len);
-        for (let i=0; i<len; i++) bytes[i] = bin.charCodeAt(i);
+        for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
         return new Blob([bytes], {type: mime});
       }
       async function ensureDriveFolder(accessToken, folderId, folderName){
@@ -1935,27 +1830,27 @@
     })();
   }
 
-  // FIX B (Option 1): Top error UI helper (safe; no innerHTML, no external deps)
-+  function showTopError(title, msg){
-+    const n = document.getElementById('error'); if (!n) return;
-+    // Nudge below the toolbar if present; otherwise fall back to 12px.
-+    const bar = document.querySelector('.route-toolbar');
-+    if (bar) {
-+      const r = bar.getBoundingClientRect();
-+      n.style.top = Math.max(12, Math.round(r.bottom + 8)) + 'px'; // “a few pixels down”
-+    } else {
-+      n.style.top = '12px';
-+    }
-+    n.style.display = 'block';
-+    n.textContent = (title ? (title + ': ') : '') + (msg || '');
-+    setTimeout(() => { n.style.display = 'none'; }, 5000);
-+  }
-+    function positionSnapHelper() {
-+    if (!snapEls || !snapEls.helper) return;
-+    const h = snapEls.helper.getBoundingClientRect().height || 24;
-+    // Place ~1.5x its own height from the top
-+    snapEls.helper.style.top = Math.round(h * 1.5) + 'px';
-+    }
+  // ---- Top error UI helper + helper positioning ----
+  function showTopError(title, msg){
+    const n = document.getElementById('error'); if (!n) return;
+    // Nudge below the toolbar if present; otherwise fall back to 12px.
+    const bar = document.querySelector('.route-toolbar');
+    if (bar) {
+      const r = bar.getBoundingClientRect();
+      n.style.top = Math.max(12, Math.round(r.bottom + 8)) + 'px';
+    } else {
+      n.style.top = '12px';
+    }
+    n.style.display = 'block';
+    n.textContent = (title ? (title + ': ') : '') + (msg || '');
+    setTimeout(() => { n.style.display = 'none'; }, 5000);
+  }
+  function positionSnapHelper() {
+    // Places the helper ~1.5x its own height from the top; avoids overlap with toolbar.
+    if (!snapEls || !snapEls.helper) return;
+    const h = snapEls.helper.getBoundingClientRect().height || 24;
+    snapEls.helper.style.top = Math.round(h * 1.5) + 'px';
+  }
 
   // Kick it off
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
