@@ -1,14 +1,16 @@
+{
 // apps.js — vNext READY (finished)
+// - Banner = 3 centered, single-line rows:
+//   1) Day/Driver/Route Name
+//   2) # deliveries … # XLs
+//   3) # customs … # large
+//   Copyable text, draggable by grabbing anywhere on the banner (no grip row).
 // - Works with ?cfg, ?assignMap, ?driverMeta, ?batch (websafe b64), ?cb (webhook),
 //   optional ?manual=1, ?diag=1, and Drive hints (?driveDirect=1&gClientId=...&driveFolderId|driveFolderUrl|driveFolder).
-//
-// Notes
-// - Prevents blank shots by rendering the map via leaflet-image whenever the frame touches the map.
-// - Draws the banner stats as a single line (full left-stage D..N, strictly integers; keeps D/H/E/F/G aliases) at the banner’s DOM position.
-// - Banner text is copy/select friendly; dragging is via a small grip only.
-// - Snapshot helper sits below the toolbar and is dismissible; no more `snapEls is not defined`.
-// - Save dock shows storage readiness and returns a clickable Drive link.
-// - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
+// - Subset publishing: ?subsetOK=1 & ?days=Friday (or cfg.behavior.subsetOK/focusDays)
+//   + relaxes manual bootstrap when ?sel is present
+//   + reduces assignMap/driverMeta/batchItems to the visible selection + focus days
+// - Prevents blank shots (leaflet-image), draws banner onto snapshot, snapshot dock, Drive Direct webhook fallback.
 
 (function () {
 
@@ -43,6 +45,17 @@
       const diagMode        = qs.get('diag') === '1';
       const cbUrl           = qs.get('cb') || '';
 
+      // NEW: subset publishing flags
+      const subsetOK     = (qs.get('subsetOK') === '1');
+      const focusDaysCsv = (qs.get('days') || '');
+      const focusDays    = focusDaysCsv.split(/[ ,;|]/).map(s => s.trim()).filter(Boolean).map(d => d.toLowerCase());
+      // honor cfg.behavior overrides (loaded after fetch)
+      let cfgSubsetOK = false;
+      let cfgFocusDays = [];
+
+      // If an explicit selection CSV/URL is provided, don’t auto-seed manualSelectedKeys from batch.
+      const hasSelParam  = !!qs.get('sel');
+
       // Drive hints
       const DRIVE_FOLDER_DEFAULT_NAME = 'Screenshots';
       const driveDirect = qs.get('driveDirect') === '1';
@@ -72,6 +85,10 @@
       // ---------- fetch config ----------
       phase('Loading config…');
       const cfg = await fetchJson(cfgUrl);
+      // merge behavior fallbacks
+      cfgSubsetOK = subsetOK || !!(cfg.behavior && cfg.behavior.subsetOK);
+      cfgFocusDays = focusDays.length ? focusDays
+                                      : ((cfg.behavior && cfg.behavior.focusDays) ? String(cfg.behavior.focusDays).split(/[ ,;|]/).map(s=>s.trim().toLowerCase()).filter(Boolean) : []);
 
       // ---------- map init ----------
       ensureMapRoot();
@@ -147,7 +164,8 @@
       setTimeout(()=>map.invalidateSize(), 50);
 
       // ---------- initial load ----------
-      if (manualMode && batchItems.length) {
+      // RELAXED: only seed from batch when there isn’t an explicit selection param
+      if (manualMode && batchItems.length && !hasSelParam) {
         manualSelectedKeys = unionAllKeys(batchItems);
         runtimeCustEnabled = false; // hide customers in overview
       }
@@ -183,19 +201,18 @@
         `;
         document.body.appendChild(bar);
 
-        // banner (copyable text; draggable via small grip only)
+        // banner (copyable text; draggable by grabbing anywhere; no grip row)
         const banner = document.createElement('div');
         banner.id = 'dispatchBanner';
         banner.className = 'dispatch-banner';
         banner.innerHTML = `
-          <div class="row grip" title="Drag banner" aria-label="Drag banner">⠿</div>
           <div class="row r1 meta" contenteditable="false"></div>
-          <div class="row r2 stats" contenteditable="false"></div>
+          <div class="row r2 stats1" contenteditable="false"></div>
+          <div class="row r3 stats2" contenteditable="false"></div>
         `;
         document.body.appendChild(banner);
         restoreBannerPos(banner);
-        const grip = banner.querySelector('.grip');
-        makeBannerDraggable(banner, grip);
+        makeBannerDraggable(banner, banner); // handle = whole banner
 
         document.getElementById('btnPrev').addEventListener('click', async () => { await stepRouteCycle(-1); });
         document.getElementById('btnNext').addEventListener('click', async () => { await stepRouteCycle(+1); });
@@ -224,13 +241,12 @@
         if (statsVisible && currentIndex >= 0) renderDispatchBanner(batchItems[currentIndex]);
       }
 
-      // ===== Expanded stats (all integers, robust fallbacks) =====
+      // ===== Stats parsing (aliases stay supported) =====
       function getStatsNumbers(statsObj = {}) {
         const toInt = (v) => {
           const n = Number(v);
           return Number.isFinite(n) ? Math.trunc(n) : 0;
         };
-        // Keep legacy aliases (D/H/E/F/G) working, but include all D..N fields
         return {
           deliveries: toInt(statsObj.deliveries ?? statsObj.D),
           apartments: toInt(statsObj.apartments ?? statsObj.H),
@@ -246,46 +262,52 @@
         };
       }
 
-      // One-liner, required order, guaranteed single line (copyable text)
-      function buildStatsOneLinerNums(n) {
+      // Row builders — exact order + row split requested
+      function buildStatsRows(n) {
         const seg = (label, val) => `${label}: ${val}`;
-        return [
+        const rowA = [
           seg('# deliveries', n.deliveries),
           seg('# apartments', n.apartments),
           seg('# base boxes', n.baseBoxes),
           seg('# regulars',   n.regulars),
           seg('# fruits',     n.fruits),
           seg('# XLs',        n.xls),
+        ].join(' • ');
+        const rowB = [
           seg('# customs',    n.customs),
           seg('# add-ons',    n.addOns),
           seg('# small (<5)', n.small),
           seg('# medium (5<15)', n.medium),
           seg('# large (15+)', n.large),
         ].join(' • ');
+        return [rowA, rowB];
       }
 
       function renderDispatchBanner(it){
         const banner = document.getElementById('dispatchBanner'); if (!banner) return;
         if (!it) { banner.classList.remove('visible'); return; }
         const s = getStatsNumbers(it.stats || {});
-        const row1 = `<strong>Day:</strong> ${escapeHtml(it.day||'')} &nbsp; - &nbsp; <strong>Driver:</strong> ${escapeHtml(it.driver||'')} &nbsp; - &nbsp; <strong>Route Name:</strong> ${escapeHtml(it.name||'')}`;
-        const row2 = buildStatsOneLinerNums(s);
+        const row1 = `Day:  ${it.day||''}   -   Driver:  ${it.driver||''}   -   Route Name:  ${it.name||''}`;
+        const [row2, row3] = buildStatsRows(s);
+
         const r1 = banner.querySelector('.r1');
         const r2 = banner.querySelector('.r2');
-        if (r1) r1.innerHTML = row1;
-        if (r2) r2.textContent = row2; // copyable, no innerHTML
+        const r3 = banner.querySelector('.r3');
+        if (r1) r1.textContent = row1;
+        if (r2) r2.textContent = row2;
+        if (r3) r3.textContent = row3;
         if (statsVisible) banner.classList.add('visible');
       }
 
-      // Draw the banner directly onto a snapshot canvas at its DOM position
+      // Draw the banner (3 rows) onto a snapshot canvas at the DOM position, centered text
       function drawBannerOntoCanvas(canvas, it, frameRect){
         if (!it || !statsVisible) return;
         const domBanner = document.getElementById('dispatchBanner');
         if (!domBanner || !domBanner.classList.contains('visible')) return;
 
         const s = getStatsNumbers(it.stats || {});
-        const row1 = `Day: ${it.day||''}  -  Driver: ${it.driver||''}  -  Route Name: ${it.name||''}`;
-        const row2 = buildStatsOneLinerNums(s);
+        const row1 = `Day:  ${it.day||''}   -   Driver:  ${it.driver||''}   -   Route Name:  ${it.name||''}`;
+        const [row2, row3] = buildStatsRows(s);
 
         const bRect = domBanner.getBoundingClientRect();
         const frameW = (typeof frameRect?.width === 'number' && frameRect.width > 0) ? Math.round(frameRect.width) : canvas.width;
@@ -304,46 +326,35 @@
         const lineH = Math.max(16 * dpr, Math.round(Math.min(canvas.width, canvas.height) * 0.027));
 
         const fontFamily = 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-        const fBold = (px)=>`700 ${px}px ${fontFamily}`;
-        const fNorm = (px)=>`600 ${px}px ${fontFamily}`;
+        const fSemi = (px)=>`600 ${px}px ${fontFamily}`;
 
-        const wrap = (text, fontPx) => {
-          const font = fBold(fontPx);
-          ctx.font = font;
-          const words = String(text||'').split(/\s+/);
-          const out = [];
-          let cur='';
-          for (const w of words){
-            const test = cur ? cur + ' ' + w : w;
-            if (ctx.measureText(test).width <= boxW - pad*2) cur = test;
-            else { if (cur) out.push(cur); cur = w; }
+        // shrink-to-fit helper (single line)
+        const fit = (text, startPx) => {
+          let px = startPx; ctx.font = fSemi(px);
+          const target = boxW - pad*2;
+          while (ctx.measureText(text).width > target && px > Math.max(10, Math.round(lineH*0.6))) {
+            px -= 1; ctx.font = fSemi(px);
           }
-          if (cur) out.push(cur);
-          return { lines: out, font };
+          return px;
         };
 
-        const metaFontPx = Math.round(lineH*0.95);
-        const metaWrapped = wrap(row1, metaFontPx);
+        const metaPx  = fit(row1, Math.round(lineH*0.95));
+        const stats1Px= fit(row2, Math.round(lineH*0.90));
+        const stats2Px= fit(row3, Math.round(lineH*0.90));
 
-        // Stats one-liner shrink-to-fit
-        let statsFontPx = Math.round(lineH*0.90);
-        ctx.font = fNorm(statsFontPx);
-        let statsWidth = ctx.measureText(row2).width;
-        const targetW = boxW - pad*2;
-        while (statsWidth > targetW && statsFontPx > Math.max(10, Math.round(lineH*0.6))) {
-          statsFontPx -= 1;
-          ctx.font = fNorm(statsFontPx);
-          statsWidth = ctx.measureText(row2).width;
-        }
-
-        const totalLines = metaWrapped.lines.length + 1; // meta lines + 1 stats line
+        const totalLines = 3;
         const boxH = pad*2 + totalLines * lineH + Math.round(lineH*0.2);
 
         ctx.fillStyle = 'rgba(255,255,255,0.92)'; roundRect(ctx, x, y, boxW, boxH, 12 * dpr).fill();
+        ctx.fillStyle = '#111';
 
-        let yy = y + pad + lineH; ctx.fillStyle='#111';
-        ctx.font = metaWrapped.font; for (const ln of metaWrapped.lines) { ctx.fillText(ln, x+pad, yy); yy += lineH; }
-        ctx.font = fNorm(statsFontPx); ctx.fillText(row2, x+pad, yy);
+        // centered text
+        const centerX = (w) => x + (boxW/2) - (w/2);
+        let yy = y + pad + lineH;
+
+        ctx.font = fSemi(metaPx);  let w1 = ctx.measureText(row1).width; ctx.fillText(row1, centerX(w1), yy); yy += lineH;
+        ctx.font = fSemi(stats1Px);let w2 = ctx.measureText(row2).width; ctx.fillText(row2, centerX(w2), yy); yy += lineH;
+        ctx.font = fSemi(stats2Px);let w3 = ctx.measureText(row3).width; ctx.fillText(row3, centerX(w3), yy);
       }
       function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); return ctx; }
 
@@ -418,14 +429,13 @@
           frame: overlay.querySelector('.frame'),
           flashCrop
         };
-        // Safe global so the outside function can reference the helper without scope issues
         try { window.__dispatchSnapEls = snapEls; } catch {}
 
         const xBtn = overlay.querySelector('#snapHelperClose');
         if (xBtn) xBtn.addEventListener('click', () => { snapEls.helper.style.display = 'none'; });
 
         bindFramingGestures(snapEls.frame);
-        positionSnapHelper(); // position after creation
+        positionSnapHelper();
       }
 
       function ensureDockUi(){
@@ -498,6 +508,14 @@
           parts.push(`<div><strong>Folder:</strong> ${driveFolderIdCandidate ? 'id:' + escapeHtml(driveFolderIdCandidate) : escapeHtml(DRIVE_FOLDER_DEFAULT_NAME)}</div>`);
         }
         return parts.join('');
+      }
+
+      function buildSendOff(it){
+        const days = (cfgFocusDays && cfgFocusDays.length) ? cfgFocusDays.map(d=>d[0].toUpperCase()+d.slice(1)).join(',') : (it?.day || '');
+        if (cfgSubsetOK || subsetOK) {
+          return `${days}-only publish enabled via subsetOK; assigns/batch auto-trimmed to selected keys/days; other-day routes ignored without blocking.`;
+        }
+        return `Publish ready; full assignMap/batch in play.`;
       }
 
       async function onSnapClick(){
@@ -588,6 +606,10 @@
               pngBase64: lastPngDataUrl,
               folderId: driveFolderIdCandidate || '',
               folderName: DRIVE_FOLDER_DEFAULT_NAME,
+              // NEW: send-off summary
+              sendOff: buildSendOff(ctx),
+              subsetOK: (cfgSubsetOK || subsetOK) ? 1 : 0,
+              days: (cfgFocusDays && cfgFocusDays.length) ? cfgFocusDays : focusDays
             };
             reply = await saveViaWebhook(cbUrl, payload);
             if (reply && (reply.ok || reply.success)) {
@@ -803,7 +825,12 @@
 
             let reply = null;
             if (cbUrl) {
-              reply = await saveViaWebhook(cbUrl, { name, day: it.day, driver: it.driver, routeName: it.name, pngBase64: png, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME });
+              reply = await saveViaWebhook(cbUrl, {
+                name,
+                day: it.day, driver: it.driver, routeName: it.name,
+                pngBase64: png, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME,
+                sendOff: buildSendOff(it), subsetOK: (cfgSubsetOK || subsetOK) ? 1 : 0, days: (cfgFocusDays && cfgFocusDays.length) ? cfgFocusDays : focusDays
+              });
             } else if (driveDirect && gClientId) {
               reply = await uploadToDriveDirect({ dataUrl: png, name, folderId: driveFolderIdCandidate, folderName: DRIVE_FOLDER_DEFAULT_NAME, clientId: gClientId });
             } else {
@@ -876,6 +903,46 @@
           }
         }
         updateDiagnostics();
+      }
+
+      // NEW: reducer that trims data to the active selection (+ optional focus days)
+      function reduceToSelectionContext() {
+        const allowSubset = (cfgSubsetOK || subsetOK);
+        if (!allowSubset) return;
+
+        // Only keep keys that are actually visible/selected in the map.
+        const selKeys = new Set(
+          selectedOrderedKeys.filter(k => visibleSelectedKeysSet.has(k))
+        );
+        if (selKeys.size === 0) return;
+
+        // Keep base keys for quad/subquad mappings so driver lookup still works.
+        const keepBase = new Set(Array.from(selKeys).map(baseKeyFrom));
+
+        // 3a) Filter assign map to just the selected universe (by exact or base match).
+        const reducedAssign = {};
+        Object.entries(activeAssignMap || {}).forEach(([k, v]) => {
+          const bk = baseKeyFrom(k);
+          if (selKeys.has(k) || keepBase.has(bk)) reducedAssign[k] = v;
+        });
+        activeAssignMap = reducedAssign;
+
+        // 3b) Filter driver meta to only drivers who still have zones in play.
+        const keepNames = new Set(Object.values(activeAssignMap).map(n => String(n).toLowerCase()));
+        driverMeta = (driverMeta || []).filter(d => keepNames.has(String(d.name || '').toLowerCase()));
+
+        // 3c) Filter batch items to the selection and (optionally) to focus days.
+        const dayOK = (d) => {
+          if (!cfgFocusDays.length) return true;
+          const low = String(d || '').toLowerCase();
+          return !!low && cfgFocusDays.includes(low);
+        };
+        batchItems = (batchItems || [])
+          .map(it => {
+            const keys = (it.keys || []).map(normalizeKey).filter(k => selKeys.has(k));
+            return { ...it, keys };
+          })
+          .filter(it => (it.keys && it.keys.length) && dayOK(it.day));
       }
 
       async function applySelection() {
@@ -971,7 +1038,15 @@
         }
 
         recolorAndRecountCustomers();
-        const activeKeysOrderedLower = selectedOrderedKeys.filter(k => visibleSelectedKeysSet.has(k)).map(k => k.toLowerCase());
+
+        // keys that actually resolved to visible features:
+        const activeKeysOrderedLower = selectedOrderedKeys
+          .filter(k => visibleSelectedKeysSet.has(k))
+          .map(k => k.toLowerCase());
+
+        // SUBSET TRIM happens here, after selection is built
+        if (cfgSubsetOK || subsetOK) reduceToSelectionContext();
+
         updateLegend();
         setStatus(makeStatusLine(selectedMunicipalities, custWithinSel, custOutsideSel, activeKeysOrderedLower));
         await rebuildDriverOverlays();
@@ -1058,32 +1133,32 @@
         const onlySelectedCustomers = manualMode && (currentIndex >= 0) && !outsideHighlight;
 
         for (const rec of customerMarkers) {
-          let show = true, style = { ...outStyle }, insideSel = false, selDay = null;
+            let show = true, style = { ...outStyle }, insideSel = false, selDay = null;
 
-          if (turfOn) {
-            const pt = turf.point([rec.lng, rec.lat]);
-            for (let j = 0; j < coveragePolysAll.length; j++) {
-              if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) { const lyr = coveragePolysAll[j].layerRef; if (lyr) lyr._custAny += 1; break; }
-            }
-            for (let k = 0; k < coveragePolysSelected.length; k++) {
-              if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
-                insideSel = true; selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
-                const pd = coveragePolysSelected[k].perDay || {};
-                style = { radius:(cst.radius||9), color: pd.stroke || (cst.stroke || '#111'), weight:(cst.weightPx||2), opacity:(cst.opacity ?? 0.95), fillColor: pd.fill || (cst.fill || '#ffffff'), fillOpacity:(cst.fillOpacity ?? 0.95) };
-                const lyr = coveragePolysSelected[k].layerRef; if (lyr) lyr._custSel += 1; break;
+            if (turfOn) {
+              const pt = turf.point([rec.lng, rec.lat]);
+              for (let j = 0; j < coveragePolysAll.length; j++) {
+                if (turf.booleanPointInPolygon(pt, coveragePolysAll[j].feat)) { const lyr = coveragePolysAll[j].layerRef; if (lyr) lyr._custAny += 1; break; }
+              }
+              for (let k = 0; k < coveragePolysSelected.length; k++) {
+                if (turf.booleanPointInPolygon(pt, coveragePolysSelected[k].feat)) {
+                  insideSel = true; selDay = (coveragePolysSelected[k].feat.properties.day || '').trim();
+                  const pd = coveragePolysSelected[k].perDay || {};
+                  style = { radius:(cst.radius||9), color: pd.stroke || (cst.stroke || '#111'), weight:(cst.weightPx||2), opacity:(cst.opacity ?? 0.95), fillColor: pd.fill || (cst.fill || '#ffffff'), fillOpacity:(cst.fillOpacity ?? 0.95) };
+                  const lyr = coveragePolysSelected[k].layerRef; if (lyr) lyr._custSel += 1; break;
+                }
               }
             }
-          }
 
-          if (onlySelectedCustomers && !insideSel) show = false;
+            if (onlySelectedCustomers && !insideSel) show = false;
 
-          if (insideSel) { inSel++; if (selDay && custByDayInSel[selDay] != null) custByDayInSel[selDay] += 1; }
-          else { outSel++; }
+            if (insideSel) { inSel++; if (selDay && custByDayInSel[selDay] != null) custByDayInSel[selDay] += 1; }
+            else { outSel++; }
 
-          if (show && !rec.visible) { customerLayer.addLayer(rec.marker); rec.visible = true; }
-          else if (!show && rec.visible) { customerLayer.removeLayer(rec.marker); rec.visible = false; }
+            if (show && !rec.visible) { customerLayer.addLayer(rec.marker); rec.visible = true; }
+            else if (!show && rec.visible) { customerLayer.removeLayer(rec.marker); rec.visible = false; }
 
-          if (show) rec.marker.setStyle(style);
+            if (show) rec.marker.setStyle(style);
         }
 
         custWithinSel = inSel; custOutsideSel = outSel;
@@ -1419,7 +1494,7 @@
       }
       function splitKeys(s) { return String(s||'').split(/[;,/|]/).map(x => x.trim()).filter(Boolean); }
       function unionAllKeys(items){ const set = new Set(); (items || []).forEach(it => (it.keys || []).forEach(k => set.add(normalizeKey(k)))); return Array.from(set); }
-      function normalizeKey(s) { s = String(s || '').trim().toUpperCase(); const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/); return m ? (m[1] + String(parseInt(m[2], 10)) + (m[3] || '')) : s; }
+      function normalizeKey(s) { s = String(s || '').trim().toUpperCase(); const m = s.match(/^([WTFS])0*(\d+)(_.+)?$/); return m ? (s = (m[1] + String(parseInt(m[2], 10)) + (m[3] || ''))) : s; }
       function baseKeyFrom(key) { const m = String(key||'').toUpperCase().match(/^([WTFS]\d+)/); return m ? m[1] : String(key||'').toUpperCase(); }
       function quadParts(key) { const m = String(key || '').toUpperCase().match(/_(NE|NW|SE|SW)(?:_(TL|TR|LL|LR))?$/); return m ? { quad: m[1], sub: m[2] || null } : null; }
       function basePlusQuad(key) { const p = quadParts(key); return p ? (baseKeyFrom(key) + '_' + p.quad) : null; }
@@ -1540,7 +1615,8 @@
         const seen = new Set(out.map(d => String(d.name||'').toLowerCase()));
         for (const nm of (driverNames || [])) {
           const low = String(nm||'').toLowerCase(); if (!low) continue;
-          if (!seen.has(low)) { out.push({ name: nm, color: colorFromName(nm) }); seen.add(low); }
+          if (!seen.has(low)) { out.push({ name: nm, color: colorFromName(nm) }); seen.add(low);
+          }
         }
         return out;
       }
@@ -1590,15 +1666,21 @@
           .route-toolbar button{background:#111;color:#fff;border:none;border-radius:6px;padding:8px 12px;font:600 14px system-ui;cursor:pointer;opacity:.95;transition:background .15s ease}
           .route-toolbar button:hover{opacity:1}
           .route-toolbar button.armed{background:#c62828}
-          .dispatch-banner{position:fixed;left:50%;top:78vh;transform:translateX(-50%);z-index:8500;background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);padding:10px 14px;max-width:min(80vw,1100px);display:none;cursor:default}
+
+          /* Banner — compact, centered, 3 rows, single-line rows */
+          .dispatch-banner{
+            position:fixed;left:50%;top:78vh;transform:translateX(-50%);
+            z-index:8500;background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);
+            border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);
+            padding:10px 14px;max-width:min(80vw,900px);display:none;cursor:move;text-align:center
+          }
           .dispatch-banner.dragging{user-select:none}
           .dispatch-banner.visible{display:block}
-          .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word;user-select:text}
-          .dispatch-banner .row.stats{white-space:nowrap;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
-          .dispatch-banner .row strong{font-weight:700}
-          .dispatch-banner .row.meta strong{font-weight:700}
-          .dispatch-banner .row.grip{user-select:none;cursor:grab;font:700 14px system-ui;line-height:1;opacity:.6;width:max-content;padding:2px 4px 6px 2px}
-          .dispatch-banner.dragging .row.grip{cursor:grabbing}
+          .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;user-select:text}
+          .dispatch-banner .row.meta{white-space:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch}
+          .dispatch-banner .row.stats1{white-space:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch}
+          .dispatch-banner .row.stats2{white-space:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch}
+
           .snap-overlay{position:fixed;inset:0;z-index:9400;pointer-events:none}
           .snap-overlay .helper{position:fixed;left:50%;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto;display:flex;gap:8px;align-items:center}
           .snap-overlay .helper .close{background:transparent;border:none;color:#fff;opacity:.8;cursor:pointer;font:700 14px system-ui;line-height:1;padding:0 4px 0 0}
@@ -1614,6 +1696,7 @@
           .snap-overlay .handle.se{right:-8px;bottom:-8px;transform:translate(50%,50%)}
           .snap-overlay .handle.sw{left:-8px;bottom:-8px;transform:translate(-50%,50%)}
           .snap-flash-crop{position:fixed;border:2px solid #4caf50;border-radius:10px;pointer-events:none;left:0;top:0;width:0;height:0;opacity:0;transition:opacity .18s ease}
+
           .snap-dock{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:9500;min-width:280px;width:min(90vw,1100px);max-width:1100px;background:#fff;border:1px solid #e8e8e8;border-radius:14px;box-shadow:0 16px 44px rgba(0,0,0,.18);display:none}
           .snap-dock .head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-bottom:1px solid #eee;cursor:move}
           .snap-dock .head .spacer{flex:1}
@@ -1626,21 +1709,9 @@
             align-items:start;
           }
           .snap-dock .col.left{min-width:0}
-          .snap-dock .col.right.stack{
-            display:grid;
-            grid-auto-rows:auto;
-            row-gap:12px;
-            align-content:start;
-          }
+          .snap-dock .col.right.stack{display:grid;grid-auto-rows:auto;row-gap:12px;align-content:start}
           .snap-dock .col.right .item{width:100%}
-          .snap-dock .preview{
-            display:block;
-            width:100%;
-            max-height:70vh;
-            object-fit:contain;
-            background:#f6f7f8;
-            border-radius:10px
-          }
+          .snap-dock .preview{display:block;width:100%;max-height:70vh;object-fit:contain;background:#f6f7f8;border-radius:10px}
           .snap-dock input[type="text"]{width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:6px;font:600 13px system-ui}
           .snap-dock .btn{background:#111;color:#fff;border:none;border-radius:8px;padding:8px 10px;font:700 13px system-ui;cursor:pointer;margin-right:6px}
           .snap-dock .btn.secondary{background:#f2f3f6;color:#222}
@@ -1650,7 +1721,7 @@
         document.head.appendChild(css);
       }
 
-      // ---------- UI Drag helpers (grip-only) ----------
+      // ---------- UI Drag helpers (grab banner anywhere) ----------
       function makeBannerDraggable(el, handle){
         let dragging=false, dx=0, dy=0;
         const onDown = (e)=>{
@@ -1665,7 +1736,6 @@
           el.style.left = `${x}px`; el.style.top = `${y}px`; el.style.transform='none';
         };
         const onUp = ()=>{ if(!dragging) return; dragging=false; el.classList.remove('dragging'); saveBannerPos(el); };
-        // Listen on window so dragging feels natural
         window.addEventListener('pointerdown', onDown);
         window.addEventListener('pointermove', onMove);
         window.addEventListener('pointerup', onUp);
@@ -1745,7 +1815,7 @@
         if (!(window.turf && turf.booleanPointInPolygon)) {
           await load('https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js');
         }
-        // Optional boundary mask if you use it:
+        // Optional boundary mask:
         // if (!(L.TileLayer && L.TileLayer.boundaryCanvas)) {
         //   await load('https://unpkg.com/leaflet-boundary-canvas@2.0.1/dist/leaflet-boundary-canvas.min.js');
         // }
@@ -1883,7 +1953,6 @@
   // ---- Top error UI helper + helper positioning (safe global access) ----
   function showTopError(title, msg){
     const n = document.getElementById('error'); if (!n) return;
-    // Nudge below the toolbar if present; otherwise fall back to 12px.
     const bar = document.querySelector('.route-toolbar');
     if (bar) {
       const r = bar.getBoundingClientRect();
@@ -1896,7 +1965,6 @@
     setTimeout(() => { n.style.display = 'none'; }, 5000);
   }
   function positionSnapHelper() {
-    // Works even if snapEls is scoped inside start(); reads from safe global
     const pack = (typeof window !== 'undefined') ? (window.__dispatchSnapEls || null) : null;
     const helper = pack && pack.helper ? pack.helper : null;
     if (!helper) return;
@@ -1905,11 +1973,10 @@
     if (bar) {
       try {
         const r = bar.getBoundingClientRect();
-        helper.style.top = Math.round(r.bottom + 16) + 'px'; // ~1 inch below buttons on typical DPI
+        helper.style.top = Math.round(r.bottom + 16) + 'px';
         return;
       } catch {}
     }
-    // Fallback if toolbar missing
     const h = helper.getBoundingClientRect().height || 24;
     helper.style.top = Math.round(h * 2.5) + 'px';
   }
@@ -1918,3 +1985,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
 })();
+
+}
