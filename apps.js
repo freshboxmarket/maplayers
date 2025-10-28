@@ -4,7 +4,9 @@
 //
 // Notes
 // - Prevents blank shots by rendering the map via leaflet-image whenever the frame touches the map.
-// - Draws the banner stats as a single line (D/H/E/F/G, strictly integers) onto the canvas at its DOM position.
+// - Draws the banner stats as a single line (full left-stage D..N, strictly integers; keeps D/H/E/F/G aliases) at the banner’s DOM position.
+// - Banner text is copy/select friendly; dragging is via a small grip only.
+// - Snapshot helper sits below the toolbar and is dismissible; no more `snapEls is not defined`.
 // - Save dock shows storage readiness and returns a clickable Drive link.
 // - Direct Drive uses Google Identity Services (no gapi client needed). Scope: drive.file.
 
@@ -181,14 +183,19 @@
         `;
         document.body.appendChild(bar);
 
-        // banner (draggable) — two rows: meta + one-line stats
+        // banner (copyable text; draggable via small grip only)
         const banner = document.createElement('div');
         banner.id = 'dispatchBanner';
         banner.className = 'dispatch-banner';
-        banner.innerHTML = `<div class="row r1 meta"></div><div class="row r2 stats"></div>`;
+        banner.innerHTML = `
+          <div class="row grip" title="Drag banner" aria-label="Drag banner">⠿</div>
+          <div class="row r1 meta" contenteditable="false"></div>
+          <div class="row r2 stats" contenteditable="false"></div>
+        `;
         document.body.appendChild(banner);
         restoreBannerPos(banner);
-        makeBannerDraggable(banner);
+        const grip = banner.querySelector('.grip');
+        makeBannerDraggable(banner, grip);
 
         document.getElementById('btnPrev').addEventListener('click', async () => { await stepRouteCycle(-1); });
         document.getElementById('btnNext').addEventListener('click', async () => { await stepRouteCycle(+1); });
@@ -217,29 +224,43 @@
         if (statsVisible && currentIndex >= 0) renderDispatchBanner(batchItems[currentIndex]);
       }
 
-      // ===== Strictly numeric stats (D/H/E/F/G) =====
+      // ===== Expanded stats (all integers, robust fallbacks) =====
       function getStatsNumbers(statsObj = {}) {
         const toInt = (v) => {
           const n = Number(v);
           return Number.isFinite(n) ? Math.trunc(n) : 0;
         };
+        // Keep legacy aliases (D/H/E/F/G) working, but include all D..N fields
         return {
           deliveries: toInt(statsObj.deliveries ?? statsObj.D),
           apartments: toInt(statsObj.apartments ?? statsObj.H),
-          baseBoxes:  toInt(statsObj.baseBoxes  ?? statsObj.E),
-          customs:    toInt(statsObj.customs    ?? statsObj.F),
-          addOns:     toInt(statsObj.addOns     ?? statsObj.G),
+          baseBoxes:  toInt(statsObj.baseBoxes  ?? statsObj.E ?? statsObj.base ?? statsObj.base_boxes),
+          regulars:   toInt(statsObj.regulars   ?? statsObj.regs),
+          fruits:     toInt(statsObj.fruits     ?? statsObj.fruit),
+          xls:        toInt(statsObj.xls        ?? statsObj.XLs ?? statsObj.xl ?? statsObj.XL),
+          customs:    toInt(statsObj.customs    ?? statsObj.F   ?? statsObj.cust),
+          addOns:     toInt(statsObj.addOns     ?? statsObj.G   ?? statsObj.addons ?? statsObj.add_ons),
+          small:      toInt(statsObj.small      ?? statsObj.small_lt5     ?? statsObj.small_under5),
+          medium:     toInt(statsObj.medium     ?? statsObj.medium_5_to_15),
+          large:      toInt(statsObj.large      ?? statsObj.large_15_plus),
         };
       }
 
+      // One-liner, required order, guaranteed single line (copyable text)
       function buildStatsOneLinerNums(n) {
         const seg = (label, val) => `${label}: ${val}`;
         return [
           seg('# deliveries', n.deliveries),
           seg('# apartments', n.apartments),
           seg('# base boxes', n.baseBoxes),
+          seg('# regulars',   n.regulars),
+          seg('# fruits',     n.fruits),
+          seg('# XLs',        n.xls),
           seg('# customs',    n.customs),
-          seg('# add ons',    n.addOns),
+          seg('# add-ons',    n.addOns),
+          seg('# small (<5)', n.small),
+          seg('# medium (5<15)', n.medium),
+          seg('# large (15+)', n.large),
         ].join(' • ');
       }
 
@@ -252,7 +273,7 @@
         const r1 = banner.querySelector('.r1');
         const r2 = banner.querySelector('.r2');
         if (r1) r1.innerHTML = row1;
-        if (r2) r2.textContent = row2;
+        if (r2) r2.textContent = row2; // copyable, no innerHTML
         if (statsVisible) banner.classList.add('visible');
       }
 
@@ -375,7 +396,10 @@
         const overlay = document.createElement('div');
         overlay.className = 'snap-overlay'; overlay.style.display='none';
         overlay.innerHTML = `
-          <div class="helper">Drag to frame your capture. Click the <b>red Snap</b> to take it. &nbsp;•&nbsp; Press <b>Esc</b> to cancel.</div>
+          <div class="helper" id="snapHelper">
+            <span class="txt">Drag to frame your capture. Click the <b>red Snap</b> to take it. &nbsp;•&nbsp; Press <b>Esc</b> to cancel.</span>
+            <button class="close" id="snapHelperClose" aria-label="Hide helper">×</button>
+          </div>
           <div class="frame">
             <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
             <div class="handle w" data-dir="w"></div> <div class="handle e" data-dir="e"></div>
@@ -388,8 +412,20 @@
         flashCrop.className='snap-flash-crop';
         document.body.appendChild(flashCrop);
 
-        snapEls = { overlay, helper: overlay.querySelector('.helper'), frame: overlay.querySelector('.frame'), flashCrop };
+        snapEls = {
+          overlay,
+          helper: overlay.querySelector('#snapHelper'),
+          frame: overlay.querySelector('.frame'),
+          flashCrop
+        };
+        // Safe global so the outside function can reference the helper without scope issues
+        try { window.__dispatchSnapEls = snapEls; } catch {}
+
+        const xBtn = overlay.querySelector('#snapHelperClose');
+        if (xBtn) xBtn.addEventListener('click', () => { snapEls.helper.style.display = 'none'; });
+
         bindFramingGestures(snapEls.frame);
+        positionSnapHelper(); // position after creation
       }
 
       function ensureDockUi(){
@@ -1554,15 +1590,19 @@
           .route-toolbar button{background:#111;color:#fff;border:none;border-radius:6px;padding:8px 12px;font:600 14px system-ui;cursor:pointer;opacity:.95;transition:background .15s ease}
           .route-toolbar button:hover{opacity:1}
           .route-toolbar button.armed{background:#c62828}
-          .dispatch-banner{position:fixed;left:50%;top:78vh;transform:translateX(-50%);z-index:8500;cursor:grab;background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);padding:10px 14px;max-width:min(80vw,1100px);display:none}
-          .dispatch-banner.dragging{cursor:grabbing; user-select:none}
+          .dispatch-banner{position:fixed;left:50%;top:78vh;transform:translateX(-50%);z-index:8500;background:rgba(255,255,255,.92);backdrop-filter:saturate(120%) blur(2px);border-radius:12px;box-shadow:0 8px 22px rgba(0,0,0,.14);padding:10px 14px;max-width:min(80vw,1100px);display:none;cursor:default}
+          .dispatch-banner.dragging{user-select:none}
           .dispatch-banner.visible{display:block}
-          .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word}
+          .dispatch-banner .row{font:500 14px system-ui;color:#111;line-height:1.35;margin:2px 0;word-wrap:break-word;overflow-wrap:break-word;user-select:text}
           .dispatch-banner .row.stats{white-space:nowrap;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
           .dispatch-banner .row strong{font-weight:700}
           .dispatch-banner .row.meta strong{font-weight:700}
+          .dispatch-banner .row.grip{user-select:none;cursor:grab;font:700 14px system-ui;line-height:1;opacity:.6;width:max-content;padding:2px 4px 6px 2px}
+          .dispatch-banner.dragging .row.grip{cursor:grabbing}
           .snap-overlay{position:fixed;inset:0;z-index:9400;pointer-events:none}
-          .snap-overlay .helper{position:fixed;left:50%;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto}
+          .snap-overlay .helper{position:fixed;left:50%;transform:translateX(-50%);background:#111;color:#fff;border-radius:8px;padding:6px 10px;font:600 12px system-ui;pointer-events:auto;display:flex;gap:8px;align-items:center}
+          .snap-overlay .helper .close{background:transparent;border:none;color:#fff;opacity:.8;cursor:pointer;font:700 14px system-ui;line-height:1;padding:0 4px 0 0}
+          .snap-overlay .helper .close:hover{opacity:1}
           .snap-overlay .frame{position:fixed;border:2px dashed #c62828;border-radius:10px;box-shadow:0 0 0 9999px rgba(0,0,0,.25);cursor:move;pointer-events:auto}
           .snap-overlay .handle{position:absolute;width:12px;height:12px;background:#fff;border:2px solid #c62828;border-radius:50%}
           .snap-overlay .handle.n{left:50%;top:-8px;transform:translate(-50%,-50%)}
@@ -1610,13 +1650,23 @@
         document.head.appendChild(css);
       }
 
-      // ---------- UI Drag helpers ----------
-      function makeBannerDraggable(el){
+      // ---------- UI Drag helpers (grip-only) ----------
+      function makeBannerDraggable(el, handle){
         let dragging=false, dx=0, dy=0;
-        const onDown = (e)=>{ dragging=true; el.classList.add('dragging'); const r=el.getBoundingClientRect(); dx=e.clientX - r.left; dy=e.clientY - r.top; e.preventDefault(); };
-        const onMove = (e)=>{ if(!dragging) return; const x = clamp(e.clientX - dx, 8, window.innerWidth - el.offsetWidth - 8); const y = clamp(e.clientY - dy, 8, window.innerHeight - el.offsetHeight - 8); el.style.left = `${x}px`; el.style.top = `${y}px`; el.style.transform='none'; };
-        const onUp   = ()=>{ if(!dragging) return; dragging=false; el.classList.remove('dragging'); saveBannerPos(el); };
-        el.addEventListener('pointerdown', onDown);
+        const onDown = (e)=>{
+          if (!handle || (e.target !== handle && !handle.contains(e.target))) return;
+          dragging=true; el.classList.add('dragging');
+          const r=el.getBoundingClientRect(); dx=e.clientX - r.left; dy=e.clientY - r.top; e.preventDefault();
+        };
+        const onMove = (e)=>{
+          if(!dragging) return;
+          const x = clamp(e.clientX - dx, 8, window.innerWidth - el.offsetWidth - 8);
+          const y = clamp(e.clientY - dy, 8, window.innerHeight - el.offsetHeight - 8);
+          el.style.left = `${x}px`; el.style.top = `${y}px`; el.style.transform='none';
+        };
+        const onUp = ()=>{ if(!dragging) return; dragging=false; el.classList.remove('dragging'); saveBannerPos(el); };
+        // Listen on window so dragging feels natural
+        window.addEventListener('pointerdown', onDown);
         window.addEventListener('pointermove', onMove);
         window.addEventListener('pointerup', onUp);
       }
@@ -1830,7 +1880,7 @@
     })();
   }
 
-  // ---- Top error UI helper + helper positioning ----
+  // ---- Top error UI helper + helper positioning (safe global access) ----
   function showTopError(title, msg){
     const n = document.getElementById('error'); if (!n) return;
     // Nudge below the toolbar if present; otherwise fall back to 12px.
@@ -1846,10 +1896,22 @@
     setTimeout(() => { n.style.display = 'none'; }, 5000);
   }
   function positionSnapHelper() {
-    // Places the helper ~1.5x its own height from the top; avoids overlap with toolbar.
-    if (!snapEls || !snapEls.helper) return;
-    const h = snapEls.helper.getBoundingClientRect().height || 24;
-    snapEls.helper.style.top = Math.round(h * 1.5) + 'px';
+    // Works even if snapEls is scoped inside start(); reads from safe global
+    const pack = (typeof window !== 'undefined') ? (window.__dispatchSnapEls || null) : null;
+    const helper = pack && pack.helper ? pack.helper : null;
+    if (!helper) return;
+
+    const bar = document.querySelector('.route-toolbar');
+    if (bar) {
+      try {
+        const r = bar.getBoundingClientRect();
+        helper.style.top = Math.round(r.bottom + 16) + 'px'; // ~1 inch below buttons on typical DPI
+        return;
+      } catch {}
+    }
+    // Fallback if toolbar missing
+    const h = helper.getBoundingClientRect().height || 24;
+    helper.style.top = Math.round(h * 2.5) + 'px';
   }
 
   // Kick it off
